@@ -6148,7 +6148,7 @@
 { oid => '3776',
   descr => 'statistics: reset collected statistics for a single table or index in the current database or shared across all databases in the cluster',
   proname => 'pg_stat_reset_single_table_counters', provolatile => 'v',
-  prorettype => 'void', proargtypes => 'oid',
+  prorettype => 'timestamptz', proargtypes => 'oid',
   prosrc => 'pg_stat_reset_single_table_counters' },
 { oid => '3777',
   descr => 'statistics: reset collected statistics for a single function in the current database',

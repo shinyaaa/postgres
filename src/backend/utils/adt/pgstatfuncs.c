@@ -1922,10 +1922,11 @@ pg_stat_reset_single_table_counters(PG_FUNCTION_ARGS)
 {
 	Oid			taboid = PG_GETARG_OID(0);
 	Oid			dboid = (IsSharedRelation(taboid) ? InvalidOid : MyDatabaseId);
+	TimestampTz ts;
 
-	pgstat_reset(PGSTAT_KIND_RELATION, dboid, taboid);
+	ts = pgstat_reset(PGSTAT_KIND_RELATION, dboid, taboid);
 
-	PG_RETURN_VOID();
+	PG_RETURN_TIMESTAMPTZ(ts);
 }
 
 Datum

@@ -666,10 +666,10 @@ SELECT last_seq_scan, last_idx_scan FROM pg_stat_all_tables WHERE relid = 'test_
 (1 row)
 
 COMMIT;
-SELECT pg_stat_reset_single_table_counters('test_last_scan'::regclass);
- pg_stat_reset_single_table_counters 
--------------------------------------
- 
+SELECT pg_stat_reset_single_table_counters('test_last_scan'::regclass) IS NOT NULL AS t;
+ t 
+---
+ t
 (1 row)
 
 SELECT seq_scan, idx_scan FROM pg_stat_all_tables WHERE relid = 'test_last_scan'::regclass;
@@ -877,10 +877,10 @@ SELECT (n_tup_ins + n_tup_upd) > 0 AS has_data FROM pg_stat_all_tables
  t
 (1 row)
 
-SELECT pg_stat_reset_single_table_counters('pg_shdescription'::regclass);
- pg_stat_reset_single_table_counters 
--------------------------------------
- 
+SELECT pg_stat_reset_single_table_counters('pg_shdescription'::regclass) IS NOT NULL AS t;
+ t 
+---
+ t
 (1 row)
 
 SELECT (n_tup_ins + n_tup_upd) > 0 AS has_data FROM pg_stat_all_tables

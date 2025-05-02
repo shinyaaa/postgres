@@ -865,7 +865,7 @@ pgstat_reset_counters(void)
  * Permission checking for this function is managed through the normal
  * GRANT system.
  */
-void
+TimestampTz
 pgstat_reset(PgStat_Kind kind, Oid dboid, uint64 objid)
 {
 	const PgStat_KindInfo *kind_info = pgstat_get_kind_info(kind);
@@ -879,6 +879,8 @@ pgstat_reset(PgStat_Kind kind, Oid dboid, uint64 objid)
 
 	if (!kind_info->accessed_across_databases)
 		pgstat_reset_database_timestamp(dboid, ts);
+
+	return ts;
 }
 
 /*

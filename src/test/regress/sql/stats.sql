@@ -312,7 +312,7 @@ SELECT pg_stat_force_next_flush();
 SELECT last_seq_scan, last_idx_scan FROM pg_stat_all_tables WHERE relid = 'test_last_scan'::regclass;
 COMMIT;
 
-SELECT pg_stat_reset_single_table_counters('test_last_scan'::regclass);
+SELECT pg_stat_reset_single_table_counters('test_last_scan'::regclass) IS NOT NULL AS t;
 SELECT seq_scan, idx_scan FROM pg_stat_all_tables WHERE relid = 'test_last_scan'::regclass;
 
 -- ensure we start out with exactly one index and sequential scan
@@ -402,7 +402,7 @@ COMMIT;
 -- check that the stats are reset.
 SELECT (n_tup_ins + n_tup_upd) > 0 AS has_data FROM pg_stat_all_tables
   WHERE relid = 'pg_shdescription'::regclass;
-SELECT pg_stat_reset_single_table_counters('pg_shdescription'::regclass);
+SELECT pg_stat_reset_single_table_counters('pg_shdescription'::regclass) IS NOT NULL AS t;
 SELECT (n_tup_ins + n_tup_upd) > 0 AS has_data FROM pg_stat_all_tables
   WHERE relid = 'pg_shdescription'::regclass;
 

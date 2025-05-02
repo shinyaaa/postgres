@@ -5082,11 +5082,12 @@ description | Waiting for a newly initialized WAL file to reach durable storage
          <primary>pg_stat_reset_single_table_counters</primary>
         </indexterm>
         <function>pg_stat_reset_single_table_counters</function> ( <type>oid</type> )
-        <returnvalue>void</returnvalue>
+        <returnvalue>timestamp with time zone</returnvalue>
        </para>
        <para>
         Resets statistics for a single table or index in the current database
-        or shared across all databases in the cluster to zero.
+        or shared across all databases in the cluster to zero, and returns the
+        time of the reset.
        </para>
        <para>
         This function is restricted to superusers by default, but other users
