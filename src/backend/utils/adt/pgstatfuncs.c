@@ -1933,10 +1933,11 @@ Datum
 pg_stat_reset_single_function_counters(PG_FUNCTION_ARGS)
 {
 	Oid			funcoid = PG_GETARG_OID(0);
+	TimestampTz ts;
 
-	pgstat_reset(PGSTAT_KIND_FUNCTION, MyDatabaseId, funcoid);
+	ts = pgstat_reset(PGSTAT_KIND_FUNCTION, MyDatabaseId, funcoid);
 
-	PG_RETURN_VOID();
+	PG_RETURN_TIMESTAMPTZ(ts);
 }
 
 /*

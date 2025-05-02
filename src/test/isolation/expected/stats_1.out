@@ -1137,10 +1137,10 @@ name          |pg_stat_get_function_calls|total_above_zero|self_above_zero
 test_stat_func|                         3|t               |t              
 (1 row)
 
-step s1_func_stats_reset: SELECT pg_stat_reset_single_function_counters('test_stat_func'::regproc);
-pg_stat_reset_single_function_counters
---------------------------------------
-                                      
+step s1_func_stats_reset: SELECT pg_stat_reset_single_function_counters('test_stat_func'::regproc) IS NOT NULL AS t;
+t
+-
+t
 (1 row)
 
 step s1_func_stats: 
@@ -1200,10 +1200,10 @@ pg_stat_get_function_calls
                           
 (1 row)
 
-step s1_func_stats_reset_nonexistent: SELECT pg_stat_reset_single_function_counters(12000);
-pg_stat_reset_single_function_counters
---------------------------------------
-                                      
+step s1_func_stats_reset_nonexistent: SELECT pg_stat_reset_single_function_counters(12000) IS NOT NULL AS t;
+t
+-
+t
 (1 row)
 
 step s1_func_stats_nonexistent: 

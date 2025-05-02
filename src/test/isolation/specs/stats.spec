@@ -54,8 +54,8 @@ step s1_track_funcs_all { SET track_functions = 'all'; }
 step s1_track_funcs_none { SET track_functions = 'none'; }
 step s1_func_call { SELECT test_stat_func(); }
 step s1_func_drop { DROP FUNCTION test_stat_func(); }
-step s1_func_stats_reset { SELECT pg_stat_reset_single_function_counters('test_stat_func'::regproc); }
-step s1_func_stats_reset_nonexistent { SELECT pg_stat_reset_single_function_counters(12000); }
+step s1_func_stats_reset { SELECT pg_stat_reset_single_function_counters('test_stat_func'::regproc) IS NOT NULL AS t; }
+step s1_func_stats_reset_nonexistent { SELECT pg_stat_reset_single_function_counters(12000) IS NOT NULL AS t; }
 step s1_reset { SELECT pg_stat_reset() IS NOT NULL AS t; }
 step s1_func_stats {
     SELECT
