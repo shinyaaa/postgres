@@ -1295,10 +1295,10 @@ name          |pg_stat_get_function_calls|total_above_zero|self_above_zero
 test_stat_func|                         2|t               |t              
 (1 row)
 
-step s1_reset: SELECT pg_stat_reset();
-pg_stat_reset
--------------
-             
+step s1_reset: SELECT pg_stat_reset() IS NOT NULL AS t;
+t
+-
+t
 (1 row)
 
 step s1_func_stats: 

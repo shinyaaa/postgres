@@ -507,9 +507,9 @@ SELECT pg_stat_reset_shared('unknown');
 -- Test that reset works for pg_stat_database
 
 -- Since pg_stat_database stats_reset starts out as NULL, reset it once first so we have something to compare it to
-SELECT pg_stat_reset();
+SELECT pg_stat_reset() IS NOT NULL AS t;
 SELECT stats_reset AS db_reset_ts FROM pg_stat_database WHERE datname = (SELECT current_database()) \gset
-SELECT pg_stat_reset();
+SELECT pg_stat_reset() IS NOT NULL AS t;
 SELECT stats_reset > :'db_reset_ts'::timestamptz FROM pg_stat_database WHERE datname = (SELECT current_database());
 
 

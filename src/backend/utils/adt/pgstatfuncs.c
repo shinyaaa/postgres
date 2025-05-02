@@ -1857,9 +1857,9 @@ pg_stat_force_next_flush(PG_FUNCTION_ARGS)
 Datum
 pg_stat_reset(PG_FUNCTION_ARGS)
 {
-	pgstat_reset_counters();
+	TimestampTz ts = pgstat_reset_counters();
 
-	PG_RETURN_VOID();
+	PG_RETURN_TIMESTAMPTZ(ts);
 }
 
 /*

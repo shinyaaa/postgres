@@ -844,7 +844,7 @@ match_db_entries(PgStatShared_HashEntry *entry, Datum match_data)
  * Permission checking for this function is managed through the normal
  * GRANT system.
  */
-void
+TimestampTz
 pgstat_reset_counters(void)
 {
 	TimestampTz ts = GetCurrentTimestamp();
@@ -852,6 +852,8 @@ pgstat_reset_counters(void)
 	pgstat_reset_matching_entries(match_db_entries,
 								  ObjectIdGetDatum(MyDatabaseId),
 								  ts);
+
+	return ts;
 }
 
 /*

@@ -524,7 +524,7 @@ extern void pgstat_initialize(void);
 extern long pgstat_report_stat(bool force);
 extern void pgstat_force_next_flush(void);
 
-extern void pgstat_reset_counters(void);
+extern TimestampTz pgstat_reset_counters(void);
 extern void pgstat_reset(PgStat_Kind kind, Oid dboid, uint64 objid);
 extern void pgstat_reset_of_kind(PgStat_Kind kind);
 
