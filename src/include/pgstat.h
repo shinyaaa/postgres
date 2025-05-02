@@ -733,7 +733,7 @@ extern PgStat_TableStatus *find_tabstat_entry(Oid rel_id);
  * Functions in pgstat_replslot.c
  */
 
-extern void pgstat_reset_replslot(const char *name);
+extern TimestampTz pgstat_reset_replslot(const char *name);
 struct ReplicationSlot;
 extern void pgstat_report_replslot(struct ReplicationSlot *slot, const PgStat_StatReplSlotEntry *repSlotStat);
 extern void pgstat_create_replslot(struct ReplicationSlot *slot);

@@ -1999,16 +1999,17 @@ Datum
 pg_stat_reset_replication_slot(PG_FUNCTION_ARGS)
 {
 	char	   *target = NULL;
+	TimestampTz ts;
 
 	if (PG_ARGISNULL(0))
-		pgstat_reset_of_kind(PGSTAT_KIND_REPLSLOT);
+		ts = pgstat_reset_of_kind(PGSTAT_KIND_REPLSLOT);
 	else
 	{
 		target = text_to_cstring(PG_GETARG_TEXT_PP(0));
-		pgstat_reset_replslot(target);
+		ts = pgstat_reset_replslot(target);
 	}
 
-	PG_RETURN_VOID();
+	PG_RETURN_TIMESTAMPTZ(ts);
 }
 
 /* Reset subscription stats (a specific one or all of them) */

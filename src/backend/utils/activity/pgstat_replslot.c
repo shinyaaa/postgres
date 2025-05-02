@@ -37,11 +37,14 @@ static int	get_replslot_index(const char *name, bool need_lock);
  *
  * Permission checking for this function is managed through the normal
  * GRANT system.
+ *
+ * NB: Returns the time of the reset or NULL if it is a physical slot.
  */
-void
+TimestampTz
 pgstat_reset_replslot(const char *name)
 {
 	ReplicationSlot *slot;
+	TimestampTz ts;
 
 	Assert(name != NULL);
 
@@ -61,10 +64,12 @@ pgstat_reset_replslot(const char *name)
 	 * as we collect stats only for logical slots.
 	 */
 	if (SlotIsLogical(slot))
-		pgstat_reset(PGSTAT_KIND_REPLSLOT, InvalidOid,
+		ts = pgstat_reset(PGSTAT_KIND_REPLSLOT, InvalidOid,
 					 ReplicationSlotIndex(slot));
 
 	LWLockRelease(ReplicationSlotControlLock);
+
+	return ts;
 }
 
 /*

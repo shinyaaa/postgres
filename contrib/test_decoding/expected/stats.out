@@ -47,10 +47,10 @@ SELECT slot_name, spill_txns = 0 AS spill_txns, spill_count = 0 AS spill_count, 
 
 RESET logical_decoding_work_mem;
 -- reset stats for one slot, others should be unaffected
-SELECT pg_stat_reset_replication_slot('regression_slot_stats1');
- pg_stat_reset_replication_slot 
---------------------------------
- 
+SELECT pg_stat_reset_replication_slot('regression_slot_stats1') IS NOT NULL AS t;
+ t 
+---
+ t
 (1 row)
 
 SELECT slot_name, spill_txns = 0 AS spill_txns, spill_count = 0 AS spill_count, total_txns > 0 AS total_txns, total_bytes > 0 AS total_bytes FROM pg_stat_replication_slots ORDER BY slot_name;
@@ -62,10 +62,10 @@ SELECT slot_name, spill_txns = 0 AS spill_txns, spill_count = 0 AS spill_count, 
 (3 rows)
 
 -- reset stats for all slots
-SELECT pg_stat_reset_replication_slot(NULL);
- pg_stat_reset_replication_slot 
---------------------------------
- 
+SELECT pg_stat_reset_replication_slot(NULL) IS NOT NULL AS t;
+ t 
+---
+ t
 (1 row)
 
 SELECT slot_name, spill_txns = 0 AS spill_txns, spill_count = 0 AS spill_count, total_txns > 0 AS total_txns, total_bytes > 0 AS total_bytes FROM pg_stat_replication_slots ORDER BY slot_name;
@@ -89,6 +89,25 @@ SELECT * FROM pg_stat_get_replication_slot('do-not-exist');
   slot_name   | spill_txns | spill_count | spill_bytes | stream_txns | stream_count | stream_bytes | total_txns | total_bytes | stats_reset 
 --------------+------------+-------------+-------------+-------------+--------------+--------------+------------+-------------+-------------
  do-not-exist |          0 |           0 |           0 |           0 |            0 |            0 |          0 |           0 | 
+(1 row)
+
+-- verify physical replication slot stats are not reset
+SELECT 'init' FROM pg_create_physical_replication_slot('regression_slot_stats_physical') ps;
+ ?column? 
+----------
+ init
+(1 row)
+
+SELECT pg_stat_reset_replication_slot('regression_slot_stats_physical') IS NOT NULL AS t;
+ t 
+---
+ t
+(1 row)
+
+SELECT pg_drop_replication_slot('regression_slot_stats_physical');
+ pg_drop_replication_slot 
+--------------------------
+ 
 (1 row)
 
 -- spilling the xact

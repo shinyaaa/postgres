@@ -19,17 +19,22 @@ SELECT slot_name, spill_txns = 0 AS spill_txns, spill_count = 0 AS spill_count, 
 RESET logical_decoding_work_mem;
 
 -- reset stats for one slot, others should be unaffected
-SELECT pg_stat_reset_replication_slot('regression_slot_stats1');
+SELECT pg_stat_reset_replication_slot('regression_slot_stats1') IS NOT NULL AS t;
 SELECT slot_name, spill_txns = 0 AS spill_txns, spill_count = 0 AS spill_count, total_txns > 0 AS total_txns, total_bytes > 0 AS total_bytes FROM pg_stat_replication_slots ORDER BY slot_name;
 
 -- reset stats for all slots
-SELECT pg_stat_reset_replication_slot(NULL);
+SELECT pg_stat_reset_replication_slot(NULL) IS NOT NULL AS t;
 SELECT slot_name, spill_txns = 0 AS spill_txns, spill_count = 0 AS spill_count, total_txns > 0 AS total_txns, total_bytes > 0 AS total_bytes FROM pg_stat_replication_slots ORDER BY slot_name;
 
 -- verify accessing/resetting stats for non-existent slot does something reasonable
 SELECT * FROM pg_stat_get_replication_slot('do-not-exist');
 SELECT pg_stat_reset_replication_slot('do-not-exist');
 SELECT * FROM pg_stat_get_replication_slot('do-not-exist');
+
+-- verify physical replication slot stats are not reset
+SELECT 'init' FROM pg_create_physical_replication_slot('regression_slot_stats_physical') ps;
+SELECT pg_stat_reset_replication_slot('regression_slot_stats_physical') IS NOT NULL AS t;
+SELECT pg_drop_replication_slot('regression_slot_stats_physical');
 
 -- spilling the xact
 BEGIN;

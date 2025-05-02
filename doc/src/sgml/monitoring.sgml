@@ -5170,12 +5170,13 @@ description | Waiting for a newly initialized WAL file to reach durable storage
           <primary>pg_stat_reset_replication_slot</primary>
         </indexterm>
         <function>pg_stat_reset_replication_slot</function> ( <type>text</type> )
-        <returnvalue>void</returnvalue>
+        <returnvalue>timestamp with time zone</returnvalue>
        </para>
        <para>
-        Resets statistics of the replication slot defined by the argument. If
-        the argument is <literal>NULL</literal>, resets statistics for all
-        the replication slots.
+        Resets statistics of the replication slot defined by the argument, and
+        returns the time of the reset or <literal>NULL</literal> if the replication
+        slot defined by the argument is a physical slot. If the argument is
+        <literal>NULL</literal>, resets statistics for all the replication slots.
        </para>
        <para>
          This function is restricted to superusers by default, but other users
