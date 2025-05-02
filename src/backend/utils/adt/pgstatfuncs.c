@@ -1948,6 +1948,7 @@ pg_stat_reset_backend_stats(PG_FUNCTION_ARGS)
 	PGPROC	   *proc;
 	PgBackendStatus *beentry;
 	ProcNumber	procNumber;
+	TimestampTz ts;
 	int			backend_pid = PG_GETARG_INT32(0);
 
 	proc = BackendPidGetProc(backend_pid);
@@ -1957,21 +1958,21 @@ pg_stat_reset_backend_stats(PG_FUNCTION_ARGS)
 		proc = AuxiliaryPidGetProc(backend_pid);
 
 	if (!proc)
-		PG_RETURN_VOID();
+		PG_RETURN_NULL();
 
 	procNumber = GetNumberFromPGProc(proc);
 
 	beentry = pgstat_get_beentry_by_proc_number(procNumber);
 	if (!beentry)
-		PG_RETURN_VOID();
+		PG_RETURN_NULL();
 
 	/* Check if the backend type tracks statistics */
 	if (!pgstat_tracks_backend_bktype(beentry->st_backendType))
-		PG_RETURN_VOID();
+		PG_RETURN_NULL();
 
-	pgstat_reset(PGSTAT_KIND_BACKEND, InvalidOid, procNumber);
+	ts = pgstat_reset(PGSTAT_KIND_BACKEND, InvalidOid, procNumber);
 
-	PG_RETURN_VOID();
+	PG_RETURN_TIMESTAMPTZ(ts);
 }
 
 /* Reset SLRU counters (a specific one or all of them). */

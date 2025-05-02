@@ -817,7 +817,9 @@ SELECT sum(evictions) + sum(reuses) + sum(extends) + sum(fsyncs) + sum(reads) + 
 -- pg_stat_reset_shared() did not reset backend IO stats
 SELECT :my_io_stats_pre_reset <= :my_io_stats_post_reset;
 -- but pg_stat_reset_backend_stats() does
-SELECT pg_stat_reset_backend_stats(pg_backend_pid());
+SELECT pg_stat_reset_backend_stats(pg_backend_pid()) IS NOT NULL AS t;
+-- Invalid backend process ID is specified
+SELECT pg_stat_reset_backend_stats(0);
 SELECT sum(evictions) + sum(reuses) + sum(extends) + sum(fsyncs) + sum(reads) + sum(writes) + sum(writebacks) + sum(hits) AS my_io_stats_post_backend_reset
   FROM pg_stat_get_backend_io(pg_backend_pid()) \gset
 SELECT :my_io_stats_pre_reset > :my_io_stats_post_backend_reset;

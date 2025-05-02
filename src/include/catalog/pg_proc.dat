@@ -6157,7 +6157,7 @@
   prosrc => 'pg_stat_reset_single_function_counters' },
 { oid => '8807', descr => 'statistics: reset statistics for a single backend',
   proname => 'pg_stat_reset_backend_stats', provolatile => 'v',
-  prorettype => 'void', proargtypes => 'int4',
+  prorettype => 'timestamptz', proargtypes => 'int4',
   prosrc => 'pg_stat_reset_backend_stats' },
 { oid => '2307',
   descr => 'statistics: reset collected statistics for a single SLRU',

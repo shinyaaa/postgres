@@ -1709,7 +1709,14 @@ SELECT :my_io_stats_pre_reset <= :my_io_stats_post_reset;
 (1 row)
 
 -- but pg_stat_reset_backend_stats() does
-SELECT pg_stat_reset_backend_stats(pg_backend_pid());
+SELECT pg_stat_reset_backend_stats(pg_backend_pid()) IS NOT NULL AS t;
+ t 
+---
+ t
+(1 row)
+
+-- Invalid backend process ID is specified
+SELECT pg_stat_reset_backend_stats(0);
  pg_stat_reset_backend_stats 
 -----------------------------
  

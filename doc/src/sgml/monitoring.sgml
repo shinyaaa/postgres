@@ -5101,11 +5101,12 @@ description | Waiting for a newly initialized WAL file to reach durable storage
          <primary>pg_stat_reset_backend_stats</primary>
         </indexterm>
         <function>pg_stat_reset_backend_stats</function> ( <type>integer</type> )
-        <returnvalue>void</returnvalue>
+        <returnvalue>timestamp with time zone</returnvalue>
        </para>
        <para>
         Resets statistics for a single backend with the specified process ID
-        to zero.
+        to zero, and returns the time of the reset or <literal>NULL</literal>
+        if an invalid backend process ID is specified.
        </para>
        <para>
         This function is restricted to superusers by default, but other users
