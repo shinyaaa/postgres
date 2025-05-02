@@ -746,7 +746,7 @@ extern PgStat_StatReplSlotEntry *pgstat_fetch_replslot(NameData slotname);
  * Functions in pgstat_slru.c
  */
 
-extern void pgstat_reset_slru(const char *);
+extern TimestampTz pgstat_reset_slru(const char *);
 extern void pgstat_count_slru_page_zeroed(int slru_idx);
 extern void pgstat_count_slru_page_hit(int slru_idx);
 extern void pgstat_count_slru_page_read(int slru_idx);

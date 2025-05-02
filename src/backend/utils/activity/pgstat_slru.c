@@ -41,7 +41,7 @@ static bool have_slrustats = false;
  * Permission checking for this function is managed through the normal
  * GRANT system.
  */
-void
+TimestampTz
 pgstat_reset_slru(const char *name)
 {
 	TimestampTz ts = GetCurrentTimestamp();
@@ -49,6 +49,8 @@ pgstat_reset_slru(const char *name)
 	Assert(name != NULL);
 
 	pgstat_reset_slru_counter_internal(pgstat_get_slru_index(name), ts);
+
+	return ts;
 }
 
 /*

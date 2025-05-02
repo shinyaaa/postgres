@@ -1981,16 +1981,17 @@ Datum
 pg_stat_reset_slru(PG_FUNCTION_ARGS)
 {
 	char	   *target = NULL;
+	TimestampTz ts;
 
 	if (PG_ARGISNULL(0))
-		pgstat_reset_of_kind(PGSTAT_KIND_SLRU);
+		ts = pgstat_reset_of_kind(PGSTAT_KIND_SLRU);
 	else
 	{
 		target = text_to_cstring(PG_GETARG_TEXT_PP(0));
-		pgstat_reset_slru(target);
+		ts = pgstat_reset_slru(target);
 	}
 
-	PG_RETURN_VOID();
+	PG_RETURN_TIMESTAMPTZ(ts);
 }
 
 /* Reset replication slots stats (a specific one or all of them). */
