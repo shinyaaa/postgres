@@ -16,6 +16,7 @@
 #include "access/xlogdefs.h"
 #include "access/xlogreader.h"
 #include "access/xlogrecord.h"
+#include "utils/timestamp.h"
 
 /* GUCs */
 extern PGDLLIMPORT int recovery_prefetch;
@@ -37,7 +38,7 @@ extern void XLogPrefetchReconfigure(void);
 extern size_t XLogPrefetchShmemSize(void);
 extern void XLogPrefetchShmemInit(void);
 
-extern void XLogPrefetchResetStats(void);
+extern TimestampTz XLogPrefetchResetStats(void);
 
 extern XLogPrefetcher *XLogPrefetcherAllocate(XLogReaderState *reader);
 extern void XLogPrefetcherFree(XLogPrefetcher *prefetcher);

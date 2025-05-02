@@ -299,16 +299,18 @@ XLogPrefetchShmemSize(void)
 /*
  * Reset all counters to zero.
  */
-void
+TimestampTz
 XLogPrefetchResetStats(void)
 {
-	pg_atomic_write_u64(&SharedStats->reset_time, GetCurrentTimestamp());
+	TimestampTz ts = GetCurrentTimestamp();
+	pg_atomic_write_u64(&SharedStats->reset_time, ts);
 	pg_atomic_write_u64(&SharedStats->prefetch, 0);
 	pg_atomic_write_u64(&SharedStats->hit, 0);
 	pg_atomic_write_u64(&SharedStats->skip_init, 0);
 	pg_atomic_write_u64(&SharedStats->skip_new, 0);
 	pg_atomic_write_u64(&SharedStats->skip_fpw, 0);
 	pg_atomic_write_u64(&SharedStats->skip_rep, 0);
+	return ts;
 }
 
 void

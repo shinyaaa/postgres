@@ -6143,7 +6143,7 @@
 { oid => '3775',
   descr => 'statistics: reset collected statistics shared across the cluster',
   proname => 'pg_stat_reset_shared', proisstrict => 'f', provolatile => 'v',
-  prorettype => 'void', proargtypes => 'text',
+  prorettype => 'timestamptz', proargtypes => 'text',
   prosrc => 'pg_stat_reset_shared' },
 { oid => '3776',
   descr => 'statistics: reset collected statistics for a single table or index in the current database or shared across all databases in the cluster',

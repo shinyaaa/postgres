@@ -638,7 +638,7 @@ AS 'unicode_is_normalized';
 
 CREATE OR REPLACE FUNCTION
   pg_stat_reset_shared(target text DEFAULT NULL)
-RETURNS void
+RETURNS timestamp with time zone
 LANGUAGE INTERNAL
 CALLED ON NULL INPUT VOLATILE PARALLEL SAFE
 AS 'pg_stat_reset_shared';

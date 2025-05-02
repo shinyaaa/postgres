@@ -473,32 +473,32 @@ SELECT stats_reset > :'slru_notify_reset_ts'::timestamptz FROM pg_stat_slru WHER
 
 -- Test that reset_shared with archiver specified as the stats type works
 SELECT stats_reset AS archiver_reset_ts FROM pg_stat_archiver \gset
-SELECT pg_stat_reset_shared('archiver');
+SELECT pg_stat_reset_shared('archiver') IS NOT NULL AS t;
 SELECT stats_reset > :'archiver_reset_ts'::timestamptz FROM pg_stat_archiver;
 
 -- Test that reset_shared with bgwriter specified as the stats type works
 SELECT stats_reset AS bgwriter_reset_ts FROM pg_stat_bgwriter \gset
-SELECT pg_stat_reset_shared('bgwriter');
+SELECT pg_stat_reset_shared('bgwriter') IS NOT NULL AS t;
 SELECT stats_reset > :'bgwriter_reset_ts'::timestamptz FROM pg_stat_bgwriter;
 
 -- Test that reset_shared with checkpointer specified as the stats type works
 SELECT stats_reset AS checkpointer_reset_ts FROM pg_stat_checkpointer \gset
-SELECT pg_stat_reset_shared('checkpointer');
+SELECT pg_stat_reset_shared('checkpointer') IS NOT NULL AS t;
 SELECT stats_reset > :'checkpointer_reset_ts'::timestamptz FROM pg_stat_checkpointer;
 
 -- Test that reset_shared with recovery_prefetch specified as the stats type works
 SELECT stats_reset AS recovery_prefetch_reset_ts FROM pg_stat_recovery_prefetch \gset
-SELECT pg_stat_reset_shared('recovery_prefetch');
+SELECT pg_stat_reset_shared('recovery_prefetch') IS NOT NULL AS t;
 SELECT stats_reset > :'recovery_prefetch_reset_ts'::timestamptz FROM pg_stat_recovery_prefetch;
 
 -- Test that reset_shared with slru specified as the stats type works
 SELECT max(stats_reset) AS slru_reset_ts FROM pg_stat_slru \gset
-SELECT pg_stat_reset_shared('slru');
+SELECT pg_stat_reset_shared('slru') IS NOT NULL AS t;
 SELECT max(stats_reset) > :'slru_reset_ts'::timestamptz FROM pg_stat_slru;
 
 -- Test that reset_shared with wal specified as the stats type works
 SELECT stats_reset AS wal_reset_ts FROM pg_stat_wal \gset
-SELECT pg_stat_reset_shared('wal');
+SELECT pg_stat_reset_shared('wal') IS NOT NULL AS t;
 SELECT stats_reset > :'wal_reset_ts'::timestamptz FROM pg_stat_wal;
 
 -- Test error case for reset_shared with unknown stats type
@@ -808,7 +808,7 @@ SELECT sum(evictions) + sum(reuses) + sum(extends) + sum(fsyncs) + sum(reads) + 
   FROM pg_stat_io \gset
 SELECT sum(evictions) + sum(reuses) + sum(extends) + sum(fsyncs) + sum(reads) + sum(writes) + sum(writebacks) + sum(hits) AS my_io_stats_pre_reset
   FROM pg_stat_get_backend_io(pg_backend_pid()) \gset
-SELECT pg_stat_reset_shared('io');
+SELECT pg_stat_reset_shared('io') IS NOT NULL AS t;
 SELECT sum(evictions) + sum(reuses) + sum(extends) + sum(fsyncs) + sum(reads) + sum(writes) + sum(writebacks) + sum(hits) AS io_stats_post_reset
   FROM pg_stat_io \gset
 SELECT :io_stats_post_reset < :io_stats_pre_reset;

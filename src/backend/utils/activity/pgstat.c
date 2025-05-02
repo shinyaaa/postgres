@@ -887,7 +887,7 @@ pgstat_reset(PgStat_Kind kind, Oid dboid, uint64 objid)
  * Permission checking for this function is managed through the normal
  * GRANT system.
  */
-void
+TimestampTz
 pgstat_reset_of_kind(PgStat_Kind kind)
 {
 	const PgStat_KindInfo *kind_info = pgstat_get_kind_info(kind);
@@ -897,8 +897,9 @@ pgstat_reset_of_kind(PgStat_Kind kind)
 		kind_info->reset_all_cb(ts);
 	else
 		pgstat_reset_entries_of_kind(kind, ts);
-}
 
+	return ts;
+}
 
 /* ------------------------------------------------------------
  * Fetching of stats

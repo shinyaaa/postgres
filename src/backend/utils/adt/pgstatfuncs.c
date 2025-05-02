@@ -1872,6 +1872,7 @@ Datum
 pg_stat_reset_shared(PG_FUNCTION_ARGS)
 {
 	char	   *target = NULL;
+	TimestampTz ts;
 
 	if (PG_ARGISNULL(0))
 	{
@@ -1882,34 +1883,34 @@ pg_stat_reset_shared(PG_FUNCTION_ARGS)
 		pgstat_reset_of_kind(PGSTAT_KIND_IO);
 		XLogPrefetchResetStats();
 		pgstat_reset_of_kind(PGSTAT_KIND_SLRU);
-		pgstat_reset_of_kind(PGSTAT_KIND_WAL);
+		ts = pgstat_reset_of_kind(PGSTAT_KIND_WAL);
 
-		PG_RETURN_VOID();
+		PG_RETURN_TIMESTAMPTZ(ts);
 	}
 
 	target = text_to_cstring(PG_GETARG_TEXT_PP(0));
 
 	if (strcmp(target, "archiver") == 0)
-		pgstat_reset_of_kind(PGSTAT_KIND_ARCHIVER);
+		ts = pgstat_reset_of_kind(PGSTAT_KIND_ARCHIVER);
 	else if (strcmp(target, "bgwriter") == 0)
-		pgstat_reset_of_kind(PGSTAT_KIND_BGWRITER);
+		ts = pgstat_reset_of_kind(PGSTAT_KIND_BGWRITER);
 	else if (strcmp(target, "checkpointer") == 0)
-		pgstat_reset_of_kind(PGSTAT_KIND_CHECKPOINTER);
+		ts = pgstat_reset_of_kind(PGSTAT_KIND_CHECKPOINTER);
 	else if (strcmp(target, "io") == 0)
-		pgstat_reset_of_kind(PGSTAT_KIND_IO);
+		ts = pgstat_reset_of_kind(PGSTAT_KIND_IO);
 	else if (strcmp(target, "recovery_prefetch") == 0)
-		XLogPrefetchResetStats();
+		ts = XLogPrefetchResetStats();
 	else if (strcmp(target, "slru") == 0)
-		pgstat_reset_of_kind(PGSTAT_KIND_SLRU);
+		ts = pgstat_reset_of_kind(PGSTAT_KIND_SLRU);
 	else if (strcmp(target, "wal") == 0)
-		pgstat_reset_of_kind(PGSTAT_KIND_WAL);
+		ts = pgstat_reset_of_kind(PGSTAT_KIND_WAL);
 	else
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("unrecognized reset target: \"%s\"", target),
 				 errhint("Target must be \"archiver\", \"bgwriter\", \"checkpointer\", \"io\", \"recovery_prefetch\", \"slru\", or \"wal\".")));
 
-	PG_RETURN_VOID();
+	PG_RETURN_TIMESTAMPTZ(ts);
 }
 
 /*

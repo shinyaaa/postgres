@@ -5013,11 +5013,12 @@ description | Waiting for a newly initialized WAL file to reach durable storage
          <primary>pg_stat_reset_shared</primary>
         </indexterm>
         <function>pg_stat_reset_shared</function> ( [ <parameter>target</parameter> <type>text</type> <literal>DEFAULT</literal> <literal>NULL</literal> ] )
-        <returnvalue>void</returnvalue>
+        <returnvalue>timestamp with time zone</returnvalue>
        </para>
        <para>
         Resets some cluster-wide statistics counters to zero, depending on the
-        argument. <parameter>target</parameter> can be:
+        argument, and returns the time of the reset.
+        <parameter>target</parameter> can be:
        <itemizedlist>
         <listitem>
          <para>
