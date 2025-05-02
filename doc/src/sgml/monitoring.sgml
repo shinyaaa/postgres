@@ -5190,13 +5190,13 @@ description | Waiting for a newly initialized WAL file to reach durable storage
           <primary>pg_stat_reset_subscription_stats</primary>
         </indexterm>
         <function>pg_stat_reset_subscription_stats</function> ( <type>oid</type> )
-        <returnvalue>void</returnvalue>
+        <returnvalue>timestamp with time zone</returnvalue>
        </para>
        <para>
         Resets statistics for a single subscription shown in the
-        <structname>pg_stat_subscription_stats</structname> view to zero. If
-        the argument is <literal>NULL</literal>, reset statistics for all
-        subscriptions.
+        <structname>pg_stat_subscription_stats</structname> view to zero, and
+        returns the time of the reset. If the argument is
+        <literal>NULL</literal>, reset statistics for all subscriptions.
        </para>
        <para>
         This function is restricted to superusers by default, but other users

@@ -47,10 +47,10 @@ SELECT subname, stats_reset IS NULL stats_reset_is_null FROM pg_stat_subscriptio
  regress_testsub | t
 (1 row)
 
-SELECT pg_stat_reset_subscription_stats(oid) FROM pg_subscription WHERE subname = 'regress_testsub';
- pg_stat_reset_subscription_stats 
-----------------------------------
- 
+SELECT pg_stat_reset_subscription_stats(oid) IS NOT NULL AS t FROM pg_subscription WHERE subname = 'regress_testsub';
+ t 
+---
+ t
 (1 row)
 
 SELECT subname, stats_reset IS NULL stats_reset_is_null FROM pg_stat_subscription_stats WHERE subname = 'regress_testsub';
@@ -61,10 +61,10 @@ SELECT subname, stats_reset IS NULL stats_reset_is_null FROM pg_stat_subscriptio
 
 -- Reset the stats again and check if the new reset_stats is updated.
 SELECT stats_reset as prev_stats_reset FROM pg_stat_subscription_stats WHERE subname = 'regress_testsub' \gset
-SELECT pg_stat_reset_subscription_stats(oid) FROM pg_subscription WHERE subname = 'regress_testsub';
- pg_stat_reset_subscription_stats 
-----------------------------------
- 
+SELECT pg_stat_reset_subscription_stats(oid) IS NOT NULL AS t FROM pg_subscription WHERE subname = 'regress_testsub';
+ t 
+---
+ t
 (1 row)
 
 SELECT :'prev_stats_reset' < stats_reset FROM pg_stat_subscription_stats WHERE subname = 'regress_testsub';

@@ -2017,11 +2017,12 @@ Datum
 pg_stat_reset_subscription_stats(PG_FUNCTION_ARGS)
 {
 	Oid			subid;
+	TimestampTz ts;
 
 	if (PG_ARGISNULL(0))
 	{
 		/* Clear all subscription stats */
-		pgstat_reset_of_kind(PGSTAT_KIND_SUBSCRIPTION);
+		ts = pgstat_reset_of_kind(PGSTAT_KIND_SUBSCRIPTION);
 	}
 	else
 	{
@@ -2031,10 +2032,10 @@ pg_stat_reset_subscription_stats(PG_FUNCTION_ARGS)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("invalid subscription OID %u", subid)));
-		pgstat_reset(PGSTAT_KIND_SUBSCRIPTION, InvalidOid, subid);
+		ts = pgstat_reset(PGSTAT_KIND_SUBSCRIPTION, InvalidOid, subid);
 	}
 
-	PG_RETURN_VOID();
+	PG_RETURN_TIMESTAMPTZ(ts);
 }
 
 Datum

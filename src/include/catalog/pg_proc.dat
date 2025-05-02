@@ -6172,7 +6172,7 @@
 { oid => '6232',
   descr => 'statistics: reset collected statistics for a single subscription',
   proname => 'pg_stat_reset_subscription_stats', proisstrict => 'f',
-  provolatile => 'v', prorettype => 'void', proargtypes => 'oid',
+  provolatile => 'v', prorettype => 'timestamptz', proargtypes => 'oid',
   prosrc => 'pg_stat_reset_subscription_stats' },
 
 { oid => '3163', descr => 'current trigger depth',
