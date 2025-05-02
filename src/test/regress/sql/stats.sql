@@ -524,7 +524,7 @@ SELECT pg_stat_get_snapshot_timestamp();
 SELECT pg_stat_get_function_calls(0);
 SELECT pg_stat_get_snapshot_timestamp() >= NOW();
 -- shows NULL again after clearing
-SELECT pg_stat_clear_snapshot();
+SELECT pg_stat_clear_snapshot() IS NOT NULL AS t;
 SELECT pg_stat_get_snapshot_timestamp();
 COMMIT;
 

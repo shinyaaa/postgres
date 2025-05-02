@@ -529,7 +529,7 @@ extern TimestampTz pgstat_reset(PgStat_Kind kind, Oid dboid, uint64 objid);
 extern TimestampTz pgstat_reset_of_kind(PgStat_Kind kind);
 
 /* stats accessors */
-extern void pgstat_clear_snapshot(void);
+extern TimestampTz pgstat_clear_snapshot(void);
 extern TimestampTz pgstat_get_stat_snapshot_timestamp(bool *have_snapshot);
 
 /* helpers */

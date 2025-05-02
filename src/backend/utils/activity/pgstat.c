@@ -916,7 +916,7 @@ pgstat_reset_of_kind(PgStat_Kind kind)
  * the no-longer-wanted snapshot.  Updates of stats_fetch_consistency can
  * cause this routine to be called.
  */
-void
+TimestampTz
 pgstat_clear_snapshot(void)
 {
 	pgstat_assert_is_up();
@@ -946,6 +946,8 @@ pgstat_clear_snapshot(void)
 
 	/* Reset this flag, as it may be possible that a cleanup was forced. */
 	force_stats_snapshot_clear = false;
+
+	return GetCurrentTimestamp();
 }
 
 void *

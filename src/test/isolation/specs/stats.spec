@@ -40,7 +40,7 @@ setup { SET stats_fetch_consistency = 'none'; }
 step s1_fetch_consistency_none { SET stats_fetch_consistency = 'none'; }
 step s1_fetch_consistency_cache { SET stats_fetch_consistency = 'cache'; }
 step s1_fetch_consistency_snapshot { SET stats_fetch_consistency = 'snapshot'; }
-step s1_clear_snapshot { SELECT pg_stat_clear_snapshot(); }
+step s1_clear_snapshot { SELECT pg_stat_clear_snapshot() IS NOT NULL AS t; }
 step s1_begin { BEGIN; }
 step s1_commit { COMMIT; }
 step s1_rollback { ROLLBACK; }

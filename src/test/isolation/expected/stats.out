@@ -3422,10 +3422,10 @@ step s1_slru_check_stats:
 t       
 (1 row)
 
-step s1_clear_snapshot: SELECT pg_stat_clear_snapshot();
-pg_stat_clear_snapshot
-----------------------
-                      
+step s1_clear_snapshot: SELECT pg_stat_clear_snapshot() IS NOT NULL AS t;
+t
+-
+t
 (1 row)
 
 step s1_slru_check_stats: 
@@ -3495,10 +3495,10 @@ step s1_slru_check_stats:
 f       
 (1 row)
 
-step s1_clear_snapshot: SELECT pg_stat_clear_snapshot();
-pg_stat_clear_snapshot
-----------------------
-                      
+step s1_clear_snapshot: SELECT pg_stat_clear_snapshot() IS NOT NULL AS t;
+t
+-
+t
 (1 row)
 
 step s1_slru_check_stats: 
@@ -3568,10 +3568,10 @@ step s1_slru_check_stats:
 f       
 (1 row)
 
-step s1_clear_snapshot: SELECT pg_stat_clear_snapshot();
-pg_stat_clear_snapshot
-----------------------
-                      
+step s1_clear_snapshot: SELECT pg_stat_clear_snapshot() IS NOT NULL AS t;
+t
+-
+t
 (1 row)
 
 step s1_slru_check_stats: 
@@ -3712,10 +3712,10 @@ name          |pg_stat_get_function_calls|total_above_zero|self_above_zero
 test_stat_func|                          |                |               
 (1 row)
 
-step s1_clear_snapshot: SELECT pg_stat_clear_snapshot();
-pg_stat_clear_snapshot
-----------------------
-                      
+step s1_clear_snapshot: SELECT pg_stat_clear_snapshot() IS NOT NULL AS t;
+t
+-
+t
 (1 row)
 
 step s1_func_stats: 

@@ -1837,9 +1837,11 @@ pg_stat_get_snapshot_timestamp(PG_FUNCTION_ARGS)
 Datum
 pg_stat_clear_snapshot(PG_FUNCTION_ARGS)
 {
-	pgstat_clear_snapshot();
+	TimestampTz ts;
 
-	PG_RETURN_VOID();
+	ts = pgstat_clear_snapshot();
+
+	PG_RETURN_TIMESTAMPTZ(ts);
 }
 
 

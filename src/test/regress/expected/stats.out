@@ -1136,10 +1136,10 @@ SELECT pg_stat_get_snapshot_timestamp() >= NOW();
 (1 row)
 
 -- shows NULL again after clearing
-SELECT pg_stat_clear_snapshot();
- pg_stat_clear_snapshot 
-------------------------
- 
+SELECT pg_stat_clear_snapshot() IS NOT NULL AS t;
+ t 
+---
+ t
 (1 row)
 
 SELECT pg_stat_get_snapshot_timestamp();

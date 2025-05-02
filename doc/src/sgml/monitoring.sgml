@@ -4982,10 +4982,11 @@ description | Waiting for a newly initialized WAL file to reach durable storage
          <primary>pg_stat_clear_snapshot</primary>
         </indexterm>
         <function>pg_stat_clear_snapshot</function> ()
-        <returnvalue>void</returnvalue>
+        <returnvalue>timestamp with time zone</returnvalue>
        </para>
        <para>
-        Discards the current statistics snapshot or cached information.
+        Discards the current statistics snapshot or cached information, and
+        returns the time of the discard.
        </para></entry>
       </row>
 

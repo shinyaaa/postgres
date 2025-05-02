@@ -6129,7 +6129,7 @@
 { oid => '2230',
   descr => 'statistics: discard current transaction\'s statistics snapshot',
   proname => 'pg_stat_clear_snapshot', proisstrict => 'f', provolatile => 'v',
-  proparallel => 'r', prorettype => 'void', proargtypes => '',
+  proparallel => 'r', prorettype => 'timestamptz', proargtypes => '',
   prosrc => 'pg_stat_clear_snapshot' },
 { oid => '2137',
   descr => 'statistics: force stats to be flushed after the next commit',
