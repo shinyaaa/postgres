@@ -67,6 +67,23 @@ AS 'MODULE_PATHNAME', 'page_checksum_1_9'
 LANGUAGE C STRICT PARALLEL SAFE;
 
 --
+-- spgist_page_type()
+--
+CREATE FUNCTION spgist_page_type(IN page bytea)
+RETURNS text
+AS 'MODULE_PATHNAME', 'spgist_page_type'
+LANGUAGE C STRICT PARALLEL SAFE;
+
+--
+-- spgist_metapage_info()
+--
+CREATE FUNCTION spgist_metapage_info(IN page bytea,
+    OUT magic_number bigint,
+    OUT version int4)
+AS 'MODULE_PATHNAME', 'spgist_metapage_info'
+LANGUAGE C STRICT PARALLEL SAFE;
+
+--
 -- bt_metap()
 --
 DROP FUNCTION bt_metap(text);

@@ -8,6 +8,7 @@ OBJS = \
 	fsmfuncs.o \
 	ginfuncs.o \
 	gistfuncs.o \
+	spgistfuncs.o \
 	hashfuncs.o \
 	heapfuncs.o \
 	rawpage.o
@@ -23,7 +24,7 @@ DATA =  pageinspect--1.12--1.13.sql \
 	pageinspect--1.0--1.1.sql
 PGFILEDESC = "pageinspect - functions to inspect contents of database pages"
 
-REGRESS = page btree brin gin gist hash checksum oldextversions
+REGRESS = page btree brin gin gist spgist hash checksum oldextversions
 
 ifdef USE_PGXS
 PG_CONFIG = pg_config

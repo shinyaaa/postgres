@@ -811,6 +811,76 @@ test=# SELECT * FROM gist_page_items_bytea(get_raw_page('test_gist_idx', 0));
   </variablelist>
  </sect2>
 
+ <sect2 id="pageinspect-spgist-funcs">
+  <title>SP-GiST Functions</title>
+
+  <variablelist>
+   <varlistentry>
+    <term>
+     <function>spgist_page_type(page bytea) returns text</function>
+     <indexterm>
+      <primary>spgist_page_type</primary>
+     </indexterm>
+    </term>
+
+    <listitem>
+     <para>
+      <function>spgist_page_type</function> returns the type of a page from an
+      <acronym>SP-GiST</acronym> index: <literal>meta</literal> for the
+      metapage, <literal>leaf</literal> for leaf pages, or <literal>inner</literal>
+      for inner-node pages.  It throws an error if the supplied page is not a
+      valid SP-GiST page.  For example:
+<screen>
+test=# SELECT spgist_page_type(get_raw_page('test_spgist_idx', 0));
+ spgist_page_type 
+------------------
+ meta
+(1 row)
+
+test=# SELECT spgist_page_type(get_raw_page('test_spgist_idx', 1));
+ spgist_page_type 
+------------------
+ leaf
+(1 row)
+</screen>
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term>
+     <function>spgist_metapage_info(page bytea) returns record</function>
+     <indexterm>
+      <primary>spgist_metapage_info</primary>
+     </indexterm>
+    </term>
+
+    <listitem>
+     <para>
+      <function>spgist_metapage_info</function> returns information stored on
+      an SP-GiST metapage.  At present it returns the metapage's magic number
+      and a format version (implementation detail).  It will raise an error if
+      the supplied page is not an SP-GiST metapage.  For example:
+<screen>
+test=# SELECT * FROM spgist_metapage_info(get_raw_page('test_spgist_idx', 0));
+ magic_number | version 
+--------------+---------
+   3121327086 |       1
+(1 row)
+</screen>
+     </para>
+
+     <para>
+      As with other functions in this module, a page image obtained with
+      <function>get_raw_page</function> should be passed as the argument.
+      Non-SP-GiST pages or invalid input will provoke an error; all functions
+      here require superuser privilege.
+     </para>
+    </listitem>
+   </varlistentry>
+  </variablelist>
+ </sect2>
+
  <sect2 id="pageinspect-hash-funcs">
   <title>Hash Functions</title>
 
