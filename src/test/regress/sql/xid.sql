@@ -59,6 +59,20 @@ create index on xid8_t1 using btree(x);
 create index on xid8_t1 using hash(x);
 drop table xid8_t1;
 
+-- xid8 arithmetic operators
+select '42'::xid8 + 3::bigint;
+select 3::bigint + '42'::xid8;
+select '42'::xid8 - 3::bigint;
+select '100'::xid8 - '42'::xid8;
+select '42'::xid8 + (-3)::bigint;
+select '42'::xid8 - (-3)::bigint;
+
+-- xid8 arithmetic overflow/underflow
+select '0'::xid8 - 1::bigint;
+select '18446744073709551615'::xid8 + 1::bigint;
+select '18446744073709551615'::xid8 - '0'::xid8;
+select '0'::xid8 - '18446744073709551615'::xid8;
+
 
 -- pg_snapshot data type and related functions
 

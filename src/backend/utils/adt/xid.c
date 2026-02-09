@@ -313,6 +313,70 @@ hashxid8extended(PG_FUNCTION_ARGS)
 }
 
 Datum
+xid8pl(PG_FUNCTION_ARGS)
+{
+	FullTransactionId fxid = PG_GETARG_FULLTRANSACTIONID(0);
+	int64		delta = PG_GETARG_INT64(1);
+	uint64		val = U64FromFullTransactionId(fxid);
+	uint64		result;
+
+	result = val + (uint64) delta;
+
+	/* Check for over/underflow */
+	if ((delta > 0 && result < val) || (delta < 0 && result > val))
+		ereport(ERROR,
+				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+				 errmsg("xid8 out of range")));
+
+	PG_RETURN_FULLTRANSACTIONID(FullTransactionIdFromU64(result));
+}
+
+Datum
+xid8mi(PG_FUNCTION_ARGS)
+{
+	FullTransactionId fxid = PG_GETARG_FULLTRANSACTIONID(0);
+	int64		delta = PG_GETARG_INT64(1);
+	uint64		val = U64FromFullTransactionId(fxid);
+	uint64		result;
+
+	result = val - (uint64) delta;
+
+	/* Check for over/underflow */
+	if ((delta > 0 && result > val) || (delta < 0 && result < val))
+		ereport(ERROR,
+				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+				 errmsg("xid8 out of range")));
+
+	PG_RETURN_FULLTRANSACTIONID(FullTransactionIdFromU64(result));
+}
+
+Datum
+xid8_mi_xid8(PG_FUNCTION_ARGS)
+{
+	FullTransactionId fxid1 = PG_GETARG_FULLTRANSACTIONID(0);
+	FullTransactionId fxid2 = PG_GETARG_FULLTRANSACTIONID(1);
+	uint64		val1 = U64FromFullTransactionId(fxid1);
+	uint64		val2 = U64FromFullTransactionId(fxid2);
+
+	if (val1 >= val2)
+	{
+		if (val1 - val2 > (uint64) PG_INT64_MAX)
+			ereport(ERROR,
+					(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+					 errmsg("bigint out of range")));
+		PG_RETURN_INT64((int64) (val1 - val2));
+	}
+	else
+	{
+		if (val2 - val1 > (uint64) PG_INT64_MAX + 1)
+			ereport(ERROR,
+					(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+					 errmsg("bigint out of range")));
+		PG_RETURN_INT64(-((int64) (val2 - val1)));
+	}
+}
+
+Datum
 xid8_larger(PG_FUNCTION_ARGS)
 {
 	FullTransactionId fxid1 = PG_GETARG_FULLTRANSACTIONID(0);
