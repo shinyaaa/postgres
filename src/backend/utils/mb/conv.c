@@ -11,6 +11,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "mb/pg_encoding_simd.h"
 #include "mb/pg_wchar.h"
 
 
@@ -52,7 +53,14 @@ local2local(const unsigned char *l,
 			report_invalid_encoding(src_encoding, (const char *) l, len);
 		}
 		if (!IS_HIGHBIT_SET(c1))
-			*p++ = c1;
+		{
+			/* SIMD fast path: bulk copy runs of ASCII bytes */
+			int			n = encoding_copy_ascii(l, p, len);
+
+			l += n;
+			p += n;
+			len -= n;
+		}
 		else
 		{
 			c2 = tab[c1 - HIGHBIT];
@@ -65,9 +73,9 @@ local2local(const unsigned char *l,
 				report_untranslatable_char(src_encoding, dest_encoding,
 										   (const char *) l, len);
 			}
+			l++;
+			len--;
 		}
-		l++;
-		len--;
 	}
 	*p = '\0';
 
@@ -101,11 +109,22 @@ latin2mic(const unsigned char *l, unsigned char *p, int len,
 				break;
 			report_invalid_encoding(encoding, (const char *) l, len);
 		}
-		if (IS_HIGHBIT_SET(c1))
+		if (!IS_HIGHBIT_SET(c1))
+		{
+			/* SIMD fast path: ASCII bytes copy 1:1 to MIC */
+			int			n = encoding_copy_ascii(l, p, len);
+
+			l += n;
+			p += n;
+			len -= n;
+		}
+		else
+		{
 			*p++ = lc;
-		*p++ = c1;
-		l++;
-		len--;
+			*p++ = c1;
+			l++;
+			len--;
+		}
 	}
 	*p = '\0';
 
@@ -141,10 +160,12 @@ mic2latin(const unsigned char *mic, unsigned char *p, int len,
 		}
 		if (!IS_HIGHBIT_SET(c1))
 		{
-			/* easy for ASCII */
-			*p++ = c1;
-			mic++;
-			len--;
+			/* SIMD fast path: bulk copy runs of ASCII bytes */
+			int			n = encoding_copy_ascii(mic, p, len);
+
+			mic += n;
+			p += n;
+			len -= n;
 		}
 		else
 		{
@@ -213,7 +234,14 @@ latin2mic_with_table(const unsigned char *l,
 			report_invalid_encoding(encoding, (const char *) l, len);
 		}
 		if (!IS_HIGHBIT_SET(c1))
-			*p++ = c1;
+		{
+			/* SIMD fast path: ASCII bytes copy 1:1 to MIC */
+			int			n = encoding_copy_ascii(l, p, len);
+
+			l += n;
+			p += n;
+			len -= n;
+		}
 		else
 		{
 			c2 = tab[c1 - HIGHBIT];
@@ -229,9 +257,9 @@ latin2mic_with_table(const unsigned char *l,
 				report_untranslatable_char(encoding, PG_MULE_INTERNAL,
 										   (const char *) l, len);
 			}
+			l++;
+			len--;
 		}
-		l++;
-		len--;
 	}
 	*p = '\0';
 
@@ -277,10 +305,12 @@ mic2latin_with_table(const unsigned char *mic,
 		}
 		if (!IS_HIGHBIT_SET(c1))
 		{
-			/* easy for ASCII */
-			*p++ = c1;
-			mic++;
-			len--;
+			/* SIMD fast path: bulk copy runs of ASCII bytes */
+			int			n = encoding_copy_ascii(mic, p, len);
+
+			mic += n;
+			p += n;
+			len -= n;
 		}
 		else
 		{
@@ -541,8 +571,16 @@ UtfToLocal(const unsigned char *utf, int len,
 
 		if (l == 1)
 		{
-			/* ASCII case is easy, assume it's one-to-one conversion */
-			*iso++ = *utf++;
+			/*
+			 * ASCII case is easy, assume it's one-to-one conversion.
+			 * Use SIMD to bulk copy runs of ASCII bytes.
+			 */
+			int			n = encoding_copy_ascii(utf, iso, len);
+
+			Assert(n >= 1);
+			utf += n;
+			iso += n;
+			len -= (n - 1);	/* loop will subtract 1 more via len -= l */
 			continue;
 		}
 
@@ -745,9 +783,17 @@ LocalToUtf(const unsigned char *iso, int len,
 
 		if (!IS_HIGHBIT_SET(*iso))
 		{
-			/* ASCII case is easy, assume it's one-to-one conversion */
-			*utf++ = *iso++;
+			/*
+			 * ASCII case is easy, assume it's one-to-one conversion.
+			 * Use SIMD to bulk copy runs of ASCII bytes.
+			 */
+			int			n = encoding_copy_ascii(iso, utf, len);
+
+			Assert(n >= 1);
+			iso += n;
+			utf += n;
 			l = 1;
+			len -= (n - 1);	/* loop will subtract 1 more via len -= l */
 			continue;
 		}
 

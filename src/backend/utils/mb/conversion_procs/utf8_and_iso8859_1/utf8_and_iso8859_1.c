@@ -13,6 +13,7 @@
 
 #include "postgres.h"
 #include "fmgr.h"
+#include "mb/pg_encoding_simd.h"
 #include "mb/pg_wchar.h"
 
 PG_MODULE_MAGIC_EXT(
@@ -59,14 +60,21 @@ iso8859_1_to_utf8(PG_FUNCTION_ARGS)
 			report_invalid_encoding(PG_LATIN1, (const char *) src, len);
 		}
 		if (!IS_HIGHBIT_SET(c))
-			*dest++ = c;
+		{
+			/* SIMD fast path: bulk copy runs of ASCII bytes */
+			int			n = encoding_copy_ascii(src, dest, len);
+
+			src += n;
+			dest += n;
+			len -= n;
+		}
 		else
 		{
 			*dest++ = (c >> 6) | 0xc0;
 			*dest++ = (c & 0x003f) | HIGHBIT;
+			src++;
+			len--;
 		}
-		src++;
-		len--;
 	}
 	*dest = '\0';
 
@@ -95,12 +103,14 @@ utf8_to_iso8859_1(PG_FUNCTION_ARGS)
 				break;
 			report_invalid_encoding(PG_UTF8, (const char *) src, len);
 		}
-		/* fast path for ASCII-subset characters */
+		/* SIMD fast path for ASCII-subset characters */
 		if (!IS_HIGHBIT_SET(c))
 		{
-			*dest++ = c;
-			src++;
-			len--;
+			int			n = encoding_copy_ascii(src, dest, len);
+
+			src += n;
+			dest += n;
+			len -= n;
 		}
 		else
 		{
