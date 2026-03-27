@@ -44,6 +44,7 @@
 #include "optimizer/optimizer.h"
 #include "pgstat.h"
 #include "rewrite/rewriteHandler.h"
+#include "storage/bufmgr.h"
 #include "storage/fd.h"
 #include "tcop/tcopprot.h"
 #include "utils/lsyscache.h"
@@ -553,12 +554,15 @@ CopyMultiInsertBufferFlush(CopyMultiInsertInfo *miinfo,
 		 * context before calling it.
 		 */
 		oldcontext = MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
+		COPY_TIMING_START(cstate->opts.timing, mi_start);
 		table_multi_insert(resultRelInfo->ri_RelationDesc,
 						   slots,
 						   nused,
 						   mycid,
 						   ti_options,
 						   buffer->bistate);
+		COPY_TIMING_END(cstate->opts.timing, mi_start,
+						cstate->heap_insert_time);
 		MemoryContextSwitchTo(oldcontext);
 
 		for (i = 0; i < nused; i++)
@@ -572,13 +576,19 @@ CopyMultiInsertBufferFlush(CopyMultiInsertInfo *miinfo,
 				List	   *recheckIndexes;
 
 				cstate->cur_lineno = buffer->linenos[i];
+				COPY_TIMING_START(cstate->opts.timing, idx_start);
 				recheckIndexes =
 					ExecInsertIndexTuples(resultRelInfo,
 										  estate, 0, buffer->slots[i],
 										  NIL, NULL);
+				COPY_TIMING_END(cstate->opts.timing, idx_start,
+								cstate->index_insert_time);
+				COPY_TIMING_START(cstate->opts.timing, trig_start);
 				ExecARInsertTriggers(estate, resultRelInfo,
 									 slots[i], recheckIndexes,
 									 cstate->transition_capture);
+				COPY_TIMING_END(cstate->opts.timing, trig_start,
+								cstate->trigger_time);
 				list_free(recheckIndexes);
 			}
 
@@ -591,9 +601,12 @@ CopyMultiInsertBufferFlush(CopyMultiInsertInfo *miinfo,
 					  resultRelInfo->ri_TrigDesc->trig_insert_new_table))
 			{
 				cstate->cur_lineno = buffer->linenos[i];
+				COPY_TIMING_START(cstate->opts.timing, trig_start2);
 				ExecARInsertTriggers(estate, resultRelInfo,
 									 slots[i], NIL,
 									 cstate->transition_capture);
+				COPY_TIMING_END(cstate->opts.timing, trig_start2,
+								cstate->trigger_time);
 			}
 
 			ExecClearTuple(slots[i]);
@@ -801,6 +814,7 @@ CopyFrom(CopyFromState cstate)
 	bool		has_before_insert_row_trig;
 	bool		has_instead_insert_row_trig;
 	bool		leafpart_use_multi_insert = false;
+	instr_time	start_time = {0};
 
 	Assert(cstate->rel);
 	Assert(list_length(cstate->range_table) == 1);
@@ -1111,6 +1125,14 @@ CopyFrom(CopyFromState cstate)
 	errcallback.previous = error_context_stack;
 	error_context_stack = &errcallback;
 
+	/* Initialize timing instrumentation if requested */
+	if (cstate->opts.timing)
+	{
+		INSTR_TIME_SET_CURRENT(start_time);
+		cstate->bufusage_start = pgBufferUsage;
+		cstate->walusage_start = pgWalUsage;
+	}
+
 	for (;;)
 	{
 		TupleTableSlot *myslot;
@@ -1148,8 +1170,14 @@ CopyFrom(CopyFromState cstate)
 		ExecClearTuple(myslot);
 
 		/* Directly store the values/nulls array in the slot */
+		COPY_TIMING_START(cstate->opts.timing, parse_start);
 		if (!NextCopyFrom(cstate, econtext, myslot->tts_values, myslot->tts_isnull))
+		{
+			COPY_TIMING_END(cstate->opts.timing, parse_start,
+							cstate->parse_time);
 			break;
+		}
+		COPY_TIMING_END(cstate->opts.timing, parse_start, cstate->parse_time);
 
 		if (cstate->opts.on_error == COPY_ON_ERROR_IGNORE &&
 			cstate->escontext->error_occurred)
@@ -1328,8 +1356,11 @@ CopyFrom(CopyFromState cstate)
 		/* BEFORE ROW INSERT Triggers */
 		if (has_before_insert_row_trig)
 		{
+			COPY_TIMING_START(cstate->opts.timing, br_trig_start);
 			if (!ExecBRInsertTriggers(estate, resultRelInfo, myslot))
 				skip_tuple = true;	/* "do nothing" */
+			COPY_TIMING_END(cstate->opts.timing, br_trig_start,
+							cstate->trigger_time);
 		}
 
 		if (!skip_tuple)
@@ -1357,7 +1388,12 @@ CopyFrom(CopyFromState cstate)
 				 */
 				if (resultRelInfo->ri_FdwRoutine == NULL &&
 					resultRelInfo->ri_RelationDesc->rd_att->constr)
+				{
+					COPY_TIMING_START(cstate->opts.timing, constr_start);
 					ExecConstraints(resultRelInfo, myslot, estate);
+					COPY_TIMING_END(cstate->opts.timing, constr_start,
+									cstate->constraint_time);
+				}
 
 				/*
 				 * Also check the tuple against the partition constraint, if
@@ -1367,7 +1403,12 @@ CopyFrom(CopyFromState cstate)
 				 */
 				if (resultRelInfo->ri_RelationDesc->rd_rel->relispartition &&
 					(proute == NULL || has_before_insert_row_trig))
+				{
+					COPY_TIMING_START(cstate->opts.timing, partchk_start);
 					ExecPartitionCheck(resultRelInfo, myslot, estate, true);
+					COPY_TIMING_END(cstate->opts.timing, partchk_start,
+									cstate->constraint_time);
+				}
 
 				/* Store the slot in the multi-insert buffer, when enabled. */
 				if (insertMethod == CIM_MULTI || leafpart_use_multi_insert)
@@ -1426,19 +1467,30 @@ CopyFrom(CopyFromState cstate)
 					else
 					{
 						/* OK, store the tuple and create index entries for it */
+						COPY_TIMING_START(cstate->opts.timing, hi_start);
 						table_tuple_insert(resultRelInfo->ri_RelationDesc,
 										   myslot, mycid, ti_options, bistate);
+						COPY_TIMING_END(cstate->opts.timing, hi_start,
+										cstate->heap_insert_time);
 
 						if (resultRelInfo->ri_NumIndices > 0)
+						{
+							COPY_TIMING_START(cstate->opts.timing, idx_start);
 							recheckIndexes = ExecInsertIndexTuples(resultRelInfo,
 																   estate, 0,
 																   myslot, NIL,
 																   NULL);
+							COPY_TIMING_END(cstate->opts.timing, idx_start,
+											cstate->index_insert_time);
+						}
 					}
 
 					/* AFTER ROW INSERT Triggers */
+					COPY_TIMING_START(cstate->opts.timing, ar_trig_start);
 					ExecARInsertTriggers(estate, resultRelInfo, myslot,
 										 recheckIndexes, cstate->transition_capture);
+					COPY_TIMING_END(cstate->opts.timing, ar_trig_start,
+									cstate->trigger_time);
 
 					list_free(recheckIndexes);
 				}
@@ -1514,6 +1566,203 @@ CopyFrom(CopyFromState cstate)
 	ExecCloseRangeTableRelations(estate);
 
 	FreeExecutorState(estate);
+
+	/* Report timing breakdown if requested */
+	if (cstate->opts.timing)
+	{
+		StringInfoData buf;
+		BufferUsage bufusage;
+		WalUsage	walusage;
+		instr_time	end_time;
+		double		total_ms;
+		double		parse_ms;
+		double		heap_ms;
+		double		index_ms;
+		double		trigger_ms;
+		double		constr_ms;
+		double		other_ms;
+		bool		has_shared;
+		bool		has_local;
+		bool		has_temp;
+		bool		has_shared_timing;
+		bool		has_local_timing;
+		bool		has_temp_timing;
+		bool		has_wal;
+
+		INSTR_TIME_SET_CURRENT(end_time);
+		INSTR_TIME_SUBTRACT(end_time, start_time);
+
+		total_ms = INSTR_TIME_GET_MILLISEC(end_time);
+		parse_ms = INSTR_TIME_GET_MILLISEC(cstate->parse_time);
+		heap_ms = INSTR_TIME_GET_MILLISEC(cstate->heap_insert_time);
+		index_ms = INSTR_TIME_GET_MILLISEC(cstate->index_insert_time);
+		trigger_ms = INSTR_TIME_GET_MILLISEC(cstate->trigger_time);
+		constr_ms = INSTR_TIME_GET_MILLISEC(cstate->constraint_time);
+		other_ms = total_ms - parse_ms - heap_ms - index_ms - trigger_ms - constr_ms;
+
+		BufferUsageAccumDiff(&bufusage, &pgBufferUsage, &cstate->bufusage_start);
+		WalUsageAccumDiff(&walusage, &pgWalUsage, &cstate->walusage_start);
+
+		initStringInfo(&buf);
+
+		/* Header */
+		appendStringInfo(&buf, _("COPY FROM timing:\n"));
+
+		/* Timing breakdown: show only positive values, total always shown */
+		appendStringInfoString(&buf, _("Timing:"));
+		if (parse_ms > 0)
+			appendStringInfo(&buf, " parse=%.3f", parse_ms);
+		if (heap_ms > 0)
+			appendStringInfo(&buf, " heap insert=%.3f", heap_ms);
+		if (index_ms > 0)
+			appendStringInfo(&buf, " index insert=%.3f", index_ms);
+		if (trigger_ms > 0)
+			appendStringInfo(&buf, " trigger=%.3f", trigger_ms);
+		if (constr_ms > 0)
+			appendStringInfo(&buf, " constraint=%.3f", constr_ms);
+		if (other_ms > 0)
+			appendStringInfo(&buf, " other=%.3f", other_ms);
+		appendStringInfo(&buf, " total=%.3f ms\n", total_ms);
+
+		/* Buffers: same format as EXPLAIN show_buffer_usage() */
+		has_shared = (bufusage.shared_blks_hit > 0 ||
+					  bufusage.shared_blks_read > 0 ||
+					  bufusage.shared_blks_dirtied > 0 ||
+					  bufusage.shared_blks_written > 0);
+		has_local = (bufusage.local_blks_hit > 0 ||
+					 bufusage.local_blks_read > 0 ||
+					 bufusage.local_blks_dirtied > 0 ||
+					 bufusage.local_blks_written > 0);
+		has_temp = (bufusage.temp_blks_read > 0 ||
+					bufusage.temp_blks_written > 0);
+		if (has_shared || has_local || has_temp)
+		{
+			appendStringInfoString(&buf, _("Buffers:"));
+			if (has_shared)
+			{
+				appendStringInfoString(&buf, " shared");
+				if (bufusage.shared_blks_hit > 0)
+					appendStringInfo(&buf, " hit=%" PRId64,
+									 bufusage.shared_blks_hit);
+				if (bufusage.shared_blks_read > 0)
+					appendStringInfo(&buf, " read=%" PRId64,
+									 bufusage.shared_blks_read);
+				if (bufusage.shared_blks_dirtied > 0)
+					appendStringInfo(&buf, " dirtied=%" PRId64,
+									 bufusage.shared_blks_dirtied);
+				if (bufusage.shared_blks_written > 0)
+					appendStringInfo(&buf, " written=%" PRId64,
+									 bufusage.shared_blks_written);
+				if (has_local || has_temp)
+					appendStringInfoChar(&buf, ',');
+			}
+			if (has_local)
+			{
+				appendStringInfoString(&buf, " local");
+				if (bufusage.local_blks_hit > 0)
+					appendStringInfo(&buf, " hit=%" PRId64,
+									 bufusage.local_blks_hit);
+				if (bufusage.local_blks_read > 0)
+					appendStringInfo(&buf, " read=%" PRId64,
+									 bufusage.local_blks_read);
+				if (bufusage.local_blks_dirtied > 0)
+					appendStringInfo(&buf, " dirtied=%" PRId64,
+									 bufusage.local_blks_dirtied);
+				if (bufusage.local_blks_written > 0)
+					appendStringInfo(&buf, " written=%" PRId64,
+									 bufusage.local_blks_written);
+				if (has_temp)
+					appendStringInfoChar(&buf, ',');
+			}
+			if (has_temp)
+			{
+				appendStringInfoString(&buf, " temp");
+				if (bufusage.temp_blks_read > 0)
+					appendStringInfo(&buf, " read=%" PRId64,
+									 bufusage.temp_blks_read);
+				if (bufusage.temp_blks_written > 0)
+					appendStringInfo(&buf, " written=%" PRId64,
+									 bufusage.temp_blks_written);
+			}
+			appendStringInfoChar(&buf, '\n');
+		}
+
+		/* I/O Timings: same format as EXPLAIN show_buffer_usage() */
+		has_shared_timing = (!INSTR_TIME_IS_ZERO(bufusage.shared_blk_read_time) ||
+							 !INSTR_TIME_IS_ZERO(bufusage.shared_blk_write_time));
+		has_local_timing = (!INSTR_TIME_IS_ZERO(bufusage.local_blk_read_time) ||
+							!INSTR_TIME_IS_ZERO(bufusage.local_blk_write_time));
+		has_temp_timing = (!INSTR_TIME_IS_ZERO(bufusage.temp_blk_read_time) ||
+						   !INSTR_TIME_IS_ZERO(bufusage.temp_blk_write_time));
+		if (has_shared_timing || has_local_timing || has_temp_timing)
+		{
+			appendStringInfoString(&buf, _("I/O Timings:"));
+			if (has_shared_timing)
+			{
+				appendStringInfoString(&buf, " shared");
+				if (!INSTR_TIME_IS_ZERO(bufusage.shared_blk_read_time))
+					appendStringInfo(&buf, " read=%0.3f",
+									 INSTR_TIME_GET_MILLISEC(bufusage.shared_blk_read_time));
+				if (!INSTR_TIME_IS_ZERO(bufusage.shared_blk_write_time))
+					appendStringInfo(&buf, " write=%0.3f",
+									 INSTR_TIME_GET_MILLISEC(bufusage.shared_blk_write_time));
+				if (has_local_timing || has_temp_timing)
+					appendStringInfoChar(&buf, ',');
+			}
+			if (has_local_timing)
+			{
+				appendStringInfoString(&buf, " local");
+				if (!INSTR_TIME_IS_ZERO(bufusage.local_blk_read_time))
+					appendStringInfo(&buf, " read=%0.3f",
+									 INSTR_TIME_GET_MILLISEC(bufusage.local_blk_read_time));
+				if (!INSTR_TIME_IS_ZERO(bufusage.local_blk_write_time))
+					appendStringInfo(&buf, " write=%0.3f",
+									 INSTR_TIME_GET_MILLISEC(bufusage.local_blk_write_time));
+				if (has_temp_timing)
+					appendStringInfoChar(&buf, ',');
+			}
+			if (has_temp_timing)
+			{
+				appendStringInfoString(&buf, " temp");
+				if (!INSTR_TIME_IS_ZERO(bufusage.temp_blk_read_time))
+					appendStringInfo(&buf, " read=%0.3f",
+									 INSTR_TIME_GET_MILLISEC(bufusage.temp_blk_read_time));
+				if (!INSTR_TIME_IS_ZERO(bufusage.temp_blk_write_time))
+					appendStringInfo(&buf, " write=%0.3f",
+									 INSTR_TIME_GET_MILLISEC(bufusage.temp_blk_write_time));
+			}
+			appendStringInfoChar(&buf, '\n');
+		}
+
+		/* WAL: same format as EXPLAIN show_wal_usage() */
+		has_wal = (walusage.wal_records > 0 || walusage.wal_fpi > 0 ||
+				   walusage.wal_bytes > 0 || walusage.wal_fpi_bytes > 0 ||
+				   walusage.wal_buffers_full > 0);
+		if (has_wal)
+		{
+			appendStringInfoString(&buf, _("WAL:"));
+			if (walusage.wal_records > 0)
+				appendStringInfo(&buf, " records=%" PRId64,
+								 walusage.wal_records);
+			if (walusage.wal_fpi > 0)
+				appendStringInfo(&buf, " fpi=%" PRId64,
+								 walusage.wal_fpi);
+			if (walusage.wal_bytes > 0)
+				appendStringInfo(&buf, " bytes=%" PRIu64,
+								 walusage.wal_bytes);
+			if (walusage.wal_fpi_bytes > 0)
+				appendStringInfo(&buf, " fpi bytes=%" PRIu64,
+								 walusage.wal_fpi_bytes);
+			if (walusage.wal_buffers_full > 0)
+				appendStringInfo(&buf, " buffers full=%" PRId64,
+								 walusage.wal_buffers_full);
+			appendStringInfoChar(&buf, '\n');
+		}
+
+		ereport(INFO,
+				errmsg_internal("%s", buf.data));
+		pfree(buf.data);
+	}
 
 	return processed;
 }

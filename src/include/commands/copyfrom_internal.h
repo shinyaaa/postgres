@@ -16,6 +16,7 @@
 
 #include "commands/copy.h"
 #include "commands/trigger.h"
+#include "executor/instrument.h"
 #include "nodes/miscnodes.h"
 
 /*
@@ -189,6 +190,15 @@ typedef struct CopyFromStateData
 #define RAW_BUF_BYTES(cstate) ((cstate)->raw_buf_len - (cstate)->raw_buf_index)
 
 	uint64		bytes_processed;	/* number of bytes processed so far */
+
+	/* timing instrumentation (when opts.timing is true) */
+	instr_time	parse_time;			/* accumulated parse time */
+	instr_time	heap_insert_time;	/* accumulated heap insert time */
+	instr_time	index_insert_time;	/* accumulated index insert time */
+	instr_time	trigger_time;		/* accumulated trigger execution time */
+	instr_time	constraint_time;	/* accumulated constraint check time */
+	BufferUsage bufusage_start;		/* buffer usage at COPY start */
+	WalUsage	walusage_start;		/* WAL usage at COPY start */
 } CopyFromStateData;
 
 extern void ReceiveCopyBegin(CopyFromState cstate);

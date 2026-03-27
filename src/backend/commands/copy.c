@@ -570,6 +570,7 @@ ProcessCopyOptions(ParseState *pstate,
 	bool		log_verbosity_specified = false;
 	bool		reject_limit_specified = false;
 	bool		force_array_specified = false;
+	bool		timing_specified = false;
 	ListCell   *option;
 
 	/* Support external use for option sanity checking */
@@ -753,6 +754,13 @@ ProcessCopyOptions(ParseState *pstate,
 				errorConflictingDefElem(defel, pstate);
 			reject_limit_specified = true;
 			opts_out->reject_limit = defGetCopyRejectLimitOption(defel);
+		}
+		else if (strcmp(defel->defname, "timing") == 0)
+		{
+			if (timing_specified)
+				errorConflictingDefElem(defel, pstate);
+			timing_specified = true;
+			opts_out->timing = defGetBoolean(defel);
 		}
 		else
 			ereport(ERROR,

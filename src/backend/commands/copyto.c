@@ -25,6 +25,7 @@
 #include "commands/copyapi.h"
 #include "commands/progress.h"
 #include "executor/execdesc.h"
+#include "executor/instrument.h"
 #include "executor/executor.h"
 #include "executor/tuptable.h"
 #include "funcapi.h"
@@ -33,6 +34,7 @@
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "storage/bufmgr.h"
 #include "storage/fd.h"
 #include "tcop/tcopprot.h"
 #include "utils/json.h"
@@ -110,6 +112,13 @@ typedef struct CopyToStateData
 	FmgrInfo   *out_functions;	/* lookup info for output functions */
 	MemoryContext rowcontext;	/* per-row evaluation context */
 	uint64		bytes_processed;	/* number of bytes processed so far */
+
+	/* timing instrumentation (when opts.timing is true) */
+	instr_time	scan_time;			/* accumulated scan/query time */
+	instr_time	format_time;		/* accumulated formatting time */
+	instr_time	write_time;			/* accumulated write I/O time */
+	BufferUsage bufusage_start;		/* buffer usage at COPY start */
+	WalUsage	walusage_start;		/* WAL usage at COPY start */
 } CopyToStateData;
 
 /* DestReceiver for COPY (query) TO */
@@ -586,6 +595,8 @@ CopySendEndOfRow(CopyToState cstate)
 {
 	StringInfo	fe_msgbuf = cstate->fe_msgbuf;
 
+	COPY_TIMING_START(cstate->opts.timing, write_start);
+
 	switch (cstate->copy_dest)
 	{
 		case COPY_FILE:
@@ -632,6 +643,8 @@ CopySendEndOfRow(CopyToState cstate)
 			cstate->data_dest_cb(fe_msgbuf->data, fe_msgbuf->len);
 			break;
 	}
+
+	COPY_TIMING_END(cstate->opts.timing, write_start, cstate->write_time);
 
 	/* Update the progress */
 	cstate->bytes_processed += fe_msgbuf->len;
@@ -1283,6 +1296,13 @@ DoCopyTo(CopyToState cstate)
 
 	cstate->routine->CopyToStart(cstate, tupDesc);
 
+	/* Initialize timing instrumentation if requested */
+	if (cstate->opts.timing)
+	{
+		cstate->bufusage_start = pgBufferUsage;
+		cstate->walusage_start = pgWalUsage;
+	}
+
 	if (cstate->rel)
 	{
 		/*
@@ -1307,7 +1327,9 @@ DoCopyTo(CopyToState cstate)
 	else
 	{
 		/* run the plan --- the dest receiver will send tuples */
+		COPY_TIMING_START(cstate->opts.timing, query_start);
 		ExecutorRun(cstate->queryDesc, ForwardScanDirection, 0);
+		COPY_TIMING_END(cstate->opts.timing, query_start, cstate->scan_time);
 		processed = ((DR_copy *) cstate->queryDesc->dest)->processed;
 	}
 
@@ -1317,6 +1339,177 @@ DoCopyTo(CopyToState cstate)
 
 	if (fe_copy)
 		SendCopyEnd(cstate);
+
+	/* Report timing breakdown if requested */
+	if (cstate->opts.timing)
+	{
+		StringInfoData buf;
+		BufferUsage bufusage;
+		WalUsage	walusage;
+		double		total_ms;
+		double		scan_ms;
+		double		format_ms;
+		double		write_ms;
+		double		other_ms;
+		bool		has_shared;
+		bool		has_local;
+		bool		has_temp;
+		bool		has_shared_timing;
+		bool		has_local_timing;
+		bool		has_temp_timing;
+
+		/*
+		 * format_time includes write_time because CopyOneRowTo calls
+		 * CopySendEndOfRow internally.  Subtract write_time to get the
+		 * pure formatting time.
+		 */
+		scan_ms = INSTR_TIME_GET_MILLISEC(cstate->scan_time);
+		write_ms = INSTR_TIME_GET_MILLISEC(cstate->write_time);
+		format_ms = INSTR_TIME_GET_MILLISEC(cstate->format_time) - write_ms;
+		if (format_ms < 0)
+			format_ms = 0;
+
+		BufferUsageAccumDiff(&bufusage, &pgBufferUsage, &cstate->bufusage_start);
+		WalUsageAccumDiff(&walusage, &pgWalUsage, &cstate->walusage_start);
+
+		/*
+		 * Compute total as sum of parts rather than wall-clock, since we
+		 * did not capture a start_time for DoCopyTo.  Alternatively, we
+		 * use scan + format + write as total, with other as remainder.
+		 * For simplicity, compute total from the measured parts.
+		 */
+		total_ms = scan_ms + format_ms + write_ms;
+		other_ms = 0;
+
+		initStringInfo(&buf);
+
+		/* Header */
+		appendStringInfo(&buf, _("COPY TO timing:\n"));
+
+		/* Timing breakdown */
+		appendStringInfoString(&buf, _("Timing:"));
+		if (scan_ms > 0)
+			appendStringInfo(&buf, " scan=%.3f", scan_ms);
+		if (format_ms > 0)
+			appendStringInfo(&buf, " format=%.3f", format_ms);
+		if (write_ms > 0)
+			appendStringInfo(&buf, " write=%.3f", write_ms);
+		appendStringInfo(&buf, " total=%.3f ms\n", total_ms);
+
+		/* Buffers: same format as EXPLAIN show_buffer_usage() */
+		has_shared = (bufusage.shared_blks_hit > 0 ||
+					  bufusage.shared_blks_read > 0 ||
+					  bufusage.shared_blks_dirtied > 0 ||
+					  bufusage.shared_blks_written > 0);
+		has_local = (bufusage.local_blks_hit > 0 ||
+					 bufusage.local_blks_read > 0 ||
+					 bufusage.local_blks_dirtied > 0 ||
+					 bufusage.local_blks_written > 0);
+		has_temp = (bufusage.temp_blks_read > 0 ||
+					bufusage.temp_blks_written > 0);
+		if (has_shared || has_local || has_temp)
+		{
+			appendStringInfoString(&buf, _("Buffers:"));
+			if (has_shared)
+			{
+				appendStringInfoString(&buf, " shared");
+				if (bufusage.shared_blks_hit > 0)
+					appendStringInfo(&buf, " hit=%" PRId64,
+									 bufusage.shared_blks_hit);
+				if (bufusage.shared_blks_read > 0)
+					appendStringInfo(&buf, " read=%" PRId64,
+									 bufusage.shared_blks_read);
+				if (bufusage.shared_blks_dirtied > 0)
+					appendStringInfo(&buf, " dirtied=%" PRId64,
+									 bufusage.shared_blks_dirtied);
+				if (bufusage.shared_blks_written > 0)
+					appendStringInfo(&buf, " written=%" PRId64,
+									 bufusage.shared_blks_written);
+				if (has_local || has_temp)
+					appendStringInfoChar(&buf, ',');
+			}
+			if (has_local)
+			{
+				appendStringInfoString(&buf, " local");
+				if (bufusage.local_blks_hit > 0)
+					appendStringInfo(&buf, " hit=%" PRId64,
+									 bufusage.local_blks_hit);
+				if (bufusage.local_blks_read > 0)
+					appendStringInfo(&buf, " read=%" PRId64,
+									 bufusage.local_blks_read);
+				if (bufusage.local_blks_dirtied > 0)
+					appendStringInfo(&buf, " dirtied=%" PRId64,
+									 bufusage.local_blks_dirtied);
+				if (bufusage.local_blks_written > 0)
+					appendStringInfo(&buf, " written=%" PRId64,
+									 bufusage.local_blks_written);
+				if (has_temp)
+					appendStringInfoChar(&buf, ',');
+			}
+			if (has_temp)
+			{
+				appendStringInfoString(&buf, " temp");
+				if (bufusage.temp_blks_read > 0)
+					appendStringInfo(&buf, " read=%" PRId64,
+									 bufusage.temp_blks_read);
+				if (bufusage.temp_blks_written > 0)
+					appendStringInfo(&buf, " written=%" PRId64,
+									 bufusage.temp_blks_written);
+			}
+			appendStringInfoChar(&buf, '\n');
+		}
+
+		/* I/O Timings */
+		has_shared_timing = (!INSTR_TIME_IS_ZERO(bufusage.shared_blk_read_time) ||
+							 !INSTR_TIME_IS_ZERO(bufusage.shared_blk_write_time));
+		has_local_timing = (!INSTR_TIME_IS_ZERO(bufusage.local_blk_read_time) ||
+							!INSTR_TIME_IS_ZERO(bufusage.local_blk_write_time));
+		has_temp_timing = (!INSTR_TIME_IS_ZERO(bufusage.temp_blk_read_time) ||
+						   !INSTR_TIME_IS_ZERO(bufusage.temp_blk_write_time));
+		if (has_shared_timing || has_local_timing || has_temp_timing)
+		{
+			appendStringInfoString(&buf, _("I/O Timings:"));
+			if (has_shared_timing)
+			{
+				appendStringInfoString(&buf, " shared");
+				if (!INSTR_TIME_IS_ZERO(bufusage.shared_blk_read_time))
+					appendStringInfo(&buf, " read=%0.3f",
+									 INSTR_TIME_GET_MILLISEC(bufusage.shared_blk_read_time));
+				if (!INSTR_TIME_IS_ZERO(bufusage.shared_blk_write_time))
+					appendStringInfo(&buf, " write=%0.3f",
+									 INSTR_TIME_GET_MILLISEC(bufusage.shared_blk_write_time));
+				if (has_local_timing || has_temp_timing)
+					appendStringInfoChar(&buf, ',');
+			}
+			if (has_local_timing)
+			{
+				appendStringInfoString(&buf, " local");
+				if (!INSTR_TIME_IS_ZERO(bufusage.local_blk_read_time))
+					appendStringInfo(&buf, " read=%0.3f",
+									 INSTR_TIME_GET_MILLISEC(bufusage.local_blk_read_time));
+				if (!INSTR_TIME_IS_ZERO(bufusage.local_blk_write_time))
+					appendStringInfo(&buf, " write=%0.3f",
+									 INSTR_TIME_GET_MILLISEC(bufusage.local_blk_write_time));
+				if (has_temp_timing)
+					appendStringInfoChar(&buf, ',');
+			}
+			if (has_temp_timing)
+			{
+				appendStringInfoString(&buf, " temp");
+				if (!INSTR_TIME_IS_ZERO(bufusage.temp_blk_read_time))
+					appendStringInfo(&buf, " read=%0.3f",
+									 INSTR_TIME_GET_MILLISEC(bufusage.temp_blk_read_time));
+				if (!INSTR_TIME_IS_ZERO(bufusage.temp_blk_write_time))
+					appendStringInfo(&buf, " write=%0.3f",
+									 INSTR_TIME_GET_MILLISEC(bufusage.temp_blk_write_time));
+			}
+			appendStringInfoChar(&buf, '\n');
+		}
+
+		ereport(INFO,
+				errmsg_internal("%s", buf.data));
+		pfree(buf.data);
+	}
 
 	return processed;
 }
@@ -1352,11 +1545,19 @@ CopyRelationTo(CopyToState cstate, Relation rel, Relation root_rel, uint64 *proc
 										   false);
 	}
 
-	while (table_scan_getnextslot(scandesc, ForwardScanDirection, slot))
+	while (true)
 	{
 		TupleTableSlot *copyslot;
+		bool		got_tuple;
 
 		CHECK_FOR_INTERRUPTS();
+
+		COPY_TIMING_START(cstate->opts.timing, scan_start);
+		got_tuple = table_scan_getnextslot(scandesc, ForwardScanDirection, slot);
+		COPY_TIMING_END(cstate->opts.timing, scan_start, cstate->scan_time);
+
+		if (!got_tuple)
+			break;
 
 		if (map != NULL)
 			copyslot = execute_attr_map_slot(map, slot, root_slot);
@@ -1368,7 +1569,9 @@ CopyRelationTo(CopyToState cstate, Relation rel, Relation root_rel, uint64 *proc
 		}
 
 		/* Format and send the data */
+		COPY_TIMING_START(cstate->opts.timing, fmt_start);
 		CopyOneRowTo(cstate, copyslot);
+		COPY_TIMING_END(cstate->opts.timing, fmt_start, cstate->format_time);
 
 		/*
 		 * Increment the number of processed tuples, and report the progress.

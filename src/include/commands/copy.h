@@ -17,6 +17,7 @@
 #include "nodes/execnodes.h"
 #include "nodes/parsenodes.h"
 #include "parser/parse_node.h"
+#include "portability/instr_time.h"
 #include "tcop/dest.h"
 
 /*
@@ -97,6 +98,7 @@ typedef struct CopyFormatOptions
 	CopyLogVerbosityChoice log_verbosity;	/* verbosity of logged messages */
 	int64		reject_limit;	/* maximum tolerable number of errors */
 	List	   *convert_select; /* list of column names (can be NIL) */
+	bool		timing;			/* report timing breakdown? */
 } CopyFormatOptions;
 
 /* These are private in commands/copy[from|to].c */
@@ -136,5 +138,24 @@ extern void EndCopyTo(CopyToState cstate);
 extern uint64 DoCopyTo(CopyToState cstate);
 extern List *CopyGetAttnums(TupleDesc tupDesc, Relation rel,
 							List *attnamelist);
+
+/*
+ * Helper macros for timing instrumentation in COPY commands.
+ * These wrap instr_time operations and are no-ops when timing is disabled.
+ */
+#define COPY_TIMING_START(timing_enabled, var) \
+	instr_time	var = {0}; \
+	if (timing_enabled) \
+		INSTR_TIME_SET_CURRENT(var)
+
+#define COPY_TIMING_END(timing_enabled, var, field) \
+	do { \
+		if (timing_enabled) \
+		{ \
+			instr_time	_copy_timing_end; \
+			INSTR_TIME_SET_CURRENT(_copy_timing_end); \
+			INSTR_TIME_ACCUM_DIFF(field, _copy_timing_end, var); \
+		} \
+	} while(0)
 
 #endif							/* COPY_H */
