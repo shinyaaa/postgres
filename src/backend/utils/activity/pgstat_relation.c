@@ -17,12 +17,16 @@
 
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "access/twophase_rmgr.h"
 #include "access/xact.h"
 #include "catalog/catalog.h"
+#include "catalog/pg_class.h"
+#include "miscadmin.h"
 #include "utils/memutils.h"
 #include "utils/pgstat_internal.h"
 #include "utils/rel.h"
+#include "utils/syscache.h"
 #include "utils/timestamp.h"
 
 
@@ -364,6 +368,48 @@ pgstat_report_analyze(Relation rel,
 	/* see pgstat_report_vacuum() */
 	pgstat_flush_io(false);
 	(void) pgstat_flush_backend(false, PGSTAT_BACKEND_FLUSH_IO);
+}
+
+/*
+ * Report that autovacuum skipped a relation due to lock conflict.
+ *
+ * This is called from vacuum_open_relation() when an autovacuum worker
+ * cannot acquire the lock on a relation and must skip it.  Unlike
+ * pgstat_report_vacuum/analyze, we take an Oid instead of a Relation
+ * because the relation could not be opened.
+ */
+void
+pgstat_report_autovac_lock_skipped(Oid relid, bool is_vacuum, bool is_analyze)
+{
+	PgStat_EntryRef *entry_ref;
+	PgStatShared_Relation *shtabentry;
+	PgStat_StatTabEntry *tabentry;
+	Oid			dboid;
+	HeapTuple	tp;
+
+	if (!pgstat_track_counts)
+		return;
+
+	/* Look up relisshared since we don't have an open Relation */
+	tp = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	if (!HeapTupleIsValid(tp))
+		return;				/* relation was dropped concurrently */
+	dboid = ((Form_pg_class) GETSTRUCT(tp))->relisshared ?
+		InvalidOid : MyDatabaseId;
+	ReleaseSysCache(tp);
+
+	entry_ref = pgstat_get_entry_ref_locked(PGSTAT_KIND_RELATION, dboid,
+											relid, false);
+
+	shtabentry = (PgStatShared_Relation *) entry_ref->shared_stats;
+	tabentry = &shtabentry->stats;
+
+	if (is_vacuum)
+		tabentry->autovacuum_lock_skipped_count++;
+	if (is_analyze)
+		tabentry->autoanalyze_lock_skipped_count++;
+
+	pgstat_unlock_entry(entry_ref);
 }
 
 /*

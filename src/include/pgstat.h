@@ -474,10 +474,12 @@ typedef struct PgStat_StatTabEntry
 	PgStat_Counter vacuum_count;
 	TimestampTz last_autovacuum_time;	/* autovacuum initiated */
 	PgStat_Counter autovacuum_count;
+	PgStat_Counter autovacuum_lock_skipped_count;
 	TimestampTz last_analyze_time;	/* user initiated */
 	PgStat_Counter analyze_count;
 	TimestampTz last_autoanalyze_time;	/* autovacuum initiated */
 	PgStat_Counter autoanalyze_count;
+	PgStat_Counter autoanalyze_lock_skipped_count;
 
 	PgStat_Counter total_vacuum_time;	/* times in milliseconds */
 	PgStat_Counter total_autovacuum_time;
@@ -706,6 +708,8 @@ extern void pgstat_report_vacuum(Relation rel, PgStat_Counter livetuples,
 extern void pgstat_report_analyze(Relation rel,
 								  PgStat_Counter livetuples, PgStat_Counter deadtuples,
 								  bool resetcounter, TimestampTz starttime);
+extern void pgstat_report_autovac_lock_skipped(Oid relid, bool is_vacuum,
+											   bool is_analyze);
 
 /*
  * If stats are enabled, but pending data hasn't been prepared yet, call

@@ -796,6 +796,12 @@ vacuum_open_relation(Oid relid, RangeVar *relation, bits32 options,
 		rel_lock = false;
 	}
 
+	/* Report lock skip statistics for autovacuum workers */
+	if (!rel_lock && AmAutoVacuumWorkerProcess())
+		pgstat_report_autovac_lock_skipped(relid,
+										   (options & VACOPT_VACUUM) != 0,
+										   (options & VACOPT_ANALYZE) != 0);
+
 	/* if relation is opened, leave */
 	if (rel)
 		return rel;

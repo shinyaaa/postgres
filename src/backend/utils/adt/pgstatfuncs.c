@@ -60,8 +60,14 @@ PG_STAT_GET_RELENTRY_INT64(analyze_count)
 /* pg_stat_get_autoanalyze_count */
 PG_STAT_GET_RELENTRY_INT64(autoanalyze_count)
 
+/* pg_stat_get_autoanalyze_lock_skipped_count */
+PG_STAT_GET_RELENTRY_INT64(autoanalyze_lock_skipped_count)
+
 /* pg_stat_get_autovacuum_count */
 PG_STAT_GET_RELENTRY_INT64(autovacuum_count)
+
+/* pg_stat_get_autovacuum_lock_skipped_count */
+PG_STAT_GET_RELENTRY_INT64(autovacuum_lock_skipped_count)
 
 /* pg_stat_get_blocks_fetched */
 PG_STAT_GET_RELENTRY_INT64(blocks_fetched)
