@@ -3112,6 +3112,12 @@
   boot_val => 'true',
 },
 
+{ name => 'track_deprecated_features', type => 'bool', context => 'PGC_SUSET', group => 'STATS_CUMULATIVE',
+  short_desc => 'Tracks usage of deprecated features.',
+  variable => 'track_deprecated_features',
+  boot_val => 'true',
+},
+
 { name => 'track_functions', type => 'enum', context => 'PGC_SUSET', group => 'STATS_CUMULATIVE',
   short_desc => 'Collects function-level statistics on database activity.',
   variable => 'pgstat_track_functions',

@@ -515,6 +515,23 @@ SELECT max(stats_reset) AS slru_reset_ts FROM pg_stat_slru \gset
 SELECT pg_stat_reset_shared('slru');
 SELECT max(stats_reset) > :'slru_reset_ts'::timestamptz FROM pg_stat_slru;
 
+-- Test deprecated features tracking
+-- Verify view exists and returns expected columns
+SELECT count(*) > 0 AS has_deprecated_features FROM pg_stat_deprecated_features;
+
+-- Test that the view has the expected column names
+SELECT name, replacement FROM pg_stat_deprecated_features ORDER BY name;
+
+-- Test reset of specific deprecated feature
+SELECT stats_reset AS dep_global_temp_reset_ts FROM pg_stat_deprecated_features WHERE name = 'global_temp_table' \gset
+SELECT pg_stat_reset_deprecated_features('global_temp_table');
+SELECT stats_reset > :'dep_global_temp_reset_ts'::timestamptz FROM pg_stat_deprecated_features WHERE name = 'global_temp_table';
+
+-- Test reset of all deprecated features
+SELECT stats_reset AS dep_md5_reset_ts FROM pg_stat_deprecated_features WHERE name = 'md5_password' \gset
+SELECT pg_stat_reset_deprecated_features();
+SELECT stats_reset > :'dep_md5_reset_ts'::timestamptz FROM pg_stat_deprecated_features WHERE name = 'md5_password';
+
 -- Test that reset_shared with wal specified as the stats type works
 SELECT stats_reset AS wal_reset_ts FROM pg_stat_wal \gset
 SELECT pg_stat_reset_shared('wal');

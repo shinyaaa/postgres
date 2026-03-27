@@ -481,6 +481,13 @@ typedef struct PgStatShared_SLRU
 	PgStat_SLRUStats stats[SLRU_NUM_ELEMENTS];
 } PgStatShared_SLRU;
 
+typedef struct PgStatShared_DeprecatedFeatures
+{
+	/* lock protects ->stats */
+	LWLock		lock;
+	PgStat_DeprecatedFeaturesStats stats[DEPRECATED_FEATURES_NUM_KINDS];
+} PgStatShared_DeprecatedFeatures;
+
 typedef struct PgStatShared_Wal
 {
 	/* lock protects ->stats */
@@ -582,6 +589,7 @@ typedef struct PgStat_ShmemControl
 	PgStatShared_IO io;
 	PgStatShared_Lock lock;
 	PgStatShared_SLRU slru;
+	PgStatShared_DeprecatedFeatures deprecated_features;
 	PgStatShared_Wal wal;
 
 	/*
@@ -616,6 +624,8 @@ typedef struct PgStat_Snapshot
 	PgStat_Lock lock;
 
 	PgStat_SLRUStats slru[SLRU_NUM_ELEMENTS];
+
+	PgStat_DeprecatedFeaturesStats deprecated_features[DEPRECATED_FEATURES_NUM_KINDS];
 
 	PgStat_WalStats wal;
 
@@ -824,6 +834,16 @@ extern void pgstat_reset_matching_entries(bool (*do_reset) (PgStatShared_HashEnt
 extern void pgstat_request_entry_refs_gc(void);
 extern PgStatShared_Common *pgstat_init_entry(PgStat_Kind kind,
 											  PgStatShared_HashEntry *shhashent);
+
+
+/*
+ * Functions in pgstat_deprecated.c
+ */
+
+extern bool pgstat_deprecated_flush_cb(bool nowait);
+extern void pgstat_deprecated_init_shmem_cb(void *stats);
+extern void pgstat_deprecated_reset_all_cb(TimestampTz ts);
+extern void pgstat_deprecated_snapshot_cb(void);
 
 
 /*

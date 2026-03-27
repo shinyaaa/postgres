@@ -60,6 +60,7 @@
 #include "parser/parser.h"
 #include "utils/datetime.h"
 #include "utils/xml.h"
+#include "pgstat.h"
 
 
 /*
@@ -3918,6 +3919,7 @@ OptTemp:	TEMPORARY					{ $$ = RELPERSISTENCE_TEMP; }
 			| LOCAL TEMP				{ $$ = RELPERSISTENCE_TEMP; }
 			| GLOBAL TEMPORARY
 				{
+					pgstat_count_deprecated_feature(DEPRECATED_GLOBAL_TEMP_TABLE);
 					ereport(WARNING,
 							(errmsg("GLOBAL is deprecated in temporary table creation"),
 							 parser_errposition(@1)));
@@ -3925,6 +3927,7 @@ OptTemp:	TEMPORARY					{ $$ = RELPERSISTENCE_TEMP; }
 				}
 			| GLOBAL TEMP
 				{
+					pgstat_count_deprecated_feature(DEPRECATED_GLOBAL_TEMP_TABLE);
 					ereport(WARNING,
 							(errmsg("GLOBAL is deprecated in temporary table creation"),
 							 parser_errposition(@1)));
@@ -13930,6 +13933,7 @@ OptTempTableName:
 				}
 			| GLOBAL TEMPORARY opt_table qualified_name
 				{
+					pgstat_count_deprecated_feature(DEPRECATED_GLOBAL_TEMP_TABLE);
 					ereport(WARNING,
 							(errmsg("GLOBAL is deprecated in temporary table creation"),
 							 parser_errposition(@1)));
@@ -13938,6 +13942,7 @@ OptTempTableName:
 				}
 			| GLOBAL TEMP opt_table qualified_name
 				{
+					pgstat_count_deprecated_feature(DEPRECATED_GLOBAL_TEMP_TABLE);
 					ereport(WARNING,
 							(errmsg("GLOBAL is deprecated in temporary table creation"),
 							 parser_errposition(@1)));

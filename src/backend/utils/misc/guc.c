@@ -51,6 +51,7 @@
 #include "utils/guc_tables.h"
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
+#include "pgstat.h"
 
 
 #define CONFIG_FILENAME "postgresql.conf"
@@ -1134,8 +1135,11 @@ find_option(const char *name, bool create_placeholders, bool skip_errors,
 	for (int i = 0; map_old_guc_names[i] != NULL; i += 2)
 	{
 		if (guc_name_compare(name, map_old_guc_names[i]) == 0)
+		{
+			pgstat_count_deprecated_feature(DEPRECATED_OLD_GUC_NAMES);
 			return find_option(map_old_guc_names[i + 1], false,
 							   skip_errors, elevel);
+		}
 	}
 
 	if (create_placeholders)

@@ -985,6 +985,14 @@ CREATE VIEW pg_stat_slru AS
             s.stats_reset
     FROM pg_stat_get_slru() s;
 
+CREATE VIEW pg_stat_deprecated_features AS
+    SELECT
+            s.name,
+            s.replacement,
+            s.usage_count,
+            s.stats_reset
+    FROM pg_stat_get_deprecated_features() s;
+
 CREATE VIEW pg_stat_lock AS
     SELECT
             l.locktype,

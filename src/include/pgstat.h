@@ -439,6 +439,20 @@ typedef struct PgStat_SLRUStats
 	TimestampTz stat_reset_timestamp;
 } PgStat_SLRUStats;
 
+/*
+ * Deprecated feature IDs for tracking usage of deprecated features.
+ */
+#define DEPRECATED_MD5_PASSWORD			0
+#define DEPRECATED_GLOBAL_TEMP_TABLE	1
+#define DEPRECATED_OLD_GUC_NAMES		2
+#define DEPRECATED_FEATURES_NUM_KINDS	3
+
+typedef struct PgStat_DeprecatedFeaturesStats
+{
+	PgStat_Counter usage_count;
+	TimestampTz stat_reset_timestamp;
+} PgStat_DeprecatedFeaturesStats;
+
 typedef struct PgStat_StatSubEntry
 {
 	PgStat_Counter apply_error_count;
@@ -786,6 +800,18 @@ extern PgStat_StatReplSlotEntry *pgstat_fetch_replslot(NameData slotname);
 
 
 /*
+ * Functions in pgstat_deprecated.c
+ */
+
+extern void pgstat_count_deprecated_feature(int feature_idx);
+extern PgStat_DeprecatedFeaturesStats *pgstat_fetch_deprecated_features(void);
+extern const char *pgstat_get_deprecated_feature_name(int idx);
+extern const char *pgstat_get_deprecated_feature_replacement(int idx);
+extern int	pgstat_get_deprecated_feature_index(const char *name);
+extern void pgstat_reset_deprecated_features(const char *name);
+
+
+/*
  * Functions in pgstat_slru.c
  */
 
@@ -840,6 +866,7 @@ extern PgStat_WalStats *pgstat_fetch_stat_wal(void);
 
 /* GUC parameters */
 extern PGDLLIMPORT bool pgstat_track_counts;
+extern PGDLLIMPORT bool track_deprecated_features;
 extern PGDLLIMPORT int pgstat_track_functions;
 extern PGDLLIMPORT int pgstat_fetch_consistency;
 

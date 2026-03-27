@@ -25,6 +25,7 @@
 #include "utils/memutils.h"
 #include "utils/syscache.h"
 #include "utils/timestamp.h"
+#include "pgstat.h"
 
 /* Threshold for password expiration warnings. */
 int			password_expiration_warning_threshold = 604800;
@@ -241,11 +242,14 @@ encrypt_password(PasswordType target_type, const char *role,
 
 	if (md5_password_warnings &&
 		get_password_type(encrypted_password) == PASSWORD_TYPE_MD5)
+	{
+		pgstat_count_deprecated_feature(DEPRECATED_MD5_PASSWORD);
 		ereport(WARNING,
 				(errcode(ERRCODE_WARNING_DEPRECATED_FEATURE),
 				 errmsg("setting an MD5-encrypted password"),
 				 errdetail("MD5 password support is deprecated and will be removed in a future release of PostgreSQL."),
 				 errhint("Refer to the PostgreSQL documentation for details about migrating to another password type.")));
+	}
 
 	return encrypted_password;
 }
@@ -302,6 +306,8 @@ md5_crypt_verify(const char *role, const char *shadow_pass,
 			MemoryContext oldcontext;
 			char	   *warning;
 			char	   *detail;
+
+			pgstat_count_deprecated_feature(DEPRECATED_MD5_PASSWORD);
 
 			oldcontext = MemoryContextSwitchTo(TopMemoryContext);
 

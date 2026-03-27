@@ -2073,6 +2073,67 @@ pg_stat_reset_slru(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
+Datum
+pg_stat_get_deprecated_features(PG_FUNCTION_ARGS)
+{
+#define PG_STAT_GET_DEPRECATED_FEATURES_COLS	4
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	int			i;
+	PgStat_DeprecatedFeaturesStats *stats;
+
+	InitMaterializedSRF(fcinfo, 0);
+
+	/* request deprecated feature stats from the cumulative stats system */
+	stats = pgstat_fetch_deprecated_features();
+
+	for (i = 0;; i++)
+	{
+		Datum		values[PG_STAT_GET_DEPRECATED_FEATURES_COLS] = {0};
+		bool		nulls[PG_STAT_GET_DEPRECATED_FEATURES_COLS] = {0};
+		PgStat_DeprecatedFeaturesStats stat;
+		const char *name;
+		const char *replacement;
+
+		name = pgstat_get_deprecated_feature_name(i);
+
+		if (!name)
+			break;
+
+		replacement = pgstat_get_deprecated_feature_replacement(i);
+		stat = stats[i];
+
+		values[0] = PointerGetDatum(cstring_to_text(name));
+		values[1] = PointerGetDatum(cstring_to_text(replacement));
+		values[2] = Int64GetDatum(stat.usage_count);
+
+		if (stat.stat_reset_timestamp != 0)
+			values[3] = TimestampTzGetDatum(stat.stat_reset_timestamp);
+		else
+			nulls[3] = true;
+
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+
+	return (Datum) 0;
+}
+
+/* Reset deprecated feature counters (a specific one or all of them). */
+Datum
+pg_stat_reset_deprecated_features(PG_FUNCTION_ARGS)
+{
+	char	   *target = NULL;
+
+	if (PG_ARGISNULL(0))
+		pgstat_reset_of_kind(PGSTAT_KIND_DEPRECATED);
+	else
+	{
+		target = text_to_cstring(PG_GETARG_TEXT_PP(0));
+		pgstat_reset_deprecated_features(target);
+	}
+
+	PG_RETURN_VOID();
+}
+
 /* Reset replication slots stats (a specific one or all of them). */
 Datum
 pg_stat_reset_replication_slot(PG_FUNCTION_ARGS)
