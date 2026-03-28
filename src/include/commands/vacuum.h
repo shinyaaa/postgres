@@ -424,6 +424,9 @@ extern void parallel_vacuum_cleanup_all_indexes(ParallelVacuumState *pvs,
 												PVWorkerStats *wstats);
 extern void parallel_vacuum_main(dsm_segment *seg, shm_toc *toc);
 
+/* in commands/vacuum.c */
+extern Datum pg_estimate_vacuum_wal(PG_FUNCTION_ARGS);
+
 /* in commands/analyze.c */
 extern void analyze_rel(Oid relid, RangeVar *relation,
 						const VacuumParams params, List *va_cols, bool in_outer_xact,

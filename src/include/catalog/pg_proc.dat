@@ -12851,4 +12851,12 @@
   proname => 'hashoid8extended', prorettype => 'int8',
   proargtypes => 'oid8 int8', prosrc => 'hashoid8extended' },
 
+{ oid => '9950',
+  descr => 'estimate WAL output bytes for vacuuming a relation',
+  proname => 'pg_estimate_vacuum_wal', provolatile => 'v',
+  proparallel => 'r', prorettype => 'record', proargtypes => 'regclass',
+  proallargtypes => '{regclass,int8,int8,int8,int8,int8,int8,int8,int8,int8}',
+  proargmodes => '{i,o,o,o,o,o,o,o,o,o}',
+  proargnames => '{rel,wal_bytes,wal_fpi,wal_fpi_bytes,heap_wal_bytes,index_wal_bytes,dead_tuples,pages_to_scan,pages_all_visible,pages_all_frozen}',
+  prosrc => 'pg_estimate_vacuum_wal' },
 ]

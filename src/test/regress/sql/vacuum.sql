@@ -525,3 +525,42 @@ SELECT id, pg_column_toast_chunk_id(f1) IS NULL AS f1_chunk_null,
 SELECT pg_column_toast_chunk_id(f1) = :'id_2_chunk' AS same_chunk
   FROM vac_rewrite_toast WHERE id = 2;
 DROP TABLE vac_rewrite_toast;
+
+-- Test pg_estimate_vacuum_wal function
+CREATE TABLE test_estimate_wal (id int, data text);
+INSERT INTO test_estimate_wal SELECT i, repeat('x', 100) FROM generate_series(1, 1000) i;
+DELETE FROM test_estimate_wal WHERE id % 2 = 0;
+SELECT pg_stat_force_next_flush();
+
+-- Basic invocation should return a record with all expected columns
+SELECT
+  wal_bytes >= 0 AS wal_bytes_ok,
+  wal_fpi >= 0 AS wal_fpi_ok,
+  wal_fpi_bytes >= 0 AS wal_fpi_bytes_ok,
+  heap_wal_bytes >= 0 AS heap_wal_bytes_ok,
+  index_wal_bytes >= 0 AS index_wal_bytes_ok,
+  dead_tuples >= 0 AS dead_tuples_ok,
+  pages_to_scan >= 0 AS pages_to_scan_ok,
+  pages_all_visible >= 0 AS pages_all_visible_ok,
+  pages_all_frozen >= 0 AS pages_all_frozen_ok
+FROM pg_estimate_vacuum_wal('test_estimate_wal');
+
+-- Table with dead tuples should report positive dead_tuples and wal_bytes
+SELECT
+  dead_tuples > 0 AS has_dead_tuples,
+  wal_bytes > 0 AS has_wal_estimate,
+  pages_to_scan > 0 AS has_pages_to_scan
+FROM pg_estimate_vacuum_wal('test_estimate_wal');
+
+-- After vacuuming, dead_tuples should be zero
+VACUUM test_estimate_wal;
+SELECT pg_stat_force_next_flush();
+SELECT
+  dead_tuples = 0 AS no_dead_tuples_after_vacuum
+FROM pg_estimate_vacuum_wal('test_estimate_wal');
+
+-- Error on non-table relation
+CREATE INDEX test_estimate_wal_idx ON test_estimate_wal (id);
+SELECT pg_estimate_vacuum_wal('test_estimate_wal_idx');
+
+DROP TABLE test_estimate_wal;
