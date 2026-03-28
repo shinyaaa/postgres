@@ -137,6 +137,8 @@ int			autovacuum_vac_cost_limit;
 int			Log_autovacuum_min_duration = 600000;
 int			Log_autoanalyze_min_duration = 600000;
 
+int			autovacuum_warning;
+
 /* the minimum allowed time between two awakenings of the launcher */
 #define MIN_AUTOVAC_SLEEPTIME 100.0 /* milliseconds */
 #define MAX_AUTOVAC_SLEEPTIME 300	/* seconds */
@@ -155,6 +157,9 @@ static int	av_storage_param_cost_limit = -1;
 
 /* Flags set by signal handlers */
 static volatile sig_atomic_t got_SIGUSR2 = false;
+
+/* Timestamp when all workers became busy, 0 if workers are available */
+static pg_time_t last_workers_full_time = 0;
 
 /* Comparison points for determining whether freeze_max_age is exceeded */
 static TransactionId recentXid;
@@ -707,7 +712,43 @@ AutoVacLauncherMain(const void *startup_data, size_t startup_data_len)
 
 		/* if we can't do anything, just go back to sleep */
 		if (!can_launch)
+		{
+			/*
+			 * Track how long all workers have been busy.  If this exceeds
+			 * autovacuum_warning, emit a warning that autovacuum is not
+			 * keeping up.  This is analogous to checkpoint_warning for
+			 * checkpoints occurring too frequently.
+			 */
+			if (autovacuum_warning > 0)
+			{
+				pg_time_t	now = (pg_time_t) time(NULL);
+
+				if (last_workers_full_time == 0)
+					last_workers_full_time = now;
+				else
+				{
+					int			elapsed_secs = now - last_workers_full_time;
+
+					if (elapsed_secs >= autovacuum_warning)
+					{
+						ereport(LOG,
+								(errmsg_plural("autovacuum workers have been busy for %d second",
+											   "autovacuum workers have been busy for %d seconds",
+											   elapsed_secs,
+											   elapsed_secs),
+								 errhint("Consider increasing the configuration parameter \"%s\".",
+										 "autovacuum_max_workers")));
+
+						/* Reset so we don't warn every loop iteration */
+						last_workers_full_time = now;
+					}
+				}
+			}
 			continue;
+		}
+
+		/* Workers are available; reset the busy tracking */
+		last_workers_full_time = 0;
 
 		/* We're OK to start a new worker */
 

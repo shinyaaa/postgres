@@ -241,6 +241,16 @@
   max => 'INT_MAX',
 },
 
+{ name => 'autovacuum_warning', type => 'int', context => 'PGC_SIGHUP', group => 'VACUUM_AUTOVACUUM',
+  short_desc => 'Sets the time before warning if all autovacuum workers are busy for too long.',
+  long_desc => 'Write a message to the server log if all autovacuum worker slots remain occupied for longer than this amount of time, indicating that autovacuum may not be keeping up. 0 disables the warning.',
+  flags => 'GUC_UNIT_S',
+  variable => 'autovacuum_warning',
+  boot_val => '30',
+  min => '0',
+  max => 'INT_MAX',
+},
+
 { name => 'autovacuum_work_mem', type => 'int', context => 'PGC_SIGHUP', group => 'RESOURCES_MEM',
   short_desc => 'Sets the maximum memory to be used by each autovacuum worker process.',
   long_desc => '-1 means use "maintenance_work_mem".',

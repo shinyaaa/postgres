@@ -739,6 +739,8 @@
 #autovacuum_vacuum_cost_limit = -1      # default vacuum cost limit for
                                         # autovacuum, -1 means use
                                         # vacuum_cost_limit
+#autovacuum_warning = 30s               # warn if all workers busy for this
+                                        # long; 0 disables
 
 # - Cost-Based Vacuum Delay -
 
