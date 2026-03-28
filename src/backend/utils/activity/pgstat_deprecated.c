@@ -82,6 +82,13 @@ pgstat_count_deprecated_feature(int feature_idx)
 	if (!track_deprecated_features)
 		return;
 
+	/*
+	 * During early startup (e.g., GUC processing), pgstat may not be
+	 * initialized yet.  Silently skip counting in that case.
+	 */
+	if (!pgStatLocal.shmem)
+		return;
+
 	get_deprecated_entry(feature_idx)->usage_count += 1;
 }
 

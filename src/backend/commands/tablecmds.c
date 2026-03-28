@@ -96,6 +96,7 @@
 #include "storage/predicate.h"
 #include "storage/smgr.h"
 #include "tcop/utility.h"
+#include "pgstat.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
@@ -858,6 +859,14 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("cannot create temporary table within security-restricted operation")));
+
+	/*
+	 * Track usage of the deprecated GLOBAL keyword for temporary tables.
+	 * This is done at execution time rather than parse time so that we only
+	 * count statements that actually reach execution.
+	 */
+	if (stmt->globalTemp)
+		pgstat_count_deprecated_feature(DEPRECATED_GLOBAL_TEMP_TABLE);
 
 	/*
 	 * Determine the lockmode to use when scanning parents.  A self-exclusive

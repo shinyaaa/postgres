@@ -3782,7 +3782,8 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 				{
 					CreateStmt *n = makeNode(CreateStmt);
 
-					$4->relpersistence = $2;
+					n->globalTemp = ($2 == 'G');
+					$4->relpersistence = ($2 == 'G' ? RELPERSISTENCE_TEMP : $2);
 					n->relation = $4;
 					n->tableElts = $6;
 					n->inhRelations = $8;
@@ -3802,7 +3803,8 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 				{
 					CreateStmt *n = makeNode(CreateStmt);
 
-					$7->relpersistence = $2;
+					n->globalTemp = ($2 == 'G');
+					$7->relpersistence = ($2 == 'G' ? RELPERSISTENCE_TEMP : $2);
 					n->relation = $7;
 					n->tableElts = $9;
 					n->inhRelations = $11;
@@ -3822,7 +3824,8 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 				{
 					CreateStmt *n = makeNode(CreateStmt);
 
-					$4->relpersistence = $2;
+					n->globalTemp = ($2 == 'G');
+					$4->relpersistence = ($2 == 'G' ? RELPERSISTENCE_TEMP : $2);
 					n->relation = $4;
 					n->tableElts = $7;
 					n->inhRelations = NIL;
@@ -3843,7 +3846,8 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 				{
 					CreateStmt *n = makeNode(CreateStmt);
 
-					$7->relpersistence = $2;
+					n->globalTemp = ($2 == 'G');
+					$7->relpersistence = ($2 == 'G' ? RELPERSISTENCE_TEMP : $2);
 					n->relation = $7;
 					n->tableElts = $10;
 					n->inhRelations = NIL;
@@ -3864,7 +3868,8 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 				{
 					CreateStmt *n = makeNode(CreateStmt);
 
-					$4->relpersistence = $2;
+					n->globalTemp = ($2 == 'G');
+					$4->relpersistence = ($2 == 'G' ? RELPERSISTENCE_TEMP : $2);
 					n->relation = $4;
 					n->tableElts = $8;
 					n->inhRelations = list_make1($7);
@@ -3885,7 +3890,8 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 				{
 					CreateStmt *n = makeNode(CreateStmt);
 
-					$7->relpersistence = $2;
+					n->globalTemp = ($2 == 'G');
+					$7->relpersistence = ($2 == 'G' ? RELPERSISTENCE_TEMP : $2);
 					n->relation = $7;
 					n->tableElts = $11;
 					n->inhRelations = list_make1($10);
@@ -3919,19 +3925,18 @@ OptTemp:	TEMPORARY					{ $$ = RELPERSISTENCE_TEMP; }
 			| LOCAL TEMP				{ $$ = RELPERSISTENCE_TEMP; }
 			| GLOBAL TEMPORARY
 				{
-					pgstat_count_deprecated_feature(DEPRECATED_GLOBAL_TEMP_TABLE);
 					ereport(WARNING,
 							(errmsg("GLOBAL is deprecated in temporary table creation"),
 							 parser_errposition(@1)));
-					$$ = RELPERSISTENCE_TEMP;
+					/* Use 'G' as a sentinel to propagate GLOBAL flag to CreateStmt */
+					$$ = 'G';
 				}
 			| GLOBAL TEMP
 				{
-					pgstat_count_deprecated_feature(DEPRECATED_GLOBAL_TEMP_TABLE);
 					ereport(WARNING,
 							(errmsg("GLOBAL is deprecated in temporary table creation"),
 							 parser_errposition(@1)));
-					$$ = RELPERSISTENCE_TEMP;
+					$$ = 'G';
 				}
 			| UNLOGGED					{ $$ = RELPERSISTENCE_UNLOGGED; }
 			| /*EMPTY*/					{ $$ = RELPERSISTENCE_PERMANENT; }
@@ -13933,19 +13938,19 @@ OptTempTableName:
 				}
 			| GLOBAL TEMPORARY opt_table qualified_name
 				{
-					pgstat_count_deprecated_feature(DEPRECATED_GLOBAL_TEMP_TABLE);
 					ereport(WARNING,
 							(errmsg("GLOBAL is deprecated in temporary table creation"),
 							 parser_errposition(@1)));
+					pgstat_count_deprecated_feature(DEPRECATED_GLOBAL_TEMP_TABLE);
 					$$ = $4;
 					$$->relpersistence = RELPERSISTENCE_TEMP;
 				}
 			| GLOBAL TEMP opt_table qualified_name
 				{
-					pgstat_count_deprecated_feature(DEPRECATED_GLOBAL_TEMP_TABLE);
 					ereport(WARNING,
 							(errmsg("GLOBAL is deprecated in temporary table creation"),
 							 parser_errposition(@1)));
+					pgstat_count_deprecated_feature(DEPRECATED_GLOBAL_TEMP_TABLE);
 					$$ = $4;
 					$$->relpersistence = RELPERSISTENCE_TEMP;
 				}
