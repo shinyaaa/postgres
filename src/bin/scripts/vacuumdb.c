@@ -60,6 +60,7 @@ main(int argc, char *argv[])
 		{"buffer-usage-limit", required_argument, NULL, 13},
 		{"missing-stats-only", no_argument, NULL, 14},
 		{"dry-run", no_argument, NULL, 15},
+		{"only-database-stats", no_argument, NULL, 16},
 		{NULL, 0, NULL, 0}
 	};
 
@@ -211,6 +212,9 @@ main(int argc, char *argv[])
 			case 15:
 				vacopts.dry_run = true;
 				break;
+			case 16:
+				vacopts.only_database_stats = true;
+				break;
 			default:
 				/* getopt_long already emitted a complaint */
 				pg_log_error_hint("Try \"%s --help\" for more information.", progname);
@@ -307,6 +311,66 @@ main(int argc, char *argv[])
 		pg_fatal("cannot use the \"%s\" option without \"%s\" or \"%s\"",
 				 "missing-stats-only", "analyze-only", "analyze-in-stages");
 
+	/*
+	 * Prohibit --only-database-stats with options not compatible with
+	 * ONLY_DATABASE_STATS.  The backend only allows VERBOSE alongside it.
+	 */
+	if (vacopts.only_database_stats)
+	{
+		if (vacopts.mode == MODE_ANALYZE ||
+			vacopts.mode == MODE_ANALYZE_IN_STAGES)
+			pg_fatal("cannot use the \"%s\" option when performing only analyze",
+					 "only-database-stats");
+		if (vacopts.objfilter & OBJFILTER_TABLE)
+			pg_fatal("cannot use the \"%s\" option with a list of tables",
+					 "only-database-stats");
+		if (vacopts.objfilter & (OBJFILTER_SCHEMA | OBJFILTER_SCHEMA_EXCLUDE))
+			pg_fatal("cannot use the \"%s\" option with schema filtering",
+					 "only-database-stats");
+		if (vacopts.full)
+			pg_fatal("cannot use the \"%s\" option with the \"%s\" option",
+					 "only-database-stats", "full");
+		if (vacopts.freeze)
+			pg_fatal("cannot use the \"%s\" option with the \"%s\" option",
+					 "only-database-stats", "freeze");
+		if (vacopts.disable_page_skipping)
+			pg_fatal("cannot use the \"%s\" option with the \"%s\" option",
+					 "only-database-stats", "disable-page-skipping");
+		if (vacopts.skip_locked)
+			pg_fatal("cannot use the \"%s\" option with the \"%s\" option",
+					 "only-database-stats", "skip-locked");
+		if (vacopts.no_index_cleanup)
+			pg_fatal("cannot use the \"%s\" option with the \"%s\" option",
+					 "only-database-stats", "no-index-cleanup");
+		if (vacopts.force_index_cleanup)
+			pg_fatal("cannot use the \"%s\" option with the \"%s\" option",
+					 "only-database-stats", "force-index-cleanup");
+		if (!vacopts.do_truncate)
+			pg_fatal("cannot use the \"%s\" option with the \"%s\" option",
+					 "only-database-stats", "no-truncate");
+		if (!vacopts.process_main)
+			pg_fatal("cannot use the \"%s\" option with the \"%s\" option",
+					 "only-database-stats", "no-process-main");
+		if (!vacopts.process_toast)
+			pg_fatal("cannot use the \"%s\" option with the \"%s\" option",
+					 "only-database-stats", "no-process-toast");
+		if (vacopts.and_analyze)
+			pg_fatal("cannot use the \"%s\" option with the \"%s\" option",
+					 "only-database-stats", "analyze");
+		if (vacopts.parallel_workers >= 0)
+			pg_fatal("cannot use the \"%s\" option with the \"%s\" option",
+					 "only-database-stats", "parallel");
+		if (vacopts.buffer_usage_limit)
+			pg_fatal("cannot use the \"%s\" option with the \"%s\" option",
+					 "only-database-stats", "buffer-usage-limit");
+		if (vacopts.min_xid_age != 0)
+			pg_fatal("cannot use the \"%s\" option with the \"%s\" option",
+					 "only-database-stats", "min-xid-age");
+		if (vacopts.min_mxid_age != 0)
+			pg_fatal("cannot use the \"%s\" option with the \"%s\" option",
+					 "only-database-stats", "min-mxid-age");
+	}
+
 	if (vacopts.dry_run && !vacopts.quiet)
 		pg_log_info("Executing in dry-run mode.\n"
 					"No commands will be sent to the server.");
@@ -363,6 +427,7 @@ help(const char *progname)
 	printf(_("      --min-xid-age=XID_AGE       minimum transaction ID age of tables to vacuum\n"));
 	printf(_("      --missing-stats-only        only analyze relations with missing statistics\n"));
 	printf(_("      --no-index-cleanup          don't remove index entries that point to dead tuples\n"));
+	printf(_("      --only-database-stats       only update database-wide statistics\n"));
 	printf(_("      --no-process-main           skip the main relation\n"));
 	printf(_("      --no-process-toast          skip the TOAST table associated with the table to vacuum\n"));
 	printf(_("      --no-truncate               don't truncate empty pages at the end of the table\n"));

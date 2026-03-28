@@ -87,6 +87,32 @@ $node->issues_sql_like(
 	[ 'vacuumdb', '--parallel' => 0, 'postgres' ],
 	qr/statement: VACUUM \(SKIP_DATABASE_STATS, PARALLEL 0\).*;/,
 	'vacuumdb -P 0');
+$node->issues_sql_like(
+	[ 'vacuumdb', '--only-database-stats', 'postgres' ],
+	qr/statement: VACUUM \(ONLY_DATABASE_STATS\);/,
+	'vacuumdb --only-database-stats');
+$node->issues_sql_like(
+	[ 'vacuumdb', '--only-database-stats', '-v', 'postgres' ],
+	qr/statement: VACUUM \(ONLY_DATABASE_STATS, VERBOSE\);/,
+	'vacuumdb --only-database-stats -v');
+$node->command_fails(
+	[ 'vacuumdb', '--only-database-stats', '-f', 'postgres' ],
+	'--only-database-stats and --full specified together');
+$node->command_fails(
+	[ 'vacuumdb', '--only-database-stats', '-F', 'postgres' ],
+	'--only-database-stats and --freeze specified together');
+$node->command_fails(
+	[ 'vacuumdb', '--only-database-stats', '-z', 'postgres' ],
+	'--only-database-stats and --analyze specified together');
+$node->command_fails(
+	[ 'vacuumdb', '--only-database-stats', '-Z', 'postgres' ],
+	'--only-database-stats and --analyze-only specified together');
+$node->command_fails(
+	[ 'vacuumdb', '--only-database-stats', '-t', 'pg_am', 'postgres' ],
+	'--only-database-stats and --table specified together');
+$node->command_fails(
+	[ 'vacuumdb', '--only-database-stats', '--parallel', '2', 'postgres' ],
+	'--only-database-stats and --parallel specified together');
 $node->command_ok([qw(vacuumdb -Z --table=pg_am dbname=template1)],
 	'vacuumdb with connection string');
 

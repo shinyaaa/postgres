@@ -278,8 +278,16 @@ vacuum_one_database(ConnParams *cparams,
 				 "--missing-stats-only", "15");
 	}
 
+	if (vacopts->only_database_stats && PQserverVersion(conn) < 160000)
+	{
+		PQfinish(conn);
+		pg_fatal("cannot use the \"%s\" option on server versions older than PostgreSQL %s",
+				 "--only-database-stats", "16");
+	}
+
 	/* skip_database_stats is used automatically if server supports it */
-	vacopts->skip_database_stats = (PQserverVersion(conn) >= 160000);
+	if (!vacopts->only_database_stats)
+		vacopts->skip_database_stats = (PQserverVersion(conn) >= 160000);
 
 	if (!vacopts->quiet)
 	{
@@ -290,6 +298,33 @@ vacuum_one_database(ConnParams *cparams,
 			printf(_("%s: vacuuming database \"%s\"\n"),
 				   progname, PQdb(conn));
 		fflush(stdout);
+	}
+
+	/*
+	 * For ONLY_DATABASE_STATS, we don't process any tables.  Just issue the
+	 * VACUUM (ONLY_DATABASE_STATS) command and return.
+	 */
+	if (vacopts->only_database_stats)
+	{
+		PQExpBufferData only_stats_sql;
+		const char *verbose_opt = vacopts->verbose ? ", VERBOSE" : "";
+
+		initPQExpBuffer(&only_stats_sql);
+		appendPQExpBuffer(&only_stats_sql, "VACUUM (ONLY_DATABASE_STATS%s);",
+						  verbose_opt);
+
+		if (vacopts->dry_run)
+			printf("%s\n", only_stats_sql.data);
+		else
+		{
+			if (vacopts->echo)
+				printf("%s\n", only_stats_sql.data);
+			executeCommand(conn, only_stats_sql.data, false);
+		}
+
+		termPQExpBuffer(&only_stats_sql);
+		PQfinish(conn);
+		return EXIT_SUCCESS;
 	}
 
 	/*

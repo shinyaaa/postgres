@@ -49,6 +49,7 @@ typedef struct vacuumingOptions
 	bool		process_main;
 	bool		process_toast;
 	bool		skip_database_stats;
+	bool		only_database_stats;
 	char	   *buffer_usage_limit;
 	bool		missing_stats_only;
 	bool		echo;
