@@ -2962,6 +2962,7 @@ recheck_relation_needs_vacanalyze(Oid relid,
  *
  * A table whose autovacuum_enabled option is false is
  * automatically skipped (unless we have to vacuum it due to freeze_max_age).
+ * In that case, only vacuum is performed; analyze is still skipped.
  * Thus autovacuum can be disabled for specific tables. Also, when the cumulative
  * stats system does not have data about a table, it will be skipped.
  *
@@ -3146,7 +3147,7 @@ relation_needs_vacanalyze(Oid relid,
 		/* Determine if this table needs vacuum or analyze. */
 		*dovacuum = force_vacuum || (vactuples > vacthresh) ||
 			(vac_ins_base_thresh >= 0 && instuples > vacinsthresh);
-		*doanalyze = (anltuples > anlthresh);
+		*doanalyze = (av_enabled && anltuples > anlthresh);
 	}
 	else
 	{
