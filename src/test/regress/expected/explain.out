@@ -743,6 +743,36 @@ select explain_filter('explain (verbose) create table test_ctas as select 1');
  Query Identifier: N
 (3 rows)
 
+-- Test EXPLAIN with COPY TO
+select explain_filter('explain (costs off) copy (select * from int8_tbl) to stdout');
+    explain_filter    
+----------------------
+ Seq Scan on int8_tbl
+(1 row)
+
+select explain_filter('explain (costs off) copy int8_tbl to stdout');
+    explain_filter    
+----------------------
+ Seq Scan on int8_tbl
+(1 row)
+
+select explain_filter('explain (costs off, verbose) copy (select * from int8_tbl i8) to stdout');
+         explain_filter         
+--------------------------------
+ Seq Scan on public.int8_tbl i8
+   Output: q1, q2
+ Query Identifier: N
+(3 rows)
+
+select explain_filter('explain (costs off) copy int8_tbl (q1, q2) to stdout');
+    explain_filter    
+----------------------
+ Seq Scan on int8_tbl
+(1 row)
+
+-- EXPLAIN COPY FROM should error
+explain copy int8_tbl from stdin;
+ERROR:  EXPLAIN is only supported for COPY TO
 -- Test SERIALIZE option
 select explain_filter('explain (analyze,buffers off,serialize) select * from int8_tbl i8');
                                          explain_filter                                          

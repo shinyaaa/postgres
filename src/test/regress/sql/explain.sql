@@ -173,6 +173,14 @@ select explain_filter('explain (verbose) select * from int8_tbl i8');
 select explain_filter('explain (verbose) declare test_cur cursor for select * from int8_tbl');
 select explain_filter('explain (verbose) create table test_ctas as select 1');
 
+-- Test EXPLAIN with COPY TO
+select explain_filter('explain (costs off) copy (select * from int8_tbl) to stdout');
+select explain_filter('explain (costs off) copy int8_tbl to stdout');
+select explain_filter('explain (costs off, verbose) copy (select * from int8_tbl i8) to stdout');
+select explain_filter('explain (costs off) copy int8_tbl (q1, q2) to stdout');
+-- EXPLAIN COPY FROM should error
+explain copy int8_tbl from stdin;
+
 -- Test SERIALIZE option
 select explain_filter('explain (analyze,buffers off,serialize) select * from int8_tbl i8');
 select explain_filter('explain (analyze,serialize text,buffers,timing off) select * from int8_tbl i8');

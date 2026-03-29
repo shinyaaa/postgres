@@ -13,7 +13,9 @@
  */
 #include "postgres.h"
 
+#include "access/table.h"
 #include "access/xact.h"
+#include "catalog/namespace.h"
 #include "catalog/pg_type.h"
 #include "commands/createas.h"
 #include "commands/defrem.h"
@@ -470,6 +472,112 @@ ExplainOneUtility(Node *utilityStmt, IntoClause *into, ExplainState *es,
 			appendStringInfoString(es->str, "NOTIFY\n");
 		else
 			ExplainDummyGroup("Notify", NULL, es);
+	}
+	else if (IsA(utilityStmt, CopyStmt))
+	{
+		/*
+		 * We can EXPLAIN the SELECT query underlying a COPY TO statement.
+		 * COPY FROM has no query to explain.
+		 */
+		CopyStmt   *copy = (CopyStmt *) utilityStmt;
+		RawStmt    *raw_query;
+		List	   *rewritten;
+		JumbleState *jstate = NULL;
+
+		if (copy->is_from)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("EXPLAIN is only supported for COPY TO")));
+
+		if (copy->query)
+		{
+			/* COPY (query) TO ... */
+			raw_query = makeNode(RawStmt);
+			raw_query->stmt = copy->query;
+			raw_query->stmt_location = -1;
+			raw_query->stmt_len = -1;
+		}
+		else
+		{
+			/* COPY relation TO ... -- build SELECT * FROM relation */
+			SelectStmt *select;
+			List	   *targetList = NIL;
+			RangeVar   *from;
+			Relation	rel;
+
+			rel = table_openrv(copy->relation, AccessShareLock);
+
+			from = makeRangeVar(get_namespace_name(RelationGetNamespace(rel)),
+								pstrdup(RelationGetRelationName(rel)),
+								-1);
+			from->inh = (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE);
+
+			table_close(rel, NoLock);
+
+			if (!copy->attlist)
+			{
+				ColumnRef  *cr = makeNode(ColumnRef);
+				ResTarget  *target = makeNode(ResTarget);
+
+				cr->fields = list_make1(makeNode(A_Star));
+				cr->location = -1;
+
+				target->name = NULL;
+				target->indirection = NIL;
+				target->val = (Node *) cr;
+				target->location = -1;
+
+				targetList = list_make1(target);
+			}
+			else
+			{
+				ListCell   *lc;
+
+				foreach(lc, copy->attlist)
+				{
+					ColumnRef  *cr = makeNode(ColumnRef);
+					ResTarget  *target = makeNode(ResTarget);
+
+					cr->fields = list_make1(lfirst(lc));
+					cr->location = -1;
+
+					target->name = NULL;
+					target->indirection = NIL;
+					target->val = (Node *) cr;
+					target->location = -1;
+
+					targetList = lappend(targetList, target);
+				}
+			}
+
+			select = makeNode(SelectStmt);
+			select->targetList = targetList;
+			select->fromClause = list_make1(from);
+
+			raw_query = makeNode(RawStmt);
+			raw_query->stmt = (Node *) select;
+			raw_query->stmt_location = -1;
+			raw_query->stmt_len = -1;
+		}
+
+		rewritten = pg_analyze_and_rewrite_fixedparams(raw_query,
+													   pstate->p_sourcetext,
+													   NULL, 0, NULL);
+
+		Assert(list_length(rewritten) == 1);
+
+		{
+			Query	   *copy_query = linitial_node(Query, rewritten);
+
+			if (IsQueryIdEnabled())
+				jstate = JumbleQuery(copy_query);
+			if (post_parse_analyze_hook)
+				(*post_parse_analyze_hook) (pstate, copy_query, jstate);
+		}
+
+		ExplainOneQuery(linitial_node(Query, rewritten),
+						CURSOR_OPT_PARALLEL_OK, NULL, es,
+						pstate, params);
 	}
 	else
 	{
