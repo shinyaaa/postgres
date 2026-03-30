@@ -2961,8 +2961,8 @@ recheck_relation_needs_vacanalyze(Oid relid,
  * multixact_freeze_max_age multixacts back.
  *
  * A table whose autovacuum_enabled option is false is
- * automatically skipped (unless we have to vacuum it due to freeze_max_age).
- * In that case, only vacuum is performed; analyze is still skipped.
+ * automatically skipped (unless we have to vacuum it due to freeze_max_age,
+ * in which case only vacuum is performed and analyze is still skipped).
  * Thus autovacuum can be disabled for specific tables. Also, when the cumulative
  * stats system does not have data about a table, it will be skipped.
  *
