@@ -286,8 +286,7 @@ vacuum_one_database(ConnParams *cparams,
 	}
 
 	/* skip_database_stats is used automatically if server supports it */
-	if (!vacopts->only_database_stats)
-		vacopts->skip_database_stats = (PQserverVersion(conn) >= 160000);
+	vacopts->skip_database_stats = (PQserverVersion(conn) >= 160000);
 
 	if (!vacopts->quiet)
 	{
