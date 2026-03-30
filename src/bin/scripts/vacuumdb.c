@@ -427,10 +427,10 @@ help(const char *progname)
 	printf(_("      --min-xid-age=XID_AGE       minimum transaction ID age of tables to vacuum\n"));
 	printf(_("      --missing-stats-only        only analyze relations with missing statistics\n"));
 	printf(_("      --no-index-cleanup          don't remove index entries that point to dead tuples\n"));
-	printf(_("      --only-database-stats       only update database-wide statistics\n"));
 	printf(_("      --no-process-main           skip the main relation\n"));
 	printf(_("      --no-process-toast          skip the TOAST table associated with the table to vacuum\n"));
 	printf(_("      --no-truncate               don't truncate empty pages at the end of the table\n"));
+	printf(_("      --only-database-stats       only update database-wide statistics\n"));
 	printf(_("  -n, --schema=SCHEMA             vacuum tables in the specified schema(s) only\n"));
 	printf(_("  -N, --exclude-schema=SCHEMA     do not vacuum tables in the specified schema(s)\n"));
 	printf(_("  -P, --parallel=PARALLEL_WORKERS use this many background workers for vacuum, if available\n"));
