@@ -217,12 +217,12 @@ select sp_parallel_restricted(unique1) from tenk1
   where stringu1 = 'GRAAAA' order by 1;
                        QUERY PLAN                        
 ---------------------------------------------------------
- Sort
-   Output: (sp_parallel_restricted(unique1))
-   Sort Key: (sp_parallel_restricted(tenk1.unique1))
-   ->  Gather
-         Output: sp_parallel_restricted(unique1)
-         Workers Planned: 4
+ Gather Merge
+   Output: unique1
+   Workers Planned: 4
+   ->  Sort
+         Output: unique1
+         Sort Key: tenk1.unique1
          ->  Parallel Seq Scan on public.tenk1
                Output: unique1
                Filter: (tenk1.stringu1 = 'GRAAAA'::name)
@@ -271,7 +271,7 @@ explain (costs off)
                             QUERY PLAN                             
 -------------------------------------------------------------------
  HashAggregate
-   Group Key: sp_parallel_restricted(unique1)
+   Group Key: unique1
    ->  Gather
          Workers Planned: 4
          ->  Parallel Index Only Scan using tenk1_unique1 on tenk1
@@ -753,20 +753,18 @@ end;
 $$ language plpgsql PARALLEL SAFE;
 explain (costs off, verbose)
     select ten, sp_simple_func(ten) from tenk1 where ten < 100 order by ten;
-                     QUERY PLAN                      
------------------------------------------------------
+                  QUERY PLAN                   
+-----------------------------------------------
  Gather Merge
-   Output: ten, (sp_simple_func(ten))
+   Output: ten, ((ten + 10))
    Workers Planned: 4
-   ->  Result
-         Output: ten, sp_simple_func(ten)
-         ->  Sort
-               Output: ten
-               Sort Key: tenk1.ten
-               ->  Parallel Seq Scan on public.tenk1
-                     Output: ten
-                     Filter: (tenk1.ten < 100)
-(11 rows)
+   ->  Sort
+         Output: ten, ((ten + 10))
+         Sort Key: tenk1.ten
+         ->  Parallel Seq Scan on public.tenk1
+               Output: ten, (ten + 10)
+               Filter: (tenk1.ten < 100)
+(9 rows)
 
 drop function sp_simple_func(integer);
 -- test handling of SRFs in targetlist (bug in 10.0)
@@ -1016,12 +1014,12 @@ create function parallel_safe_volatile(a int) returns int as
 explain (costs off)
 select * from tenk1 where four = 2
 order by four, hundred, parallel_safe_volatile(thousand);
-                          QUERY PLAN                           
----------------------------------------------------------------
+               QUERY PLAN               
+----------------------------------------
  Gather Merge
    Workers Planned: 4
    ->  Sort
-         Sort Key: hundred, (parallel_safe_volatile(thousand))
+         Sort Key: hundred, thousand
          ->  Parallel Seq Scan on tenk1
                Filter: (four = 2)
 (6 rows)
@@ -1032,12 +1030,12 @@ set enable_seqscan = off;
 explain (costs off)
 select * from tenk1 where four = 2
 order by four, hundred, parallel_safe_volatile(thousand);
-                          QUERY PLAN                           
----------------------------------------------------------------
+                          QUERY PLAN                          
+--------------------------------------------------------------
  Gather Merge
    Workers Planned: 4
    ->  Incremental Sort
-         Sort Key: hundred, (parallel_safe_volatile(thousand))
+         Sort Key: hundred, thousand
          Presorted Key: hundred
          ->  Parallel Index Scan using tenk1_hundred on tenk1
                Filter: (four = 2)
@@ -1049,16 +1047,16 @@ reset enable_seqscan;
 explain (costs off)
 select count(*) from tenk1
 group by twenty, parallel_safe_volatile(two);
-                             QUERY PLAN                             
---------------------------------------------------------------------
+                     QUERY PLAN                     
+----------------------------------------------------
  Finalize GroupAggregate
-   Group Key: twenty, (parallel_safe_volatile(two))
+   Group Key: twenty, two
    ->  Gather Merge
          Workers Planned: 4
          ->  Sort
-               Sort Key: twenty, (parallel_safe_volatile(two))
+               Sort Key: twenty, two
                ->  Partial HashAggregate
-                     Group Key: twenty, parallel_safe_volatile(two)
+                     Group Key: twenty, two
                      ->  Parallel Seq Scan on tenk1
 (9 rows)
 

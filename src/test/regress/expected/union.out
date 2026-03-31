@@ -1572,15 +1572,15 @@ explain (costs off)
 select * from
   (select * from t3 a union all select * from t3 b) ss
   join int4_tbl on f1 = expensivefunc(x);
-                         QUERY PLAN                         
-------------------------------------------------------------
+                 QUERY PLAN                  
+---------------------------------------------
  Nested Loop
    ->  Seq Scan on int4_tbl
    ->  Append
          ->  Index Scan using t3i on t3 a
-               Index Cond: (expensivefunc(x) = int4_tbl.f1)
+               Index Cond: (x = int4_tbl.f1)
          ->  Index Scan using t3i on t3 b
-               Index Cond: (expensivefunc(x) = int4_tbl.f1)
+               Index Cond: (x = int4_tbl.f1)
 (7 rows)
 
 select * from

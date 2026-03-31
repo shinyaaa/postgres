@@ -1553,10 +1553,10 @@ ERROR:  value for domain sqljson_char2 violates check constraint "sqljson_char2_
 CREATE FUNCTION volatile_one() RETURNS int AS $$ BEGIN RETURN 1; END; $$ LANGUAGE plpgsql VOLATILE;
 CREATE FUNCTION stable_one() RETURNS int AS $$ BEGIN RETURN 1; END; $$ LANGUAGE plpgsql STABLE;
 EXPLAIN (VERBOSE, COSTS OFF) SELECT JSON_OBJECT('a': JSON_OBJECTAGG('b': volatile_one() RETURNING text) FORMAT JSON);
-                                                 QUERY PLAN                                                  
--------------------------------------------------------------------------------------------------------------
+                                           QUERY PLAN                                           
+------------------------------------------------------------------------------------------------
  Aggregate
-   Output: JSON_OBJECT('a' : JSON_OBJECTAGG('b' : volatile_one() RETURNING text) FORMAT JSON RETURNING json)
+   Output: JSON_OBJECT('a' : JSON_OBJECTAGG('b' : 1 RETURNING text) FORMAT JSON RETURNING json)
    ->  Result
 (3 rows)
 
@@ -1567,10 +1567,10 @@ SELECT JSON_OBJECT('a': JSON_OBJECTAGG('b': volatile_one() RETURNING text) FORMA
 (1 row)
 
 EXPLAIN (VERBOSE, COSTS OFF) SELECT JSON_OBJECT('a': JSON_OBJECTAGG('b': stable_one() RETURNING text) FORMAT JSON);
-                                                QUERY PLAN                                                 
------------------------------------------------------------------------------------------------------------
+                                           QUERY PLAN                                           
+------------------------------------------------------------------------------------------------
  Aggregate
-   Output: JSON_OBJECT('a' : JSON_OBJECTAGG('b' : stable_one() RETURNING text) FORMAT JSON RETURNING json)
+   Output: JSON_OBJECT('a' : JSON_OBJECTAGG('b' : 1 RETURNING text) FORMAT JSON RETURNING json)
    ->  Result
 (3 rows)
 

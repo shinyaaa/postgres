@@ -472,6 +472,136 @@ static PLpgSQL_variable *make_callstmt_target(PLpgSQL_execstate *estate,
 
 
 /* ----------
+ * plpgsql_exec_simple_function		Fast-path execution for simple functions.
+ *
+ * For PL/pgSQL functions that consist solely of "BEGIN RETURN <expr>; END"
+ * with no exception handlers and no local variables, we can avoid the
+ * overhead of SPI connect/disconnect and full estate setup.  Instead, we
+ * set up a minimal execution environment and directly evaluate the RETURN
+ * expression.
+ *
+ * Returns true if fast-path was used (result stored in *retval, *retisnull),
+ * false if the function should be executed via the normal path.
+ * ----------
+ */
+bool
+plpgsql_exec_simple_function(PLpgSQL_function *func, FunctionCallInfo fcinfo,
+							 Datum *retval, bool *retisnull)
+{
+	PLpgSQL_execstate estate;
+	PLpgSQL_expr *expr;
+	Datum		result;
+	bool		isnull;
+	Oid			rettype;
+	int32		rettypmod;
+	int			i;
+
+	ErrorContextCallback plerrcontext;
+
+	Assert(func->fn_is_simple);
+
+	expr = func->fn_simple_return_expr;
+
+	/*
+	 * Setup a minimal execution state.  We need the shared eval estate and
+	 * resowner for simple expression evaluation, and paramLI for passing
+	 * argument values.
+	 */
+	plpgsql_estate_setup(&estate, func, NULL,
+						 NULL, NULL);
+	estate.atomic = true;
+
+	/*
+	 * Setup error traceback support for ereport().
+	 */
+	plerrcontext.callback = plpgsql_exec_error_callback;
+	plerrcontext.arg = &estate;
+	plerrcontext.previous = error_context_stack;
+	error_context_stack = &plerrcontext;
+
+	/*
+	 * Make local execution copies of all the datums.
+	 */
+	copy_plpgsql_datums(&estate, func);
+
+	/*
+	 * Store call argument values into the appropriate variables.
+	 * For simple functions, all args should be simple scalar variables.
+	 */
+	for (i = 0; i < func->fn_nargs; i++)
+	{
+		int			n = func->fn_argvarnos[i];
+		PLpgSQL_datum *datum = estate.datums[n];
+
+		if (datum->dtype == PLPGSQL_DTYPE_VAR)
+		{
+			PLpgSQL_var *var = (PLpgSQL_var *) datum;
+
+			assign_simple_var(&estate, var,
+							  fcinfo->args[i].value,
+							  fcinfo->args[i].isnull,
+							  false);
+		}
+		else
+		{
+			/*
+			 * Non-scalar argument - bail out to normal path.
+			 * This shouldn't happen for functions detected as simple.
+			 */
+			plpgsql_destroy_econtext(&estate);
+			error_context_stack = plerrcontext.previous;
+			return false;
+		}
+	}
+
+	/*
+	 * Set the error statement info so error context can report the line
+	 * number of the RETURN statement.
+	 */
+	{
+		PLpgSQL_stmt_return *retstmt = (PLpgSQL_stmt_return *)
+			linitial(func->action->body);
+
+		estate.err_stmt = (PLpgSQL_stmt *) retstmt;
+	}
+
+	/*
+	 * Evaluate the RETURN expression directly.
+	 */
+	estate.err_text = NULL;
+	result = exec_eval_expr(&estate, expr, &isnull, &rettype, &rettypmod);
+
+	/*
+	 * Cast result value to function's declared result type, same as the
+	 * scalar case in plpgsql_exec_function.
+	 */
+	estate.err_text = gettext_noop("while casting return value to function's return type");
+	result = exec_cast_value(&estate,
+							 result, &isnull,
+							 rettype, rettypmod,
+							 func->fn_rettype, -1);
+
+	/*
+	 * Copy the result into the caller's context (outside eval_mcontext).
+	 * Use SPI_datumTransfer which handles expanded objects correctly.
+	 */
+	if (!isnull && !func->fn_retbyval)
+		result = SPI_datumTransfer(result, false, func->fn_rettyplen);
+
+	*retval = result;
+	*retisnull = isnull;
+
+	/* Clean up */
+	exec_eval_cleanup(&estate);
+	plpgsql_destroy_econtext(&estate);
+
+	/* Pop error context */
+	error_context_stack = plerrcontext.previous;
+
+	return true;
+}
+
+/* ----------
  * plpgsql_exec_function	Called by the call handler for
  *				function execution.
  *

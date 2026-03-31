@@ -242,6 +242,43 @@ plpgsql_call_handler(PG_FUNCTION_ARGS)
 	/* Find or compile the function */
 	func = plpgsql_compile(fcinfo, false);
 
+	/*
+	 * Fast-path for simple functions: skip most of the overhead if the
+	 * function is just "BEGIN RETURN <expr>; END" with no exception handlers
+	 * or local variables.  The fast path avoids the PG_TRY block, procedure
+	 * resowner setup, and other overhead that simple functions don't need.
+	 */
+	if (func->fn_is_simple &&
+		!nonatomic &&
+		!CALLED_AS_TRIGGER(fcinfo) &&
+		!CALLED_AS_EVENT_TRIGGER(fcinfo))
+	{
+		Datum		simple_retval;
+		bool		simple_isnull;
+
+		/* Must save and restore prior value of cur_estate */
+		save_cur_estate = func->cur_estate;
+		func->cfunc.use_count++;
+
+		if (plpgsql_exec_simple_function(func, fcinfo,
+										 &simple_retval, &simple_isnull))
+		{
+			func->cfunc.use_count--;
+			func->cur_estate = save_cur_estate;
+
+			if ((rc = SPI_finish()) != SPI_OK_FINISH)
+				elog(ERROR, "SPI_finish failed: %s",
+					 SPI_result_code_string(rc));
+
+			fcinfo->isnull = simple_isnull;
+			return simple_retval;
+		}
+
+		/* Fast path not possible, fall through to normal execution */
+		func->cfunc.use_count--;
+		func->cur_estate = save_cur_estate;
+	}
+
 	/* Must save and restore prior value of cur_estate */
 	save_cur_estate = func->cur_estate;
 

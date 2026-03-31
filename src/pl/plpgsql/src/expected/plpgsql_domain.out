@@ -196,7 +196,7 @@ select test_build_uint2_array(1::int2);
 
 select test_build_uint2_array(-1::int2);  -- fail
 ERROR:  value for domain uint2 violates check constraint "uint2_check"
-CONTEXT:  PL/pgSQL function test_build_uint2_array(smallint) while casting return value to function's return type
+CONTEXT:  PL/pgSQL function test_build_uint2_array(smallint) line 3 while casting return value to function's return type
 CREATE FUNCTION test_argresult_domain_array(x integer[])
   RETURNS ordered_pair_domain[] AS $$
 begin
@@ -370,7 +370,7 @@ SELECT build_ordered_named_pairs(1,2);
 
 SELECT build_ordered_named_pairs(2,1);  -- fail
 ERROR:  value for domain ordered_named_pair violates check constraint "ordered_named_pair_check"
-CONTEXT:  PL/pgSQL function build_ordered_named_pairs(integer,integer) while casting return value to function's return type
+CONTEXT:  PL/pgSQL function build_ordered_named_pairs(integer,integer) line 3 while casting return value to function's return type
 CREATE FUNCTION test_assign_ordered_named_pairs(x int, y int, z int)
   RETURNS ordered_named_pair[] AS $$
 declare v ordered_named_pair[] := array[row(x, y)];

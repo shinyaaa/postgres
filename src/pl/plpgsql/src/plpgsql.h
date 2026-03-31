@@ -1002,6 +1002,15 @@ typedef struct PLpgSQL_function
 	bool		requires_procedure_resowner;	/* contains CALL or DO? */
 	bool		has_exception_block;	/* contains BEGIN...EXCEPTION? */
 
+	/*
+	 * Simple function optimization: if the function body is just
+	 * "BEGIN RETURN <simple_expr>; END" with no exception handlers and no
+	 * local variable initialization, we can use a fast execution path that
+	 * skips SPI connect/disconnect and most estate setup overhead.
+	 */
+	bool		fn_is_simple;		/* qualifies for fast-path execution? */
+	PLpgSQL_expr *fn_simple_return_expr;	/* RETURN expression if simple */
+
 	/* this field changes when the function is used */
 	struct PLpgSQL_execstate *cur_estate;
 } PLpgSQL_function;
@@ -1256,6 +1265,9 @@ extern int	plpgsql_add_initdatums(int **varnos);
 /*
  * Functions in pl_exec.c
  */
+extern bool plpgsql_exec_simple_function(PLpgSQL_function *func,
+										 FunctionCallInfo fcinfo,
+										 Datum *retval, bool *retisnull);
 extern Datum plpgsql_exec_function(PLpgSQL_function *func,
 								   FunctionCallInfo fcinfo,
 								   EState *simple_eval_estate,

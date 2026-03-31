@@ -2316,13 +2316,11 @@ begin;
 create function list_part_fn(int) returns int as $$ begin return $1; end;$$ language plpgsql stable;
 -- Ensure pruning works using a stable function containing no Vars
 explain (analyze, costs off, summary off, timing off, buffers off) select * from list_part where a = list_part_fn(1);
-                             QUERY PLAN                              
----------------------------------------------------------------------
- Append (actual rows=1.00 loops=1)
-   Subplans Removed: 3
-   ->  Seq Scan on list_part1 list_part_1 (actual rows=1.00 loops=1)
-         Filter: (a = list_part_fn(1))
-(4 rows)
+                         QUERY PLAN                          
+-------------------------------------------------------------
+ Seq Scan on list_part1 list_part (actual rows=1.00 loops=1)
+   Filter: (a = 1)
+(2 rows)
 
 -- Ensure pruning does not take place when the function has a Var parameter
 explain (analyze, costs off, summary off, timing off, buffers off) select * from list_part where a = list_part_fn(a);
@@ -2330,13 +2328,13 @@ explain (analyze, costs off, summary off, timing off, buffers off) select * from
 ---------------------------------------------------------------------
  Append (actual rows=4.00 loops=1)
    ->  Seq Scan on list_part1 list_part_1 (actual rows=1.00 loops=1)
-         Filter: (a = list_part_fn(a))
+         Filter: (a IS NOT NULL)
    ->  Seq Scan on list_part2 list_part_2 (actual rows=1.00 loops=1)
-         Filter: (a = list_part_fn(a))
+         Filter: (a IS NOT NULL)
    ->  Seq Scan on list_part3 list_part_3 (actual rows=1.00 loops=1)
-         Filter: (a = list_part_fn(a))
+         Filter: (a IS NOT NULL)
    ->  Seq Scan on list_part4 list_part_4 (actual rows=1.00 loops=1)
-         Filter: (a = list_part_fn(a))
+         Filter: (a IS NOT NULL)
 (9 rows)
 
 -- Ensure pruning does not take place when the expression contains a Var.
@@ -2345,16 +2343,16 @@ explain (analyze, costs off, summary off, timing off, buffers off) select * from
 ---------------------------------------------------------------------
  Append (actual rows=0.00 loops=1)
    ->  Seq Scan on list_part1 list_part_1 (actual rows=0.00 loops=1)
-         Filter: (a = (list_part_fn(1) + a))
+         Filter: (a = (1 + a))
          Rows Removed by Filter: 1
    ->  Seq Scan on list_part2 list_part_2 (actual rows=0.00 loops=1)
-         Filter: (a = (list_part_fn(1) + a))
+         Filter: (a = (1 + a))
          Rows Removed by Filter: 1
    ->  Seq Scan on list_part3 list_part_3 (actual rows=0.00 loops=1)
-         Filter: (a = (list_part_fn(1) + a))
+         Filter: (a = (1 + a))
          Rows Removed by Filter: 1
    ->  Seq Scan on list_part4 list_part_4 (actual rows=0.00 loops=1)
-         Filter: (a = (list_part_fn(1) + a))
+         Filter: (a = (1 + a))
          Rows Removed by Filter: 1
 (13 rows)
 
@@ -4633,19 +4631,17 @@ explain (costs off)
 merge into part_abc_view pt
 using (select stable_one() as pid) as q join part_abc_1 pt1 on (q.pid = pt1.a) on pt.a = pt1.a
 when matched then delete returning pt.a;
-                              QUERY PLAN                               
------------------------------------------------------------------------
+                      QUERY PLAN                      
+------------------------------------------------------
  Merge on part_abc
    Merge on part_abc_1
    ->  Nested Loop
-         ->  Append
-               Subplans Removed: 1
-               ->  Seq Scan on part_abc_1
-                     Filter: ((b <> 'a'::text) AND (a = stable_one()))
+         ->  Seq Scan on part_abc_1
+               Filter: ((b <> 'a'::text) AND (a = 1))
          ->  Materialize
                ->  Seq Scan on part_abc_1 pt1
-                     Filter: (a = stable_one())
-(10 rows)
+                     Filter: (a = 1)
+(8 rows)
 
 merge into part_abc_view pt
 using (select stable_one() as pid) as q join part_abc_1 pt1 on (q.pid = pt1.a) on pt.a = pt1.a
@@ -4666,16 +4662,13 @@ explain (costs off)
 merge into part_abc_view pt
 using (select stable_one() + 2 as pid) as q join part_abc_1 pt1 on (q.pid = pt1.a) on pt.a = pt1.a
 when matched then delete returning pt.a;
-                      QUERY PLAN                      
-------------------------------------------------------
+               QUERY PLAN                
+-----------------------------------------
  Merge on part_abc
-   ->  Nested Loop
-         ->  Append
-               Subplans Removed: 2
-         ->  Materialize
-               ->  Seq Scan on part_abc_1 pt1
-                     Filter: (a = (stable_one() + 2))
-(7 rows)
+   ->  Result
+         Replaces: Join on pt1, part_abc
+         One-Time Filter: false
+(4 rows)
 
 merge into part_abc_view pt
 using (select stable_one() + 2 as pid) as q join part_abc_1 pt1 on (q.pid = pt1.a) on pt.a = pt1.a
@@ -4696,15 +4689,15 @@ explain (costs off)
 merge into part_abc_view pt
 using (select stable_one() + 1 as pid) as q join part_abc_2 pt2 on (q.pid = pt2.a) on pt.a = stable_one() + 2
 when not matched then insert values (1, 'd', false) returning pt.a;
-                   QUERY PLAN                   
-------------------------------------------------
+                QUERY PLAN                
+------------------------------------------
  Merge on part_abc
    ->  Nested Loop Left Join
          ->  Seq Scan on part_abc_2 pt2
-               Filter: ((stable_one() + 1) = a)
-         ->  Materialize
-               ->  Append
-                     Subplans Removed: 2
+               Filter: (2 = a)
+         ->  Result
+               Replaces: Scan on part_abc
+               One-Time Filter: false
 (7 rows)
 
 merge into part_abc_view pt
@@ -4733,17 +4726,17 @@ with t as (
   when not matched then insert values (1, 'd', false) returning merge_action(), pt.*
 )
 insert into part_abc_log select * from t returning *;
-                       QUERY PLAN                       
---------------------------------------------------------
+                    QUERY PLAN                    
+--------------------------------------------------
  Insert on part_abc_log
    CTE t
      ->  Merge on part_abc
            ->  Nested Loop Left Join
                  ->  Seq Scan on part_abc_2 pt2
-                       Filter: ((stable_one() + 1) = a)
-                 ->  Materialize
-                       ->  Append
-                             Subplans Removed: 2
+                       Filter: (2 = a)
+                 ->  Result
+                       Replaces: Scan on part_abc
+                       One-Time Filter: false
    ->  CTE Scan on t
 (10 rows)
 
@@ -4783,44 +4776,46 @@ explain (costs off)
 select min(a) over (partition by a order by a) from part_abc where a >= stable_one() + 1 and d <= stable_one()
 union all
 select min(a) over (partition by a order by a) from part_abc where a >= stable_one() + 1 and d >= stable_one();
-                                          QUERY PLAN                                          
-----------------------------------------------------------------------------------------------
+                                  QUERY PLAN                                   
+-------------------------------------------------------------------------------
  Append
    ->  Subquery Scan on unnamed_subquery_2
          ->  WindowAgg
                Window: w1 AS (PARTITION BY part_abc.a ORDER BY part_abc.a)
-               ->  Append
-                     Subplans Removed: 1
-                     ->  Index Scan using part_abc_2_a_idx on part_abc_2 part_abc_1
-                           Index Cond: (a >= (stable_one() + 1))
-                           Filter: (d <= stable_one())
-                     ->  Merge Append
-                           Sort Key: part_abc_3.a
-                           Subplans Removed: 1
-                           ->  Index Scan using part_abc_3_1_a_idx on part_abc_3_1 part_abc_3
-                                 Index Cond: (a >= (stable_one() + 1))
-                                 Filter: (d <= stable_one())
-                           ->  Index Scan using part_abc_3_2_a_idx on part_abc_3_2 part_abc_4
-                                 Index Cond: (a >= (stable_one() + 1))
-                                 Filter: (d <= stable_one())
+               ->  Sort
+                     Sort Key: part_abc.a
+                     ->  Append
+                           ->  Seq Scan on part_abc_2 part_abc_1
+                                 Filter: ((a >= 2) AND (d <= 1))
+                           ->  Bitmap Heap Scan on part_abc_3_1 part_abc_2
+                                 Recheck Cond: (a >= 2)
+                                 Filter: (d <= 1)
+                                 ->  Bitmap Index Scan on part_abc_3_1_a_idx
+                                       Index Cond: (a >= 2)
+                           ->  Bitmap Heap Scan on part_abc_3_2 part_abc_3
+                                 Recheck Cond: (a >= 2)
+                                 Filter: (d <= 1)
+                                 ->  Bitmap Index Scan on part_abc_3_2_a_idx
+                                       Index Cond: (a >= 2)
    ->  Subquery Scan on unnamed_subquery_1
          ->  WindowAgg
-               Window: w1 AS (PARTITION BY part_abc_5.a ORDER BY part_abc_5.a)
-               ->  Append
-                     Subplans Removed: 1
-                     ->  Index Scan using part_abc_2_a_idx on part_abc_2 part_abc_6
-                           Index Cond: (a >= (stable_one() + 1))
-                           Filter: (d >= stable_one())
-                     ->  Merge Append
-                           Sort Key: a
-                           Subplans Removed: 1
-                           ->  Index Scan using part_abc_3_2_a_idx on part_abc_3_2 part_abc_8
-                                 Index Cond: (a >= (stable_one() + 1))
-                                 Filter: (d >= stable_one())
-                           ->  Index Scan using part_abc_3_3_a_idx on part_abc_3_3 part_abc_9
-                                 Index Cond: (a >= (stable_one() + 1))
-                                 Filter: (d >= stable_one())
-(35 rows)
+               Window: w1 AS (PARTITION BY part_abc_4.a ORDER BY part_abc_4.a)
+               ->  Sort
+                     Sort Key: part_abc_4.a
+                     ->  Append
+                           ->  Seq Scan on part_abc_2 part_abc_5
+                                 Filter: ((a >= 2) AND (d >= 1))
+                           ->  Bitmap Heap Scan on part_abc_3_2 part_abc_6
+                                 Recheck Cond: (a >= 2)
+                                 Filter: (d >= 1)
+                                 ->  Bitmap Index Scan on part_abc_3_2_a_idx
+                                       Index Cond: (a >= 2)
+                           ->  Bitmap Heap Scan on part_abc_3_3 part_abc_7
+                                 Recheck Cond: (a >= 2)
+                                 Filter: (d >= 1)
+                                 ->  Bitmap Index Scan on part_abc_3_3_a_idx
+                                       Index Cond: (a >= 2)
+(37 rows)
 
 drop view part_abc_view;
 drop table part_abc;

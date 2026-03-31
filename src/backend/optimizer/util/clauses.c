@@ -57,6 +57,7 @@
 #include "utils/json.h"
 #include "utils/jsonb.h"
 #include "utils/jsonpath.h"
+#include "commands/proclang.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/syscache.h"
@@ -158,6 +159,12 @@ static Node *substitute_actual_parameters(Node *expr, int nargs, List *args,
 static Node *substitute_actual_parameters_mutator(Node *node,
 												  substitute_actual_parameters_context *context);
 static void sql_inline_error_callback(void *arg);
+static Expr *inline_plpgsql_function(Oid funcid, Oid result_type,
+									 Oid result_collid, Oid input_collid,
+									 List *args, bool funcvariadic,
+									 HeapTuple func_tuple,
+									 eval_const_expressions_context *context);
+static char *extract_plpgsql_return_expr(const char *src);
 static Query *inline_sql_function_in_from(PlannerInfo *root,
 										  RangeTblFunction *rtfunc,
 										  FuncExpr *fexpr,
@@ -5294,8 +5301,26 @@ inline_function(Oid funcid, Oid result_type, Oid result_collid,
 	 * Forget it if the function is not SQL-language or has other showstopper
 	 * properties.  (The prokind and nargs checks are just paranoia.)
 	 */
-	if (funcform->prolang != SQLlanguageId ||
-		funcform->prokind != PROKIND_FUNCTION ||
+	if (funcform->prolang != SQLlanguageId)
+	{
+		/*
+		 * For non-SQL languages, try PL/pgSQL inlining.  Simple PL/pgSQL
+		 * functions consisting of just "BEGIN RETURN <expr>; END" can be
+		 * inlined similarly to SQL functions, eliminating per-call overhead.
+		 */
+		if (funcform->prokind == PROKIND_FUNCTION &&
+			!funcform->prosecdef &&
+			!funcform->proretset &&
+			funcform->prorettype != RECORDOID &&
+			!type_is_rowtype(funcform->prorettype) &&
+			heap_attisnull(func_tuple, Anum_pg_proc_proconfig, NULL) &&
+			funcform->pronargs == list_length(args))
+			return inline_plpgsql_function(funcid, result_type, result_collid,
+										   input_collid, args, funcvariadic,
+										   func_tuple, context);
+		return NULL;
+	}
+	if (funcform->prokind != PROKIND_FUNCTION ||
 		funcform->prosecdef ||
 		funcform->proretset ||
 		funcform->prorettype == RECORDOID ||
@@ -5676,6 +5701,567 @@ sql_inline_error_callback(void *arg)
 	}
 
 	errcontext("SQL function \"%s\" during inlining", callback_arg->proname);
+}
+
+/*
+ * extract_plpgsql_return_expr - extract the RETURN expression from a simple
+ * PL/pgSQL function body.
+ *
+ * Returns a palloc'd string containing the expression text, or NULL if the
+ * function body is not a simple "BEGIN RETURN <expr>; END" pattern.
+ *
+ * We are intentionally conservative here: if there's any complexity
+ * (DECLARE blocks, EXCEPTION handlers, multiple statements, labels, etc.)
+ * we bail out and return NULL.  This is safe because we'll just skip the
+ * inlining optimization for those cases.
+ */
+static char *
+extract_plpgsql_return_expr(const char *src)
+{
+	const char *p = src;
+	const char *expr_start;
+	const char *expr_end;
+	int			len;
+
+	/* Skip leading whitespace */
+	while (isspace((unsigned char) *p))
+		p++;
+
+	/* Must start with BEGIN (case insensitive) */
+	if (pg_strncasecmp(p, "begin", 5) != 0)
+		return NULL;
+	if (p[5] != '\0' && !isspace((unsigned char) p[5]) && p[5] != ';')
+		return NULL;
+	p += 5;
+
+	/* Skip whitespace (and optional semicolons after BEGIN) */
+	while (isspace((unsigned char) *p))
+		p++;
+
+	/* Must be followed by RETURN (not RETURN NEXT or RETURN QUERY) */
+	if (pg_strncasecmp(p, "return", 6) != 0)
+		return NULL;
+	if (p[6] != '\0' && !isspace((unsigned char) p[6]))
+		return NULL;
+	p += 6;
+
+	/* Must have something after RETURN (not just "RETURN;") */
+	while (isspace((unsigned char) *p))
+		p++;
+	if (*p == ';')
+		return NULL;
+
+	/* Check it's not RETURN NEXT or RETURN QUERY */
+	if (pg_strncasecmp(p, "next", 4) == 0 &&
+		(isspace((unsigned char) p[4]) || p[4] == ';'))
+		return NULL;
+	if (pg_strncasecmp(p, "query", 5) == 0 &&
+		(isspace((unsigned char) p[5]) || p[5] == ';'))
+		return NULL;
+
+	expr_start = p;
+
+	/*
+	 * Scan for the semicolon that terminates the RETURN expression.
+	 * We need to handle string literals, dollar-quoted strings, and comments
+	 * so we don't stop at a semicolon inside them.
+	 */
+	while (*p)
+	{
+		if (*p == ';')
+			break;
+
+		/* Skip single-quoted string literals */
+		if (*p == '\'')
+		{
+			p++;
+			while (*p)
+			{
+				if (*p == '\'')
+				{
+					if (*(p + 1) == '\'')
+						p += 2;		/* escaped quote */
+					else
+					{
+						p++;
+						break;
+					}
+				}
+				else
+					p++;
+			}
+			continue;
+		}
+
+		/* Skip double-quoted identifiers */
+		if (*p == '"')
+		{
+			p++;
+			while (*p)
+			{
+				if (*p == '"')
+				{
+					if (*(p + 1) == '"')
+						p += 2;		/* escaped quote */
+					else
+					{
+						p++;
+						break;
+					}
+				}
+				else
+					p++;
+			}
+			continue;
+		}
+
+		/* Skip dollar-quoted strings */
+		if (*p == '$')
+		{
+			const char *tag_start = p;
+
+			p++;
+			/* Find the end of the opening tag */
+			while (*p && (isalnum((unsigned char) *p) || *p == '_'))
+				p++;
+			if (*p == '$')
+			{
+				int		tag_len = p - tag_start + 1;
+
+				p++;	/* skip closing $ of opening tag */
+				/* Find the matching closing tag */
+				while (*p)
+				{
+					if (*p == '$' &&
+						strncmp(p, tag_start, tag_len) == 0)
+					{
+						p += tag_len;
+						break;
+					}
+					p++;
+				}
+				continue;
+			}
+			/* Not a valid dollar-quote, back up */
+			p = tag_start + 1;
+			continue;
+		}
+
+		/* Skip line comments */
+		if (p[0] == '-' && p[1] == '-')
+		{
+			p += 2;
+			while (*p && *p != '\n')
+				p++;
+			continue;
+		}
+
+		/* Skip block comments (with nesting) */
+		if (p[0] == '/' && p[1] == '*')
+		{
+			int		nesting = 1;
+
+			p += 2;
+			while (*p && nesting > 0)
+			{
+				if (p[0] == '/' && p[1] == '*')
+				{
+					nesting++;
+					p += 2;
+				}
+				else if (p[0] == '*' && p[1] == '/')
+				{
+					nesting--;
+					p += 2;
+				}
+				else
+					p++;
+			}
+			continue;
+		}
+
+		p++;
+	}
+
+	if (*p != ';')
+		return NULL;
+
+	expr_end = p;
+	p++;	/* skip the semicolon */
+
+	/* Skip whitespace */
+	while (isspace((unsigned char) *p))
+		p++;
+
+	/* Must be followed by END */
+	if (pg_strncasecmp(p, "end", 3) != 0)
+		return NULL;
+	p += 3;
+
+	/* After END, allow optional label name, semicolons, whitespace */
+	while (isspace((unsigned char) *p))
+		p++;
+
+	/* Skip optional label after END */
+	if (*p != '\0' && *p != ';')
+	{
+		/* Must be an identifier (label name) */
+		if (!isalpha((unsigned char) *p) && *p != '_')
+			return NULL;
+		while (isalnum((unsigned char) *p) || *p == '_')
+			p++;
+	}
+
+	/* Skip trailing semicolons and whitespace */
+	while (isspace((unsigned char) *p) || *p == ';')
+		p++;
+
+	/* Must be at end of string */
+	if (*p != '\0')
+		return NULL;
+
+	/* Trim trailing whitespace from expression */
+	while (expr_end > expr_start && isspace((unsigned char) *(expr_end - 1)))
+		expr_end--;
+
+	len = expr_end - expr_start;
+	if (len <= 0)
+		return NULL;
+
+	return pnstrdup(expr_start, len);
+}
+
+/*
+ * inline_plpgsql_function - try to inline a simple PL/pgSQL function.
+ *
+ * Simple PL/pgSQL functions of the form "BEGIN RETURN <expr>; END" can be
+ * inlined by extracting the RETURN expression and treating it as if it were
+ * a SQL function body "SELECT <expr>".  This eliminates the substantial
+ * per-call overhead of PL/pgSQL (SPI connect/disconnect, executor state
+ * setup, datum copying, etc.).
+ *
+ * Returns a simplified expression if successful, or NULL if the function
+ * cannot be inlined.
+ */
+static Expr *
+inline_plpgsql_function(Oid funcid, Oid result_type, Oid result_collid,
+						Oid input_collid, List *args, bool funcvariadic,
+						HeapTuple func_tuple,
+						eval_const_expressions_context *context)
+{
+	Form_pg_proc funcform = (Form_pg_proc) GETSTRUCT(func_tuple);
+	char	   *src;
+	char	   *return_expr;
+	char	   *select_src;
+	Datum		tmp;
+	MemoryContext oldcxt;
+	MemoryContext mycxt;
+	inline_error_callback_arg callback_arg;
+	ErrorContextCallback sqlerrcontext;
+	FuncExpr   *fexpr;
+	SQLFunctionParseInfoPtr pinfo;
+	TupleDesc	rettupdesc;
+	ParseState *pstate;
+	List	   *raw_parsetree_list;
+	List	   *querytree_list;
+	Query	   *querytree;
+	Node	   *newexpr;
+	int		   *usecounts;
+	ListCell   *arg;
+	int			i;
+	static Oid	plpgsql_lang_oid = InvalidOid;
+
+	/*
+	 * Look up the PL/pgSQL language OID (cached after first lookup).
+	 * We use a static variable since the OID won't change within a session.
+	 */
+	if (!OidIsValid(plpgsql_lang_oid))
+	{
+		plpgsql_lang_oid = get_language_oid("plpgsql", true);
+		if (!OidIsValid(plpgsql_lang_oid))
+			return NULL;
+	}
+
+	/* Only handle PL/pgSQL functions */
+	if (funcform->prolang != plpgsql_lang_oid)
+		return NULL;
+
+	/* Check for recursive function */
+	if (list_member_oid(context->active_fns, funcid))
+		return NULL;
+
+	/* Check permission to call function */
+	if (object_aclcheck(ProcedureRelationId, funcid, GetUserId(), ACL_EXECUTE) != ACLCHECK_OK)
+		return NULL;
+
+	/* Check whether a plugin wants to hook function entry/exit */
+	if (FmgrHookIsNeeded(funcid))
+		return NULL;
+
+	/*
+	 * Don't inline PL/pgSQL functions that return domain types, composite
+	 * types, or RECORD.  PL/pgSQL performs additional type checking and
+	 * coercion at return time (domain constraint checks, composite type
+	 * matching) that would be lost if we inline the expression.
+	 */
+	if (type_is_rowtype(result_type) ||
+		get_typtype(result_type) == TYPTYPE_DOMAIN ||
+		get_typtype(result_type) == TYPTYPE_COMPOSITE ||
+		result_type == RECORDOID)
+		return NULL;
+
+	/*
+	 * Also skip if return type is an array of domain or composite types,
+	 * since element-level domain checks would be lost.
+	 */
+	{
+		Oid			elem_type = get_element_type(result_type);
+
+		if (OidIsValid(elem_type) &&
+			(get_typtype(elem_type) == TYPTYPE_DOMAIN ||
+			 get_typtype(elem_type) == TYPTYPE_COMPOSITE ||
+			 type_is_rowtype(elem_type)))
+			return NULL;
+	}
+
+	/*
+	 * Make a temporary memory context for parsing work.
+	 */
+	mycxt = AllocSetContextCreate(CurrentMemoryContext,
+								  "inline_plpgsql_function",
+								  ALLOCSET_DEFAULT_SIZES);
+	oldcxt = MemoryContextSwitchTo(mycxt);
+
+	/* Fetch the function body */
+	tmp = SysCacheGetAttrNotNull(PROCOID, func_tuple, Anum_pg_proc_prosrc);
+	src = TextDatumGetCString(tmp);
+
+	/*
+	 * Try to extract a simple RETURN expression from the PL/pgSQL body.
+	 * If the function has any complexity (DECLARE, EXCEPTION, multiple
+	 * statements, etc.), this will return NULL and we skip inlining.
+	 */
+	return_expr = extract_plpgsql_return_expr(src);
+	if (return_expr == NULL)
+		goto fail;
+
+	/*
+	 * Construct a SQL SELECT statement from the extracted expression.
+	 * This allows us to use the existing SQL function parsing infrastructure.
+	 */
+	select_src = psprintf("SELECT %s", return_expr);
+
+	/*
+	 * Setup error traceback support for ereport().
+	 */
+	callback_arg.proname = NameStr(funcform->proname);
+	callback_arg.prosrc = select_src;
+
+	sqlerrcontext.callback = sql_inline_error_callback;
+	sqlerrcontext.arg = &callback_arg;
+	sqlerrcontext.previous = error_context_stack;
+	error_context_stack = &sqlerrcontext;
+
+	/*
+	 * Build a dummy FuncExpr node for the parameter resolution machinery.
+	 */
+	fexpr = makeNode(FuncExpr);
+	fexpr->funcid = funcid;
+	fexpr->funcresulttype = result_type;
+	fexpr->funcretset = false;
+	fexpr->funcvariadic = funcvariadic;
+	fexpr->funcformat = COERCE_EXPLICIT_CALL;
+	fexpr->funccollid = result_collid;
+	fexpr->inputcollid = input_collid;
+	fexpr->args = args;
+	fexpr->location = -1;
+
+	/*
+	 * Set up to handle parameters while parsing the expression.  This uses
+	 * the same infrastructure as SQL function parsing, resolving parameter
+	 * names (e.g., "num") to Param nodes ($1, $2, ...).
+	 */
+	pinfo = prepare_sql_fn_parse_info(func_tuple,
+									  (Node *) fexpr,
+									  input_collid);
+
+	/*
+	 * Parse the constructed SELECT statement.  We use PG_TRY to catch any
+	 * parse errors, since the extracted expression might use PL/pgSQL-specific
+	 * syntax that isn't valid as standalone SQL.
+	 */
+	querytree = NULL;
+	PG_TRY();
+	{
+		raw_parsetree_list = pg_parse_query(select_src);
+		if (list_length(raw_parsetree_list) != 1)
+			querytree = NULL;
+		else
+		{
+			pstate = make_parsestate(NULL);
+			pstate->p_sourcetext = select_src;
+			sql_fn_parser_setup(pstate, pinfo);
+
+			querytree = transformTopLevelStmt(pstate,
+											  linitial(raw_parsetree_list));
+
+			free_parsestate(pstate);
+		}
+	}
+	PG_CATCH();
+	{
+		/* Silently discard the error and give up on inlining */
+		FlushErrorState();
+		querytree = NULL;
+	}
+	PG_END_TRY();
+
+	if (querytree == NULL)
+		goto fail;
+
+	/*
+	 * The single command must be a simple "SELECT expression" - same checks
+	 * as for SQL function inlining.
+	 */
+	if (!IsA(querytree, Query) ||
+		querytree->commandType != CMD_SELECT ||
+		querytree->hasAggs ||
+		querytree->hasWindowFuncs ||
+		querytree->hasTargetSRFs ||
+		querytree->hasSubLinks ||
+		querytree->cteList ||
+		querytree->rtable ||
+		querytree->jointree->fromlist ||
+		querytree->jointree->quals ||
+		querytree->groupClause ||
+		querytree->groupingSets ||
+		querytree->havingQual ||
+		querytree->windowClause ||
+		querytree->distinctClause ||
+		querytree->sortClause ||
+		querytree->limitOffset ||
+		querytree->limitCount ||
+		querytree->setOperations ||
+		list_length(querytree->targetList) != 1)
+		goto fail;
+
+	/* If the function result is composite, resolve it */
+	(void) get_expr_result_type((Node *) fexpr, NULL, &rettupdesc);
+
+	/*
+	 * Make sure the function returns what it's declared to.
+	 */
+	querytree_list = list_make1(querytree);
+	if (check_sql_fn_retval(list_make1(querytree_list),
+							result_type, rettupdesc,
+							funcform->prokind,
+							false))
+		goto fail;
+
+	if (querytree != linitial(querytree_list))
+		goto fail;
+
+	/* Grab the target list expression */
+	newexpr = (Node *) ((TargetEntry *) linitial(querytree->targetList))->expr;
+
+	/* Check result type matches */
+	if (exprType(newexpr) != result_type)
+		goto fail;
+
+	/*
+	 * Volatility and strictness checks - same as for SQL functions.
+	 */
+	if (funcform->provolatile == PROVOLATILE_IMMUTABLE &&
+		contain_mutable_functions(newexpr))
+		goto fail;
+	else if (funcform->provolatile == PROVOLATILE_STABLE &&
+			 contain_volatile_functions(newexpr))
+		goto fail;
+
+	if (funcform->proisstrict &&
+		contain_nonstrict_functions(newexpr))
+		goto fail;
+
+	/* Check for context-dependent nodes in arguments */
+	if (contain_context_dependent_node((Node *) args))
+		goto fail;
+
+	/* Substitute actual parameters for Param nodes */
+	usecounts = (int *) palloc0(funcform->pronargs * sizeof(int));
+	newexpr = substitute_actual_parameters(newexpr, funcform->pronargs,
+										   args, usecounts);
+
+	/* Check parameter usage */
+	i = 0;
+	foreach(arg, args)
+	{
+		Node	   *param = lfirst(arg);
+
+		if (usecounts[i] == 0)
+		{
+			if (funcform->proisstrict)
+				goto fail;
+		}
+		else if (usecounts[i] != 1)
+		{
+			QualCost	eval_cost;
+
+			if (contain_subplans(param))
+				goto fail;
+			cost_qual_eval(&eval_cost, list_make1(param), NULL);
+			if (eval_cost.startup + eval_cost.per_tuple >
+				10 * cpu_operator_cost)
+				goto fail;
+			if (contain_volatile_functions(param))
+				goto fail;
+		}
+		i++;
+	}
+
+	/*
+	 * Success - copy the expression out of the temporary memory context.
+	 */
+	MemoryContextSwitchTo(oldcxt);
+	newexpr = copyObject(newexpr);
+	MemoryContextDelete(mycxt);
+
+	/* Handle collation */
+	if (OidIsValid(result_collid))
+	{
+		Oid			exprcoll = exprCollation(newexpr);
+
+		if (OidIsValid(exprcoll) && exprcoll != result_collid)
+		{
+			CollateExpr *newnode = makeNode(CollateExpr);
+
+			newnode->arg = (Expr *) newexpr;
+			newnode->collOid = result_collid;
+			newnode->location = -1;
+
+			newexpr = (Node *) newnode;
+		}
+	}
+
+	/* Record the plan's dependency on the function */
+	if (context->root)
+		record_plan_function_dependency(context->root, funcid);
+
+	/* Recursively try to simplify the modified expression */
+	context->active_fns = lappend_oid(context->active_fns, funcid);
+	newexpr = eval_const_expressions_mutator(newexpr, context);
+	context->active_fns = list_delete_last(context->active_fns);
+
+	error_context_stack = sqlerrcontext.previous;
+
+	return (Expr *) newexpr;
+
+fail:
+	MemoryContextSwitchTo(oldcxt);
+	MemoryContextDelete(mycxt);
+	if (error_context_stack == &sqlerrcontext)
+		error_context_stack = sqlerrcontext.previous;
+
+	return NULL;
 }
 
 /*

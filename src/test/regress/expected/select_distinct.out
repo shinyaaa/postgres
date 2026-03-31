@@ -262,13 +262,11 @@ $$ LANGUAGE plpgsql PARALLEL UNSAFE;
 -- Ensure we don't do parallel distinct with a parallel unsafe function
 EXPLAIN (COSTS OFF)
 SELECT DISTINCT distinct_func(1) FROM tenk1;
-                        QUERY PLAN                        
-----------------------------------------------------------
- Unique
-   ->  Sort
-         Sort Key: (distinct_func(1))
-         ->  Index Only Scan using tenk1_hundred on tenk1
-(4 rows)
+                     QUERY PLAN                     
+----------------------------------------------------
+ Limit
+   ->  Index Only Scan using tenk1_hundred on tenk1
+(2 rows)
 
 -- make the function parallel safe
 CREATE OR REPLACE FUNCTION distinct_func(a INT) RETURNS INT AS $$
@@ -279,16 +277,14 @@ $$ LANGUAGE plpgsql PARALLEL SAFE;
 -- Ensure we do parallel distinct now that the function is parallel safe
 EXPLAIN (COSTS OFF)
 SELECT DISTINCT distinct_func(1) FROM tenk1;
-                     QUERY PLAN                     
-----------------------------------------------------
- Unique
-   ->  Gather Merge
+                  QUERY PLAN                  
+----------------------------------------------
+ Limit
+   ->  Gather
          Workers Planned: 2
-         ->  Unique
-               ->  Sort
-                     Sort Key: (distinct_func(1))
-                     ->  Parallel Seq Scan on tenk1
-(7 rows)
+         ->  Limit
+               ->  Parallel Seq Scan on tenk1
+(5 rows)
 
 RESET max_parallel_workers_per_gather;
 RESET min_parallel_table_scan_size;

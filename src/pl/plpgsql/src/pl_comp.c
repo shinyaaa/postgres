@@ -708,6 +708,43 @@ plpgsql_compile_callback(FunctionCallInfo fcinfo,
 	if (function->has_exception_block)
 		plpgsql_mark_local_assignment_targets(function);
 
+	/*
+	 * Check if this is a simple function eligible for fast-path execution.
+	 * A simple function has:
+	 *   - No exception handlers
+	 *   - No local variable initialization in the toplevel block
+	 *   - Exactly one statement in the body: a RETURN with an expression
+	 *   - Not a trigger function
+	 *   - Not a set-returning function
+	 */
+	function->fn_is_simple = false;
+	function->fn_simple_return_expr = NULL;
+
+	if (!function->has_exception_block &&
+		!function->fn_retset &&
+		!function->fn_retistuple &&
+		!function->fn_retisdomain &&
+		function->fn_is_trigger == PLPGSQL_NOT_TRIGGER &&
+		function->fn_prokind == PROKIND_FUNCTION &&
+		function->action != NULL &&
+		function->action->exceptions == NULL &&
+		function->action->n_initvars == 0 &&
+		list_length(function->action->body) == 1)
+	{
+		PLpgSQL_stmt *stmt = (PLpgSQL_stmt *) linitial(function->action->body);
+
+		if (stmt->cmd_type == PLPGSQL_STMT_RETURN)
+		{
+			PLpgSQL_stmt_return *ret = (PLpgSQL_stmt_return *) stmt;
+
+			if (ret->expr != NULL)
+			{
+				function->fn_is_simple = true;
+				function->fn_simple_return_expr = ret->expr;
+			}
+		}
+	}
+
 	/* Debug dump for completed functions */
 	if (plpgsql_DumpExecTree)
 		plpgsql_dumptree(function);

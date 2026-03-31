@@ -148,3 +148,141 @@ end $$;
 ERROR:  bigint out of range
 CONTEXT:  SQL statement "select x*x*x"
 PL/pgSQL function inline_code_block line 5 at SQL statement
+-- Tests for PL/pgSQL function inlining and fast-path execution optimization
+--
+-- Simple PL/pgSQL functions that consist of just "BEGIN RETURN <expr>; END"
+-- can be inlined by the planner (like SQL functions) or executed via a
+-- fast path that skips SPI overhead.
+-- Basic inlining test: simple arithmetic function
+create function plpgsql_plus100(int) returns int language plpgsql
+as $$begin return $1 + 100; end$$;
+-- Should produce the same result as inline arithmetic
+select plpgsql_plus100(42);
+ plpgsql_plus100 
+-----------------
+             142
+(1 row)
+
+select 42 + 100;
+ ?column? 
+----------
+      142
+(1 row)
+
+-- Verify it works in aggregate context (the main use case for optimization)
+create table plpgsql_inline_test (id int);
+insert into plpgsql_inline_test select generate_series(1, 100);
+select sum(plpgsql_plus100(id)) from plpgsql_inline_test;
+  sum  
+-------
+ 15050
+(1 row)
+
+select sum(id + 100) from plpgsql_inline_test;
+  sum  
+-------
+ 15050
+(1 row)
+
+-- Test with multiple calls in the same query
+select sum(plpgsql_plus100(id)), sum(plpgsql_plus100(id))
+from plpgsql_inline_test;
+  sum  |  sum  
+-------+-------
+ 15050 | 15050
+(1 row)
+
+-- Test with IMMUTABLE function (more likely to be inlined)
+create function plpgsql_multiply(int, int) returns int
+language plpgsql immutable
+as $$begin return $1 * $2; end$$;
+select plpgsql_multiply(6, 7);
+ plpgsql_multiply 
+------------------
+               42
+(1 row)
+
+-- EXPLAIN should show the function has been inlined (no function call node)
+explain (costs off) select plpgsql_plus100(id) from plpgsql_inline_test;
+           QUERY PLAN            
+---------------------------------
+ Seq Scan on plpgsql_inline_test
+(1 row)
+
+-- Test with named parameters
+create function plpgsql_add(a int, b int) returns int
+language plpgsql immutable
+as $$begin return a + b; end$$;
+select plpgsql_add(10, 20);
+ plpgsql_add 
+-------------
+          30
+(1 row)
+
+-- Test that complex PL/pgSQL functions are NOT inlined (they use normal path)
+-- Function with local variable declarations
+create function plpgsql_not_simple1(int) returns int language plpgsql
+as $$
+declare
+  tmp int;
+begin
+  tmp := $1 + 100;
+  return tmp;
+end$$;
+select plpgsql_not_simple1(42);
+ plpgsql_not_simple1 
+---------------------
+                 142
+(1 row)
+
+-- Function with EXCEPTION handler (should still work, just not inlined)
+create function plpgsql_with_exception(int) returns int language plpgsql
+as $$begin
+  return $1 + 100;
+exception when others then
+  return 0;
+end$$;
+select plpgsql_with_exception(42);
+ plpgsql_with_exception 
+------------------------
+                    142
+(1 row)
+
+-- Function with multiple statements
+create function plpgsql_multi_stmt(int) returns int language plpgsql
+as $$begin
+  perform 1;
+  return $1 + 100;
+end$$;
+select plpgsql_multi_stmt(42);
+ plpgsql_multi_stmt 
+--------------------
+                142
+(1 row)
+
+-- Test NULL handling
+select plpgsql_plus100(NULL);
+ plpgsql_plus100 
+-----------------
+                
+(1 row)
+
+-- Test with text types
+create function plpgsql_concat(text, text) returns text
+language plpgsql immutable
+as $$begin return $1 || $2; end$$;
+select plpgsql_concat('hello', ' world');
+ plpgsql_concat 
+----------------
+ hello world
+(1 row)
+
+-- Clean up
+drop table plpgsql_inline_test;
+drop function plpgsql_plus100(int);
+drop function plpgsql_multiply(int, int);
+drop function plpgsql_add(int, int);
+drop function plpgsql_not_simple1(int);
+drop function plpgsql_with_exception(int);
+drop function plpgsql_multi_stmt(int);
+drop function plpgsql_concat(text, text);
