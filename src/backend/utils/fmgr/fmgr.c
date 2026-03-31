@@ -56,6 +56,24 @@ typedef struct
 
 static HTAB *CFuncHash = NULL;
 
+/*
+ * Hashtable for caching FmgrInfo lookups in OidFunctionCall* convenience
+ * wrappers.  This avoids repeated syscache and dlsym lookups when the same
+ * function is called many times via OidFunctionCall (e.g., in JSON
+ * serialization loops or exclusion constraint checks).
+ *
+ * The cached FmgrInfo has fn_extra = NULL and fn_expr = NULL, so it is safe
+ * to copy into a local FmgrInfo for each call.  Callers that need fn_extra
+ * state should use fmgr_info() + FunctionCallN() directly.
+ */
+typedef struct
+{
+	Oid			fn_oid;			/* hash key */
+	FmgrInfo	flinfo;			/* cached function lookup info */
+} OidFmgrCacheEntry;
+
+static HTAB *OidFmgrCache = NULL;
+
 
 static void fmgr_info_cxt_security(Oid functionId, FmgrInfo *finfo, MemoryContext mcxt,
 								   bool ignore_security);
@@ -1393,18 +1411,73 @@ FunctionCall9Coll(FmgrInfo *flinfo, Oid collation, Datum arg1, Datum arg2,
 
 
 /*
+ * fmgr_info_init_from_cache
+ *
+ * Initialize a stack-allocated FmgrInfo from a per-session cache keyed by
+ * function OID.  On a cache hit, we copy the cached data and reset per-call
+ * fields (fn_extra, fn_mcxt, fn_expr) so that each call site gets a fresh
+ * FmgrInfo without the cost of a full fmgr_info() syscache lookup.
+ */
+static void
+fmgr_info_init_from_cache(Oid functionId, FmgrInfo *finfo)
+{
+	OidFmgrCacheEntry *entry;
+	bool		found;
+
+	/* Create the hash table on first use */
+	if (OidFmgrCache == NULL)
+	{
+		HASHCTL		hash_ctl;
+
+		hash_ctl.keysize = sizeof(Oid);
+		hash_ctl.entrysize = sizeof(OidFmgrCacheEntry);
+		OidFmgrCache = hash_create("OidFmgrCache",
+								   128,
+								   &hash_ctl,
+								   HASH_ELEM | HASH_BLOBS);
+	}
+
+	entry = (OidFmgrCacheEntry *)
+		hash_search(OidFmgrCache, &functionId, HASH_FIND, NULL);
+
+	if (entry != NULL && entry->flinfo.fn_oid == functionId)
+	{
+		/* Cache hit: copy cached info and reset per-call fields */
+		memcpy(finfo, &entry->flinfo, sizeof(FmgrInfo));
+		finfo->fn_extra = NULL;
+		finfo->fn_mcxt = CurrentMemoryContext;
+		finfo->fn_expr = NULL;
+		return;
+	}
+
+	/* Cache miss: do the full lookup */
+	fmgr_info(functionId, finfo);
+
+	/* Store in cache */
+	entry = (OidFmgrCacheEntry *)
+		hash_search(OidFmgrCache, &functionId, HASH_ENTER, &found);
+	memcpy(&entry->flinfo, finfo, sizeof(FmgrInfo));
+	/* Clear fn_extra in the cached copy to avoid dangling pointers */
+	entry->flinfo.fn_extra = NULL;
+	entry->flinfo.fn_expr = NULL;
+}
+
+/*
  * These are for invocation of a function identified by OID with a
  * directly-computed parameter list.  Note that neither arguments nor result
  * are allowed to be NULL.  These are essentially fmgr_info() followed
  * by FunctionCallN().  If the same function is to be invoked repeatedly,
  * do the fmgr_info() once and then use FunctionCallN().
+ *
+ * These now use a per-session cache to avoid repeated fmgr_info() syscache
+ * lookups when the same function OID is called multiple times.
  */
 Datum
 OidFunctionCall0Coll(Oid functionId, Oid collation)
 {
 	FmgrInfo	flinfo;
 
-	fmgr_info(functionId, &flinfo);
+	fmgr_info_init_from_cache(functionId, &flinfo);
 
 	return FunctionCall0Coll(&flinfo, collation);
 }
@@ -1414,7 +1487,7 @@ OidFunctionCall1Coll(Oid functionId, Oid collation, Datum arg1)
 {
 	FmgrInfo	flinfo;
 
-	fmgr_info(functionId, &flinfo);
+	fmgr_info_init_from_cache(functionId, &flinfo);
 
 	return FunctionCall1Coll(&flinfo, collation, arg1);
 }
@@ -1424,7 +1497,7 @@ OidFunctionCall2Coll(Oid functionId, Oid collation, Datum arg1, Datum arg2)
 {
 	FmgrInfo	flinfo;
 
-	fmgr_info(functionId, &flinfo);
+	fmgr_info_init_from_cache(functionId, &flinfo);
 
 	return FunctionCall2Coll(&flinfo, collation, arg1, arg2);
 }
@@ -1435,7 +1508,7 @@ OidFunctionCall3Coll(Oid functionId, Oid collation, Datum arg1, Datum arg2,
 {
 	FmgrInfo	flinfo;
 
-	fmgr_info(functionId, &flinfo);
+	fmgr_info_init_from_cache(functionId, &flinfo);
 
 	return FunctionCall3Coll(&flinfo, collation, arg1, arg2, arg3);
 }
@@ -1446,7 +1519,7 @@ OidFunctionCall4Coll(Oid functionId, Oid collation, Datum arg1, Datum arg2,
 {
 	FmgrInfo	flinfo;
 
-	fmgr_info(functionId, &flinfo);
+	fmgr_info_init_from_cache(functionId, &flinfo);
 
 	return FunctionCall4Coll(&flinfo, collation, arg1, arg2, arg3, arg4);
 }
@@ -1457,7 +1530,7 @@ OidFunctionCall5Coll(Oid functionId, Oid collation, Datum arg1, Datum arg2,
 {
 	FmgrInfo	flinfo;
 
-	fmgr_info(functionId, &flinfo);
+	fmgr_info_init_from_cache(functionId, &flinfo);
 
 	return FunctionCall5Coll(&flinfo, collation, arg1, arg2, arg3, arg4, arg5);
 }
@@ -1469,7 +1542,7 @@ OidFunctionCall6Coll(Oid functionId, Oid collation, Datum arg1, Datum arg2,
 {
 	FmgrInfo	flinfo;
 
-	fmgr_info(functionId, &flinfo);
+	fmgr_info_init_from_cache(functionId, &flinfo);
 
 	return FunctionCall6Coll(&flinfo, collation, arg1, arg2, arg3, arg4, arg5,
 							 arg6);
@@ -1482,7 +1555,7 @@ OidFunctionCall7Coll(Oid functionId, Oid collation, Datum arg1, Datum arg2,
 {
 	FmgrInfo	flinfo;
 
-	fmgr_info(functionId, &flinfo);
+	fmgr_info_init_from_cache(functionId, &flinfo);
 
 	return FunctionCall7Coll(&flinfo, collation, arg1, arg2, arg3, arg4, arg5,
 							 arg6, arg7);
@@ -1495,7 +1568,7 @@ OidFunctionCall8Coll(Oid functionId, Oid collation, Datum arg1, Datum arg2,
 {
 	FmgrInfo	flinfo;
 
-	fmgr_info(functionId, &flinfo);
+	fmgr_info_init_from_cache(functionId, &flinfo);
 
 	return FunctionCall8Coll(&flinfo, collation, arg1, arg2, arg3, arg4, arg5,
 							 arg6, arg7, arg8);
@@ -1509,7 +1582,7 @@ OidFunctionCall9Coll(Oid functionId, Oid collation, Datum arg1, Datum arg2,
 {
 	FmgrInfo	flinfo;
 
-	fmgr_info(functionId, &flinfo);
+	fmgr_info_init_from_cache(functionId, &flinfo);
 
 	return FunctionCall9Coll(&flinfo, collation, arg1, arg2, arg3, arg4, arg5,
 							 arg6, arg7, arg8, arg9);
@@ -1750,13 +1823,16 @@ SendFunctionCall(FmgrInfo *flinfo, Datum val)
 /*
  * As above, for I/O functions identified by OID.  These are only to be used
  * in seldom-executed code paths.  They are not only slow but leak memory.
+ *
+ * These now use the per-session FmgrInfo cache to avoid repeated syscache
+ * lookups when called in loops (e.g., JSON serialization).
  */
 Datum
 OidInputFunctionCall(Oid functionId, char *str, Oid typioparam, int32 typmod)
 {
 	FmgrInfo	flinfo;
 
-	fmgr_info(functionId, &flinfo);
+	fmgr_info_init_from_cache(functionId, &flinfo);
 	return InputFunctionCall(&flinfo, str, typioparam, typmod);
 }
 
@@ -1765,7 +1841,7 @@ OidOutputFunctionCall(Oid functionId, Datum val)
 {
 	FmgrInfo	flinfo;
 
-	fmgr_info(functionId, &flinfo);
+	fmgr_info_init_from_cache(functionId, &flinfo);
 	return OutputFunctionCall(&flinfo, val);
 }
 
@@ -1775,7 +1851,7 @@ OidReceiveFunctionCall(Oid functionId, StringInfo buf,
 {
 	FmgrInfo	flinfo;
 
-	fmgr_info(functionId, &flinfo);
+	fmgr_info_init_from_cache(functionId, &flinfo);
 	return ReceiveFunctionCall(&flinfo, buf, typioparam, typmod);
 }
 
@@ -1784,7 +1860,7 @@ OidSendFunctionCall(Oid functionId, Datum val)
 {
 	FmgrInfo	flinfo;
 
-	fmgr_info(functionId, &flinfo);
+	fmgr_info_init_from_cache(functionId, &flinfo);
 	return SendFunctionCall(&flinfo, val);
 }
 

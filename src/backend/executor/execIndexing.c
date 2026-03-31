@@ -136,7 +136,7 @@ static bool check_exclusion_or_unique_constraint(Relation heap, Relation index,
 												 bool violationOK,
 												 ItemPointer conflictTid);
 
-static bool index_recheck_constraint(Relation index, const Oid *constr_procs,
+static bool index_recheck_constraint(Relation index, FmgrInfo *constr_fmgr,
 									 const Datum *existing_values, const bool *existing_isnull,
 									 const Datum *new_values);
 static bool index_unchanged_by_update(ResultRelInfo *resultRelInfo,
@@ -716,6 +716,7 @@ check_exclusion_or_unique_constraint(Relation heap, Relation index,
 	int			indnkeyatts = IndexRelationGetNumberOfKeyAttributes(index);
 	IndexScanDesc index_scan;
 	ScanKeyData scankeys[INDEX_MAX_KEYS];
+	FmgrInfo	constr_fmgr[INDEX_MAX_KEYS];
 	SnapshotData DirtySnapshot;
 	int			i;
 	bool		conflict;
@@ -734,6 +735,13 @@ check_exclusion_or_unique_constraint(Relation heap, Relation index,
 		constr_procs = indexInfo->ii_UniqueProcs;
 		constr_strats = indexInfo->ii_UniqueStrats;
 	}
+
+	/*
+	 * Pre-cache FmgrInfo for constraint operator functions to avoid repeated
+	 * fmgr_info() lookups during the per-tuple recheck loop below.
+	 */
+	for (i = 0; i < indnkeyatts; i++)
+		fmgr_info(constr_procs[i], &constr_fmgr[i]);
 
 	/*
 	 * If this is a WITHOUT OVERLAPS constraint, we must also forbid empty
@@ -851,7 +859,7 @@ retry:
 		if (index_scan->xs_recheck)
 		{
 			if (!index_recheck_constraint(index,
-										  constr_procs,
+										  constr_fmgr,
 										  existing_values,
 										  existing_isnull,
 										  values))
@@ -973,9 +981,12 @@ check_exclusion_constraint(Relation heap, Relation index,
 /*
  * Check existing tuple's index values to see if it really matches the
  * exclusion condition against the new_values.  Returns true if conflict.
+ *
+ * constr_fmgr is a pre-cached array of FmgrInfo for the constraint
+ * operators, to avoid repeated fmgr_info() lookups per tuple.
  */
 static bool
-index_recheck_constraint(Relation index, const Oid *constr_procs,
+index_recheck_constraint(Relation index, FmgrInfo *constr_fmgr,
 						 const Datum *existing_values, const bool *existing_isnull,
 						 const Datum *new_values)
 {
@@ -988,10 +999,10 @@ index_recheck_constraint(Relation index, const Oid *constr_procs,
 		if (existing_isnull[i])
 			return false;
 
-		if (!DatumGetBool(OidFunctionCall2Coll(constr_procs[i],
-											   index->rd_indcollation[i],
-											   existing_values[i],
-											   new_values[i])))
+		if (!DatumGetBool(FunctionCall2Coll(&constr_fmgr[i],
+											index->rd_indcollation[i],
+											existing_values[i],
+											new_values[i])))
 			return false;
 	}
 
