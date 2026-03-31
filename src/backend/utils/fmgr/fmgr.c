@@ -32,6 +32,7 @@
 #include "utils/fmgrtab.h"
 #include "utils/guc.h"
 #include "utils/hsearch.h"
+#include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
 
@@ -62,6 +63,11 @@ static HTAB *CFuncHash = NULL;
  * function is called many times via OidFunctionCall (e.g., in JSON
  * serialization loops or exclusion constraint checks).
  *
+ * Cache invalidation is handled via a syscache invalidation callback on
+ * PROCOID.  When any pg_proc entry is modified (e.g., CREATE OR REPLACE
+ * FUNCTION), we destroy the entire cache so that stale fn_addr pointers
+ * are never used.
+ *
  * The cached FmgrInfo has fn_extra = NULL and fn_expr = NULL, so it is safe
  * to copy into a local FmgrInfo for each call.  Callers that need fn_extra
  * state should use fmgr_info() + FunctionCallN() directly.
@@ -73,6 +79,7 @@ typedef struct
 } OidFmgrCacheEntry;
 
 static HTAB *OidFmgrCache = NULL;
+static bool OidFmgrCallbackRegistered = false;
 
 
 static void fmgr_info_cxt_security(Oid functionId, FmgrInfo *finfo, MemoryContext mcxt,
@@ -1411,12 +1418,33 @@ FunctionCall9Coll(FmgrInfo *flinfo, Oid collation, Datum arg1, Datum arg2,
 
 
 /*
+ * Callback for syscache invalidation of pg_proc entries.
+ *
+ * When any pg_proc tuple is modified (CREATE OR REPLACE FUNCTION, DROP
+ * FUNCTION, etc.), we destroy the entire OidFmgrCache to prevent stale
+ * function addresses from being used.
+ */
+static void
+InvalidateOidFmgrCache(Datum arg, int cacheid, uint32 hashvalue)
+{
+	if (OidFmgrCache != NULL)
+	{
+		hash_destroy(OidFmgrCache);
+		OidFmgrCache = NULL;
+	}
+}
+
+/*
  * fmgr_info_init_from_cache
  *
  * Initialize a stack-allocated FmgrInfo from a per-session cache keyed by
  * function OID.  On a cache hit, we copy the cached data and reset per-call
  * fields (fn_extra, fn_mcxt, fn_expr) so that each call site gets a fresh
  * FmgrInfo without the cost of a full fmgr_info() syscache lookup.
+ *
+ * Cache invalidation is handled by a syscache callback on PROCOID: any
+ * change to pg_proc destroys the entire cache, so stale entries are never
+ * served.
  */
 static void
 fmgr_info_init_from_cache(Oid functionId, FmgrInfo *finfo)
@@ -1424,7 +1452,16 @@ fmgr_info_init_from_cache(Oid functionId, FmgrInfo *finfo)
 	OidFmgrCacheEntry *entry;
 	bool		found;
 
-	/* Create the hash table on first use */
+	/* Register the invalidation callback on first use */
+	if (!OidFmgrCallbackRegistered)
+	{
+		CacheRegisterSyscacheCallback(PROCOID,
+									  InvalidateOidFmgrCache,
+									  (Datum) 0);
+		OidFmgrCallbackRegistered = true;
+	}
+
+	/* Create the hash table if needed (first use, or after invalidation) */
 	if (OidFmgrCache == NULL)
 	{
 		HASHCTL		hash_ctl;
@@ -1440,7 +1477,7 @@ fmgr_info_init_from_cache(Oid functionId, FmgrInfo *finfo)
 	entry = (OidFmgrCacheEntry *)
 		hash_search(OidFmgrCache, &functionId, HASH_FIND, NULL);
 
-	if (entry != NULL && entry->flinfo.fn_oid == functionId)
+	if (entry != NULL)
 	{
 		/* Cache hit: copy cached info and reset per-call fields */
 		memcpy(finfo, &entry->flinfo, sizeof(FmgrInfo));
