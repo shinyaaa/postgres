@@ -2498,6 +2498,8 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 		bool		all_visible_cleared = false;
 		bool		all_frozen_set = false;
 		int			nthispage;
+		int			nthispage_est = 0;
+		char	   *tupledata = NULL;
 
 		CHECK_FOR_INTERRUPTS();
 
@@ -2540,6 +2542,66 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 			all_frozen_set = true;
 			/* Lock the vmbuffer before entering the critical section */
 			LockBuffer(vmbuffer, BUFFER_LOCK_EXCLUSIVE);
+		}
+
+		/*
+		 * Pre-assemble WAL tuple data outside the critical section.
+		 *
+		 * For init pages (empty pages being filled from scratch), the tuple
+		 * data in the WAL record (t_infomask, t_hoff, and heap data) is
+		 * independent of the actual insertion: offsets are sequential from
+		 * FirstOffsetNumber, and tuple header fields are set by
+		 * heap_prepare_insert before we get here.  Moving the memcpy-heavy
+		 * assembly out of the critical section reduces the window during
+		 * which ERROR is promoted to PANIC.
+		 *
+		 * We assemble data for all remaining tuples (up to what fits in the
+		 * scratch buffer).  After insertion determines nthispage, the WAL
+		 * code inside the critical section simply uses the first nthispage
+		 * entries worth of pre-assembled data.
+		 *
+		 * For non-init pages we also pre-assemble tuple data, but offsets
+		 * must be filled in after insertion (they come from t_self).
+		 */
+		if (needwal && starting_with_empty_page)
+		{
+			char	   *scratchptr = scratch.data;
+			int			remaining = ntuples - ndone;
+
+			/*
+			 * Skip past the header and max possible offsets area.
+			 * For init pages, no offsets are stored, so tupledata starts
+			 * right after the xl_heap_multi_insert header.
+			 */
+			scratchptr += SizeOfHeapMultiInsert;
+			tupledata = scratchptr;
+
+			for (i = 0; i < remaining; i++)
+			{
+				HeapTuple	heaptup = heaptuples[ndone + i];
+				xl_multi_insert_tuple *tuphdr;
+				int			datalen;
+
+				tuphdr = (xl_multi_insert_tuple *) SHORTALIGN(scratchptr);
+				scratchptr = ((char *) tuphdr) + SizeOfMultiInsertTuple;
+
+				tuphdr->t_infomask2 = heaptup->t_data->t_infomask2;
+				tuphdr->t_infomask = heaptup->t_data->t_infomask;
+				tuphdr->t_hoff = heaptup->t_data->t_hoff;
+
+				datalen = heaptup->t_len - SizeofHeapTupleHeader;
+
+				/* Stop if we'd overflow the scratch buffer */
+				if ((scratchptr + datalen) - scratch.data >= BLCKSZ)
+					break;
+
+				memcpy(scratchptr,
+					   (char *) heaptup->t_data + SizeofHeapTupleHeader,
+					   datalen);
+				tuphdr->datalen = datalen;
+				scratchptr += datalen;
+			}
+			nthispage_est = i;
 		}
 
 		/* NO EREPORT(ERROR) from here till changes are logged */
@@ -2618,7 +2680,6 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 			XLogRecPtr	recptr;
 			xl_heap_multi_insert *xlrec;
 			uint8		info = XLOG_HEAP2_MULTI_INSERT;
-			char	   *tupledata;
 			int			totaldatalen;
 			char	   *scratchptr = scratch.data;
 			bool		init;
@@ -2630,21 +2691,71 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 			 */
 			init = starting_with_empty_page;
 
-			/* allocate xl_heap_multi_insert struct from the scratch area */
-			xlrec = (xl_heap_multi_insert *) scratchptr;
-			scratchptr += SizeOfHeapMultiInsert;
-
 			/*
-			 * Allocate offsets array. Unless we're reinitializing the page,
-			 * in that case the tuples are stored in order starting at
-			 * FirstOffsetNumber and we don't need to store the offsets
-			 * explicitly.
+			 * For init pages where we pre-assembled tuple data above, we
+			 * can reuse it directly - just compute how much of it covers
+			 * the nthispage tuples actually inserted.  The pre-assembled
+			 * data is at tupledata (set above, right after the header).
+			 *
+			 * For non-init pages (or if pre-assembly didn't happen),
+			 * assemble everything here inside the critical section.
 			 */
-			if (!init)
-				scratchptr += nthispage * sizeof(OffsetNumber);
+			if (init && nthispage_est > 0 && nthispage <= nthispage_est)
+			{
+				/* Reuse pre-assembled data */
+				xlrec = (xl_heap_multi_insert *) scratch.data;
 
-			/* the rest of the scratch space is used for tuple data */
-			tupledata = scratchptr;
+				/* Walk pre-assembled data to find end of nthispage tuples */
+				{
+					char	   *endptr = tupledata;
+
+					for (i = 0; i < nthispage; i++)
+					{
+						xl_multi_insert_tuple *tuphdr;
+
+						tuphdr = (xl_multi_insert_tuple *) SHORTALIGN(endptr);
+						endptr = ((char *) tuphdr) + SizeOfMultiInsertTuple +
+							tuphdr->datalen;
+					}
+					totaldatalen = endptr - tupledata;
+				}
+			}
+			else
+			{
+				/* Full assembly inside the critical section */
+				xlrec = (xl_heap_multi_insert *) scratchptr;
+				scratchptr += SizeOfHeapMultiInsert;
+
+				if (!init)
+					scratchptr += nthispage * sizeof(OffsetNumber);
+
+				tupledata = scratchptr;
+
+				for (i = 0; i < nthispage; i++)
+				{
+					HeapTuple	heaptup = heaptuples[ndone + i];
+					xl_multi_insert_tuple *tuphdr;
+					int			datalen;
+
+					if (!init)
+						xlrec->offsets[i] = ItemPointerGetOffsetNumber(&heaptup->t_self);
+					tuphdr = (xl_multi_insert_tuple *) SHORTALIGN(scratchptr);
+					scratchptr = ((char *) tuphdr) + SizeOfMultiInsertTuple;
+
+					tuphdr->t_infomask2 = heaptup->t_data->t_infomask2;
+					tuphdr->t_infomask = heaptup->t_data->t_infomask;
+					tuphdr->t_hoff = heaptup->t_data->t_hoff;
+
+					datalen = heaptup->t_len - SizeofHeapTupleHeader;
+					memcpy(scratchptr,
+						   (char *) heaptup->t_data + SizeofHeapTupleHeader,
+						   datalen);
+					tuphdr->datalen = datalen;
+					scratchptr += datalen;
+				}
+				totaldatalen = scratchptr - tupledata;
+				Assert((scratchptr - scratch.data) < BLCKSZ);
+			}
 
 			/* check that the mutually exclusive flags are not both set */
 			Assert(!(all_visible_cleared && all_frozen_set));
@@ -2652,47 +2763,10 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 			xlrec->flags = 0;
 			if (all_visible_cleared)
 				xlrec->flags = XLH_INSERT_ALL_VISIBLE_CLEARED;
-
-			/*
-			 * We don't have to worry about including a conflict xid in the
-			 * WAL record, as HEAP_INSERT_FROZEN intentionally violates
-			 * visibility rules.
-			 */
 			if (all_frozen_set)
 				xlrec->flags = XLH_INSERT_ALL_FROZEN_SET;
 
 			xlrec->ntuples = nthispage;
-
-			/*
-			 * Write out an xl_multi_insert_tuple and the tuple data itself
-			 * for each tuple.
-			 */
-			for (i = 0; i < nthispage; i++)
-			{
-				HeapTuple	heaptup = heaptuples[ndone + i];
-				xl_multi_insert_tuple *tuphdr;
-				int			datalen;
-
-				if (!init)
-					xlrec->offsets[i] = ItemPointerGetOffsetNumber(&heaptup->t_self);
-				/* xl_multi_insert_tuple needs two-byte alignment. */
-				tuphdr = (xl_multi_insert_tuple *) SHORTALIGN(scratchptr);
-				scratchptr = ((char *) tuphdr) + SizeOfMultiInsertTuple;
-
-				tuphdr->t_infomask2 = heaptup->t_data->t_infomask2;
-				tuphdr->t_infomask = heaptup->t_data->t_infomask;
-				tuphdr->t_hoff = heaptup->t_data->t_hoff;
-
-				/* write bitmap [+ padding] [+ oid] + data */
-				datalen = heaptup->t_len - SizeofHeapTupleHeader;
-				memcpy(scratchptr,
-					   (char *) heaptup->t_data + SizeofHeapTupleHeader,
-					   datalen);
-				tuphdr->datalen = datalen;
-				scratchptr += datalen;
-			}
-			totaldatalen = scratchptr - tupledata;
-			Assert((scratchptr - scratch.data) < BLCKSZ);
 
 			if (need_tuple_data)
 				xlrec->flags |= XLH_INSERT_CONTAINS_NEW_TUPLE;
