@@ -2422,6 +2422,9 @@ heap_multi_insert_pages(HeapTuple *heaptuples, int done, int ntuples, Size saveF
  * tuples can be inserted on a single page, we can write just a single WAL
  * record covering all of them, and only need to lock/unlock the page once.
  *
+ * When tuples span multiple pages, we batch up to MAX_MULTI_INSERT_PAGES
+ * pages into a single WAL record, reducing WAL overhead for bulk inserts.
+ *
  * Note: this leaks memory into the current memory context. You can create a
  * temporary context before calling this, if that's a problem.
  */
@@ -2433,7 +2436,6 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 	HeapTuple  *heaptuples;
 	int			i;
 	int			ndone;
-	PGAlignedBlock scratch;
 	Page		page;
 	Buffer		vmbuffer = InvalidBuffer;
 	bool		needwal;
@@ -2443,6 +2445,17 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 	bool		starting_with_empty_page = false;
 	int			npages = 0;
 	int			npages_used = 0;
+
+	/* Per-page state for batched WAL */
+	Buffer		batch_buffers[MAX_MULTI_INSERT_PAGES];
+	int			batch_ntuples[MAX_MULTI_INSERT_PAGES];
+	int			batch_first_tuple[MAX_MULTI_INSERT_PAGES];
+	bool		batch_init[MAX_MULTI_INSERT_PAGES];
+	bool		batch_all_visible_cleared[MAX_MULTI_INSERT_PAGES];
+	bool		batch_all_frozen_set[MAX_MULTI_INSERT_PAGES];
+	PGAlignedBlock batch_scratch[MAX_MULTI_INSERT_PAGES];
+	char	   *batch_tupledata[MAX_MULTI_INSERT_PAGES];
+	int			batch_totaldatalen[MAX_MULTI_INSERT_PAGES];
 
 	/* currently not needed (thus unsupported) for heap_multi_insert() */
 	Assert(!(options & HEAP_INSERT_NO_LOGICAL));
@@ -2491,261 +2504,409 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 	 */
 	CheckForSerializableConflictIn(relation, NULL, InvalidBlockNumber);
 
+	/*
+	 * Ensure we have enough WAL record space for multi-page batching.
+	 * Each page needs a heap buffer slot and potentially a VM buffer slot.
+	 * Must be called before entering a critical section.
+	 */
+	if (needwal)
+		XLogEnsureRecordSpace(MAX_MULTI_INSERT_PAGES * 2,
+							  MAX_MULTI_INSERT_PAGES * 2);
+
 	ndone = 0;
 	while (ndone < ntuples)
 	{
-		Buffer		buffer;
-		bool		all_visible_cleared = false;
-		bool		all_frozen_set = false;
-		int			nthispage;
+		int			nbatch;
+		int			batch_total_tuples;
 
 		CHECK_FOR_INTERRUPTS();
 
 		/*
-		 * Compute number of pages needed to fit the to-be-inserted tuples in
-		 * the worst case.  This will be used to determine how much to extend
-		 * the relation by in RelationGetBufferForTuple(), if needed.  If we
-		 * filled a prior page from scratch, we can just update our last
-		 * computation, but if we started with a partially filled page,
-		 * recompute from scratch, the number of potentially required pages
-		 * can vary due to tuples needing to fit onto the page, page headers
-		 * etc.
-		 */
-		if (ndone == 0 || !starting_with_empty_page)
-		{
-			npages = heap_multi_insert_pages(heaptuples, ndone, ntuples,
-											 saveFreeSpace);
-			npages_used = 0;
-		}
-		else
-			npages_used++;
-
-		/*
-		 * Find buffer where at least the next tuple will fit.  If the page is
-		 * all-visible, this will also pin the requisite visibility map page.
+		 * Phase 1: Collect pages into a batch.
 		 *
-		 * Also pin visibility map page if COPY FREEZE inserts tuples into an
-		 * empty page. See all_frozen_set below.
+		 * We fill up to MAX_MULTI_INSERT_PAGES pages, placing tuples on each.
+		 * All buffers remain locked until WAL is written and the critical
+		 * section ends.
 		 */
-		buffer = RelationGetBufferForTuple(relation, heaptuples[ndone]->t_len,
-										   InvalidBuffer, options, bistate,
-										   &vmbuffer, NULL,
-										   npages - npages_used);
-		page = BufferGetPage(buffer);
-
-		starting_with_empty_page = PageGetMaxOffsetNumber(page) == 0;
-
-		if (starting_with_empty_page && (options & HEAP_INSERT_FROZEN))
-		{
-			all_frozen_set = true;
-			/* Lock the vmbuffer before entering the critical section */
-			LockBuffer(vmbuffer, BUFFER_LOCK_EXCLUSIVE);
-		}
+		nbatch = 0;
+		batch_total_tuples = 0;
 
 		/* NO EREPORT(ERROR) from here till changes are logged */
 		START_CRIT_SECTION();
 
-		/*
-		 * RelationGetBufferForTuple has ensured that the first tuple fits.
-		 * Put that on the page, and then as many other tuples as fit.
-		 */
-		RelationPutHeapTuple(relation, buffer, heaptuples[ndone], false);
-
-		/*
-		 * For logical decoding we need combo CIDs to properly decode the
-		 * catalog.
-		 */
-		if (needwal && need_cids)
-			log_heap_new_cid(relation, heaptuples[ndone]);
-
-		for (nthispage = 1; ndone + nthispage < ntuples; nthispage++)
+		while (nbatch < MAX_MULTI_INSERT_PAGES &&
+			   ndone + batch_total_tuples < ntuples)
 		{
-			HeapTuple	heaptup = heaptuples[ndone + nthispage];
-
-			if (PageGetHeapFreeSpace(page) < MAXALIGN(heaptup->t_len) + saveFreeSpace)
-				break;
-
-			RelationPutHeapTuple(relation, buffer, heaptup, false);
+			Buffer		buffer;
+			int			nthispage;
+			int			p = nbatch;		/* page index within batch */
 
 			/*
-			 * For logical decoding we need combo CIDs to properly decode the
-			 * catalog.
+			 * Compute number of pages needed to fit remaining tuples.
 			 */
+			if (nbatch == 0 && (ndone == 0 || !starting_with_empty_page))
+			{
+				npages = heap_multi_insert_pages(heaptuples,
+												 ndone + batch_total_tuples,
+												 ntuples, saveFreeSpace);
+				npages_used = 0;
+			}
+			else
+				npages_used++;
+
+			/*
+			 * We must exit the critical section briefly to call
+			 * RelationGetBufferForTuple, which may need to extend the
+			 * relation (an operation that can fail).  To do this safely,
+			 * we end the critical section, get the buffer, and restart it.
+			 *
+			 * Any pages already in the batch have been modified and marked
+			 * dirty, but that's OK -- if we ERROR out here, the transaction
+			 * will abort and the dirty pages will be discarded.
+			 */
+			END_CRIT_SECTION();
+
+			buffer = RelationGetBufferForTuple(relation,
+											   heaptuples[ndone + batch_total_tuples]->t_len,
+											   InvalidBuffer, options, bistate,
+											   &vmbuffer, NULL,
+											   npages - npages_used);
+
+			START_CRIT_SECTION();
+
+			page = BufferGetPage(buffer);
+
+			starting_with_empty_page = PageGetMaxOffsetNumber(page) == 0;
+
+			batch_init[p] = starting_with_empty_page;
+			batch_all_frozen_set[p] = false;
+			batch_all_visible_cleared[p] = false;
+
+			if (starting_with_empty_page && (options & HEAP_INSERT_FROZEN))
+			{
+				batch_all_frozen_set[p] = true;
+				LockBuffer(vmbuffer, BUFFER_LOCK_EXCLUSIVE);
+			}
+
+			/*
+			 * RelationGetBufferForTuple has ensured that the first tuple fits.
+			 * Put that on the page, and then as many other tuples as fit.
+			 */
+			RelationPutHeapTuple(relation, buffer,
+								heaptuples[ndone + batch_total_tuples], false);
+
 			if (needwal && need_cids)
-				log_heap_new_cid(relation, heaptup);
+				log_heap_new_cid(relation, heaptuples[ndone + batch_total_tuples]);
+
+			for (nthispage = 1;
+				 ndone + batch_total_tuples + nthispage < ntuples;
+				 nthispage++)
+			{
+				HeapTuple	heaptup = heaptuples[ndone + batch_total_tuples + nthispage];
+
+				if (PageGetHeapFreeSpace(page) < MAXALIGN(heaptup->t_len) + saveFreeSpace)
+					break;
+
+				RelationPutHeapTuple(relation, buffer, heaptup, false);
+
+				if (needwal && need_cids)
+					log_heap_new_cid(relation, heaptup);
+			}
+
+			/*
+			 * Handle visibility map updates for this page.
+			 */
+			if (PageIsAllVisible(page) && !(options & HEAP_INSERT_FROZEN))
+			{
+				batch_all_visible_cleared[p] = true;
+				PageClearAllVisible(page);
+				visibilitymap_clear(relation,
+									BufferGetBlockNumber(buffer),
+									vmbuffer, VISIBILITYMAP_VALID_BITS);
+			}
+			else if (batch_all_frozen_set[p])
+			{
+				PageSetAllVisible(page);
+				PageClearPrunable(page);
+				visibilitymap_set(BufferGetBlockNumber(buffer),
+								  vmbuffer,
+								  VISIBILITYMAP_ALL_VISIBLE |
+								  VISIBILITYMAP_ALL_FROZEN,
+								  relation->rd_locator);
+			}
+
+			if (!batch_all_frozen_set[p] && TransactionIdIsNormal(xid))
+				PageSetPrunable(page, xid);
+
+			MarkBufferDirty(buffer);
+
+			/* Record batch state for this page */
+			batch_buffers[p] = buffer;
+			batch_ntuples[p] = nthispage;
+			batch_first_tuple[p] = ndone + batch_total_tuples;
+			batch_total_tuples += nthispage;
+			nbatch++;
+
+			/*
+			 * Prepare per-page WAL tuple data into the scratch buffer now,
+			 * while we have the page state fresh.
+			 */
+			if (needwal)
+			{
+				char	   *scratchptr = batch_scratch[p].data;
+				char	   *tupledata;
+				int			j;
+
+				/* Skip space for per-page header (offsets) -- we'll fill the
+				 * actual WAL record header separately in Phase 2 */
+				tupledata = scratchptr;
+
+				for (j = 0; j < nthispage; j++)
+				{
+					HeapTuple			heaptup = heaptuples[batch_first_tuple[p] + j];
+					xl_multi_insert_tuple *tuphdr;
+					int					datalen;
+
+					tuphdr = (xl_multi_insert_tuple *) SHORTALIGN(scratchptr);
+					scratchptr = ((char *) tuphdr) + SizeOfMultiInsertTuple;
+
+					tuphdr->t_infomask2 = heaptup->t_data->t_infomask2;
+					tuphdr->t_infomask = heaptup->t_data->t_infomask;
+					tuphdr->t_hoff = heaptup->t_data->t_hoff;
+
+					datalen = heaptup->t_len - SizeofHeapTupleHeader;
+					memcpy(scratchptr,
+						   (char *) heaptup->t_data + SizeofHeapTupleHeader,
+						   datalen);
+					tuphdr->datalen = datalen;
+					scratchptr += datalen;
+				}
+
+				batch_tupledata[p] = tupledata;
+				batch_totaldatalen[p] = scratchptr - tupledata;
+				Assert((scratchptr - batch_scratch[p].data) < BLCKSZ);
+			}
+
+			if (batch_all_frozen_set[p])
+				LockBuffer(vmbuffer, BUFFER_LOCK_UNLOCK);
 		}
 
 		/*
-		 * If the page is all visible, need to clear that, unless we're only
-		 * going to add further frozen rows to it.
-		 *
-		 * If we're only adding already frozen rows to a previously empty
-		 * page, mark it as all-frozen and update the visibility map. We're
-		 * already holding a pin on the vmbuffer.
+		 * Phase 2: Write WAL record covering all pages in the batch.
 		 */
-		if (PageIsAllVisible(page) && !(options & HEAP_INSERT_FROZEN))
-		{
-			all_visible_cleared = true;
-			PageClearAllVisible(page);
-			visibilitymap_clear(relation,
-								BufferGetBlockNumber(buffer),
-								vmbuffer, VISIBILITYMAP_VALID_BITS);
-		}
-		else if (all_frozen_set)
-		{
-			PageSetAllVisible(page);
-			PageClearPrunable(page);
-			visibilitymap_set(BufferGetBlockNumber(buffer),
-							  vmbuffer,
-							  VISIBILITYMAP_ALL_VISIBLE |
-							  VISIBILITYMAP_ALL_FROZEN,
-							  relation->rd_locator);
-		}
-
-		/*
-		 * Set pd_prune_xid. See heap_insert() for more on why we do this when
-		 * inserting tuples. This only makes sense if we aren't already
-		 * setting the page frozen in the VM and we're not in bootstrap mode.
-		 */
-		if (!all_frozen_set && TransactionIdIsNormal(xid))
-			PageSetPrunable(page, xid);
-
-		MarkBufferDirty(buffer);
-
-		/* XLOG stuff */
-		if (needwal)
+		if (needwal && nbatch > 0)
 		{
 			XLogRecPtr	recptr;
-			xl_heap_multi_insert *xlrec;
 			uint8		info = XLOG_HEAP2_MULTI_INSERT;
-			char	   *tupledata;
-			int			totaldatalen;
-			char	   *scratchptr = scratch.data;
-			bool		init;
-			int			bufflags = 0;
 
-			/*
-			 * If the page was previously empty, we can reinit the page
-			 * instead of restoring the whole thing.
-			 */
-			init = starting_with_empty_page;
-
-			/* allocate xl_heap_multi_insert struct from the scratch area */
-			xlrec = (xl_heap_multi_insert *) scratchptr;
-			scratchptr += SizeOfHeapMultiInsert;
-
-			/*
-			 * Allocate offsets array. Unless we're reinitializing the page,
-			 * in that case the tuples are stored in order starting at
-			 * FirstOffsetNumber and we don't need to store the offsets
-			 * explicitly.
-			 */
-			if (!init)
-				scratchptr += nthispage * sizeof(OffsetNumber);
-
-			/* the rest of the scratch space is used for tuple data */
-			tupledata = scratchptr;
-
-			/* check that the mutually exclusive flags are not both set */
-			Assert(!(all_visible_cleared && all_frozen_set));
-
-			xlrec->flags = 0;
-			if (all_visible_cleared)
-				xlrec->flags = XLH_INSERT_ALL_VISIBLE_CLEARED;
-
-			/*
-			 * We don't have to worry about including a conflict xid in the
-			 * WAL record, as HEAP_INSERT_FROZEN intentionally violates
-			 * visibility rules.
-			 */
-			if (all_frozen_set)
-				xlrec->flags = XLH_INSERT_ALL_FROZEN_SET;
-
-			xlrec->ntuples = nthispage;
-
-			/*
-			 * Write out an xl_multi_insert_tuple and the tuple data itself
-			 * for each tuple.
-			 */
-			for (i = 0; i < nthispage; i++)
+			if (nbatch == 1)
 			{
-				HeapTuple	heaptup = heaptuples[ndone + i];
-				xl_multi_insert_tuple *tuphdr;
-				int			datalen;
+				/*
+				 * Single-page case: use the original WAL record format for
+				 * backward compatibility and simplicity.
+				 */
+				PGAlignedBlock hdr_scratch;
+				xl_heap_multi_insert *xlrec;
+				char	   *scratchptr = hdr_scratch.data;
+				int			bufflags = 0;
+				int			p = 0;
 
-				if (!init)
-					xlrec->offsets[i] = ItemPointerGetOffsetNumber(&heaptup->t_self);
-				/* xl_multi_insert_tuple needs two-byte alignment. */
-				tuphdr = (xl_multi_insert_tuple *) SHORTALIGN(scratchptr);
-				scratchptr = ((char *) tuphdr) + SizeOfMultiInsertTuple;
+				xlrec = (xl_heap_multi_insert *) scratchptr;
+				scratchptr += SizeOfHeapMultiInsert;
 
-				tuphdr->t_infomask2 = heaptup->t_data->t_infomask2;
-				tuphdr->t_infomask = heaptup->t_data->t_infomask;
-				tuphdr->t_hoff = heaptup->t_data->t_hoff;
+				if (!batch_init[p])
+					scratchptr += batch_ntuples[p] * sizeof(OffsetNumber);
 
-				/* write bitmap [+ padding] [+ oid] + data */
-				datalen = heaptup->t_len - SizeofHeapTupleHeader;
-				memcpy(scratchptr,
-					   (char *) heaptup->t_data + SizeofHeapTupleHeader,
-					   datalen);
-				tuphdr->datalen = datalen;
-				scratchptr += datalen;
+				Assert(!(batch_all_visible_cleared[p] && batch_all_frozen_set[p]));
+
+				xlrec->flags = 0;
+				if (batch_all_visible_cleared[p])
+					xlrec->flags = XLH_INSERT_ALL_VISIBLE_CLEARED;
+				if (batch_all_frozen_set[p])
+					xlrec->flags = XLH_INSERT_ALL_FROZEN_SET;
+
+				xlrec->ntuples = batch_ntuples[p];
+
+				if (!batch_init[p])
+				{
+					for (i = 0; i < batch_ntuples[p]; i++)
+					{
+						HeapTuple	heaptup = heaptuples[batch_first_tuple[p] + i];
+
+						xlrec->offsets[i] = ItemPointerGetOffsetNumber(&heaptup->t_self);
+					}
+				}
+
+				if (need_tuple_data)
+					xlrec->flags |= XLH_INSERT_CONTAINS_NEW_TUPLE;
+
+				if (ndone + batch_total_tuples == ntuples)
+					xlrec->flags |= XLH_INSERT_LAST_IN_MULTI;
+
+				if (batch_init[p])
+				{
+					info |= XLOG_HEAP_INIT_PAGE;
+					bufflags |= REGBUF_WILL_INIT;
+				}
+
+				if (need_tuple_data)
+					bufflags |= REGBUF_KEEP_DATA;
+
+				XLogBeginInsert();
+				XLogRegisterData(xlrec, scratchptr - hdr_scratch.data);
+				XLogRegisterBuffer(0, batch_buffers[p],
+								   REGBUF_STANDARD | bufflags);
+				if (batch_all_frozen_set[p])
+					XLogRegisterBuffer(1, vmbuffer, 0);
+
+				XLogRegisterBufData(0, batch_tupledata[p],
+									batch_totaldatalen[p]);
+
+				XLogSetRecordFlags(XLOG_INCLUDE_ORIGIN);
+
+				recptr = XLogInsert(RM_HEAP2_ID, info);
+
+				PageSetLSN(BufferGetPage(batch_buffers[p]), recptr);
+				if (batch_all_frozen_set[p])
+				{
+					Assert(BufferIsDirty(vmbuffer));
+					PageSetLSN(BufferGetPage(vmbuffer), recptr);
+				}
 			}
-			totaldatalen = scratchptr - tupledata;
-			Assert((scratchptr - scratch.data) < BLCKSZ);
-
-			if (need_tuple_data)
-				xlrec->flags |= XLH_INSERT_CONTAINS_NEW_TUPLE;
-
-			/*
-			 * Signal that this is the last xl_heap_multi_insert record
-			 * emitted by this call to heap_multi_insert(). Needed for logical
-			 * decoding so it knows when to cleanup temporary data.
-			 */
-			if (ndone + nthispage == ntuples)
-				xlrec->flags |= XLH_INSERT_LAST_IN_MULTI;
-
-			if (init)
+			else
 			{
-				info |= XLOG_HEAP_INIT_PAGE;
-				bufflags |= REGBUF_WILL_INIT;
-			}
+				/*
+				 * Multi-page case: emit a single WAL record with
+				 * XLH_INSERT_MULTI_PAGE set, covering all pages in the batch.
+				 *
+				 * Main data layout:
+				 *   xl_heap_multi_insert (with XLH_INSERT_MULTI_PAGE flag)
+				 *     .ntuples = npages (repurposed as page count)
+				 *   xl_heap_multi_insert_page_hdr[0]
+				 *     offsets[0..ntuples-1]  (if not WILL_INIT)
+				 *   xl_heap_multi_insert_page_hdr[1]
+				 *     ...
+				 *
+				 * Block IDs:
+				 *   heap page i  -> block_id = i * 2
+				 *   VM page for i -> block_id = i * 2 + 1
+				 */
+				char	   *maindata;
+				char	   *mainptr;
+				int			maindata_len;
 
-			/*
-			 * If we're doing logical decoding, include the new tuple data
-			 * even if we take a full-page image of the page.
-			 */
-			if (need_tuple_data)
-				bufflags |= REGBUF_KEEP_DATA;
+				/*
+				 * Allocate main data buffer.  Worst case size: header +
+				 * per-page headers with offsets for MaxHeapTuplesPerPage
+				 * tuples each.
+				 */
+				maindata_len = SizeOfHeapMultiInsert +
+					nbatch * (SizeOfHeapMultiInsertPageHdr +
+							  MaxHeapTuplesPerPage * sizeof(OffsetNumber));
+				maindata = palloc(maindata_len);
+				mainptr = maindata;
 
-			XLogBeginInsert();
-			XLogRegisterData(xlrec, tupledata - scratch.data);
-			XLogRegisterBuffer(0, buffer, REGBUF_STANDARD | bufflags);
-			if (all_frozen_set)
-				XLogRegisterBuffer(1, vmbuffer, 0);
+				/* Write the main xl_heap_multi_insert header */
+				{
+					xl_heap_multi_insert *xlrec = (xl_heap_multi_insert *) mainptr;
 
-			XLogRegisterBufData(0, tupledata, totaldatalen);
+					mainptr += SizeOfHeapMultiInsert;
 
-			/* filtering by origin on a row level is much more efficient */
-			XLogSetRecordFlags(XLOG_INCLUDE_ORIGIN);
+					xlrec->flags = XLH_INSERT_MULTI_PAGE;
+					if (need_tuple_data)
+						xlrec->flags |= XLH_INSERT_CONTAINS_NEW_TUPLE;
+					if (ndone + batch_total_tuples == ntuples)
+						xlrec->flags |= XLH_INSERT_LAST_IN_MULTI;
 
-			recptr = XLogInsert(RM_HEAP2_ID, info);
+					/* Repurpose ntuples to store page count */
+					xlrec->ntuples = nbatch;
+				}
 
-			PageSetLSN(page, recptr);
-			if (all_frozen_set)
-			{
-				Assert(BufferIsDirty(vmbuffer));
-				PageSetLSN(BufferGetPage(vmbuffer), recptr);
+				XLogBeginInsert();
+
+				/* Write per-page headers and register buffers */
+				for (i = 0; i < nbatch; i++)
+				{
+					xl_heap_multi_insert_page_hdr *pagehdr;
+					int			bufflags = 0;
+					int			heap_block_id = i * 2;
+
+					pagehdr = (xl_heap_multi_insert_page_hdr *) mainptr;
+					mainptr += SizeOfHeapMultiInsertPageHdr;
+
+					pagehdr->page_flags = 0;
+					if (batch_all_visible_cleared[i])
+						pagehdr->page_flags |= XLHIM_PAGE_ALL_VISIBLE_CLEARED;
+					if (batch_all_frozen_set[i])
+						pagehdr->page_flags |= XLHIM_PAGE_ALL_FROZEN_SET;
+					if (batch_init[i])
+						pagehdr->page_flags |= XLHIM_PAGE_WILL_INIT;
+
+					pagehdr->ntuples = batch_ntuples[i];
+
+					/* Write offsets if not reinitializing */
+					if (!batch_init[i])
+					{
+						int			j;
+
+						for (j = 0; j < batch_ntuples[i]; j++)
+						{
+							HeapTuple	heaptup = heaptuples[batch_first_tuple[i] + j];
+							OffsetNumber *offptr = (OffsetNumber *) mainptr;
+
+							*offptr = ItemPointerGetOffsetNumber(&heaptup->t_self);
+							mainptr += sizeof(OffsetNumber);
+						}
+					}
+
+					/* Register heap buffer */
+					if (batch_init[i])
+						bufflags |= REGBUF_WILL_INIT;
+					if (need_tuple_data)
+						bufflags |= REGBUF_KEEP_DATA;
+
+					XLogRegisterBuffer(heap_block_id, batch_buffers[i],
+									   REGBUF_STANDARD | bufflags);
+
+					/* Register tuple data for this page */
+					XLogRegisterBufData(heap_block_id, batch_tupledata[i],
+										batch_totaldatalen[i]);
+
+					/* Register VM buffer if frozen */
+					if (batch_all_frozen_set[i])
+						XLogRegisterBuffer(heap_block_id + 1, vmbuffer, 0);
+				}
+
+				XLogRegisterData(maindata, mainptr - maindata);
+
+				XLogSetRecordFlags(XLOG_INCLUDE_ORIGIN);
+
+				recptr = XLogInsert(RM_HEAP2_ID, info);
+
+				/* Set LSN on all pages in the batch */
+				for (i = 0; i < nbatch; i++)
+				{
+					PageSetLSN(BufferGetPage(batch_buffers[i]), recptr);
+					if (batch_all_frozen_set[i])
+					{
+						Assert(BufferIsDirty(vmbuffer));
+						PageSetLSN(BufferGetPage(vmbuffer), recptr);
+					}
+				}
+
+				pfree(maindata);
 			}
 		}
 
 		END_CRIT_SECTION();
 
-		if (all_frozen_set)
-			LockBuffer(vmbuffer, BUFFER_LOCK_UNLOCK);
+		/*
+		 * Phase 3: Release all buffers in the batch.
+		 */
+		for (i = nbatch - 1; i >= 0; i--)
+			UnlockReleaseBuffer(batch_buffers[i]);
 
-		UnlockReleaseBuffer(buffer);
-		ndone += nthispage;
+		ndone += batch_total_tuples;
 
 		/*
 		 * NB: Only release vmbuffer after inserting all tuples - it's fairly
