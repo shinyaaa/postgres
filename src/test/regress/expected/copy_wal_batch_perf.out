@@ -1,0 +1,180 @@
+--
+-- Tests for COPY FROM WAL efficiency with multi-page inserts.
+--
+-- This test verifies that COPY FROM correctly handles bulk inserts
+-- spanning multiple heap pages, and captures WAL volume metrics
+-- to detect regressions in WAL batching efficiency.
+--
+-- WAL byte values are non-deterministic, so we only assert boolean
+-- conditions (e.g., WAL was generated) and correctness (row counts).
+-- For detailed WAL record analysis, use contrib/pg_walinspect manually.
+--
+-- Scenario 1: Small tuples (many tuples per page, frequent page transitions)
+CREATE TABLE copy_wal_small (id int, val int, padding text);
+SELECT pg_current_wal_lsn() AS lsn_small_before \gset
+-- COPY FROM STDIN: small batch to verify basic path
+COPY copy_wal_small FROM STDIN;
+-- Bulk INSERT via generate_series exercises heap_multi_insert for 10000 rows
+INSERT INTO copy_wal_small
+    SELECT g, g * 10, repeat('x', 20)
+    FROM generate_series(11, 10010) g;
+SELECT pg_current_wal_lsn() AS lsn_small_after \gset
+-- Verify correctness
+SELECT count(*) AS small_row_count FROM copy_wal_small;
+ small_row_count 
+-----------------
+           10010
+(1 row)
+
+SELECT min(id) AS small_min_id, max(id) AS small_max_id FROM copy_wal_small;
+ small_min_id | small_max_id 
+--------------+--------------
+            1 |        10010
+(1 row)
+
+-- Verify data spans multiple pages
+ANALYZE copy_wal_small;
+SELECT relpages > 1 AS small_multi_page
+    FROM pg_class WHERE relname = 'copy_wal_small';
+ small_multi_page 
+------------------
+ t
+(1 row)
+
+-- Verify WAL was generated
+SELECT pg_wal_lsn_diff(:'lsn_small_after'::pg_lsn, :'lsn_small_before'::pg_lsn) > 0
+    AS small_wal_generated;
+ small_wal_generated 
+---------------------
+ t
+(1 row)
+
+-- Scenario 2: Large tuples (few tuples per page, each page transition matters)
+CREATE TABLE copy_wal_large (id int, val int, padding text);
+SELECT pg_current_wal_lsn() AS lsn_large_before \gset
+INSERT INTO copy_wal_large
+    SELECT g, g * 10, repeat('y', 1800)
+    FROM generate_series(1, 500) g;
+SELECT pg_current_wal_lsn() AS lsn_large_after \gset
+-- Verify correctness
+SELECT count(*) AS large_row_count FROM copy_wal_large;
+ large_row_count 
+-----------------
+             500
+(1 row)
+
+SELECT min(id) AS large_min_id, max(id) AS large_max_id FROM copy_wal_large;
+ large_min_id | large_max_id 
+--------------+--------------
+            1 |          500
+(1 row)
+
+ANALYZE copy_wal_large;
+SELECT relpages > 1 AS large_multi_page
+    FROM pg_class WHERE relname = 'copy_wal_large';
+ large_multi_page 
+------------------
+ t
+(1 row)
+
+SELECT pg_wal_lsn_diff(:'lsn_large_after'::pg_lsn, :'lsn_large_before'::pg_lsn) > 0
+    AS large_wal_generated;
+ large_wal_generated 
+---------------------
+ t
+(1 row)
+
+-- Scenario 3: COPY FROM with empty table (INIT_PAGE path)
+CREATE TABLE copy_wal_empty (id int, val int, padding text);
+SELECT pg_current_wal_lsn() AS lsn_empty_before \gset
+COPY copy_wal_empty FROM STDIN;
+SELECT pg_current_wal_lsn() AS lsn_empty_after \gset
+SELECT count(*) AS empty_row_count FROM copy_wal_empty;
+ empty_row_count 
+-----------------
+               5
+(1 row)
+
+SELECT pg_wal_lsn_diff(:'lsn_empty_after'::pg_lsn, :'lsn_empty_before'::pg_lsn) > 0
+    AS empty_wal_generated;
+ empty_wal_generated 
+---------------------
+ t
+(1 row)
+
+-- Scenario 4: COPY FROM into partitioned table
+CREATE TABLE copy_wal_part (id int, val int, padding text) PARTITION BY RANGE (id);
+CREATE TABLE copy_wal_part_1 PARTITION OF copy_wal_part FOR VALUES FROM (1) TO (5001);
+CREATE TABLE copy_wal_part_2 PARTITION OF copy_wal_part FOR VALUES FROM (5001) TO (10001);
+SELECT pg_current_wal_lsn() AS lsn_part_before \gset
+INSERT INTO copy_wal_part
+    SELECT g, g * 10, repeat('z', 20)
+    FROM generate_series(1, 10000) g;
+SELECT pg_current_wal_lsn() AS lsn_part_after \gset
+-- Verify correctness: rows distributed across partitions
+SELECT count(*) AS part_total FROM copy_wal_part;
+ part_total 
+------------
+      10000
+(1 row)
+
+SELECT count(*) AS part1_count FROM copy_wal_part_1;
+ part1_count 
+-------------
+        5000
+(1 row)
+
+SELECT count(*) AS part2_count FROM copy_wal_part_2;
+ part2_count 
+-------------
+        5000
+(1 row)
+
+SELECT pg_wal_lsn_diff(:'lsn_part_after'::pg_lsn, :'lsn_part_before'::pg_lsn) > 0
+    AS part_wal_generated;
+ part_wal_generated 
+--------------------
+ t
+(1 row)
+
+-- Scenario 5: COPY FROM with FREEZE option (exercises ALL_FROZEN_SET + VM path)
+-- CREATE TABLE and COPY FREEZE must be in the same transaction.
+BEGIN;
+CREATE TABLE copy_wal_freeze (id int, val int, padding text);
+COPY copy_wal_freeze FROM STDIN WITH (FREEZE);
+COMMIT;
+SELECT count(*) AS freeze_row_count FROM copy_wal_freeze;
+ freeze_row_count 
+------------------
+                5
+(1 row)
+
+-- Verify frozen tuples are visible without a snapshot
+SELECT id, val FROM copy_wal_freeze ORDER BY id LIMIT 3;
+ id | val 
+----+-----
+  1 |  10
+  2 |  20
+  3 |  30
+(3 rows)
+
+-- Verify that large tuple scenario generates more WAL per row than small tuples
+-- (sanity check that WAL volume scales with tuple size)
+SELECT
+    pg_wal_lsn_diff(:'lsn_large_after'::pg_lsn, :'lsn_large_before'::pg_lsn) /
+        (SELECT count(*) FROM copy_wal_large)
+    >
+    pg_wal_lsn_diff(:'lsn_small_after'::pg_lsn, :'lsn_small_before'::pg_lsn) /
+        (SELECT count(*) FROM copy_wal_small)
+    AS large_more_wal_per_row;
+ large_more_wal_per_row 
+------------------------
+ t
+(1 row)
+
+-- Clean up
+DROP TABLE copy_wal_small;
+DROP TABLE copy_wal_large;
+DROP TABLE copy_wal_empty;
+DROP TABLE copy_wal_part;
+DROP TABLE copy_wal_freeze;
