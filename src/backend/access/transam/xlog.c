@@ -654,6 +654,12 @@ static bool updateMinRecoveryPoint = true;
 static int	MyLockNo = 0;
 static bool holdingAllLocks = false;
 
+/*
+ * Batch WAL insertion mode.  When true, WALInsertLock is held persistently
+ * across multiple XLogInsertRecord calls, reducing lock acquisition overhead.
+ */
+static bool walBatchInsertMode = false;
+
 #ifdef WAL_DEBUG
 static MemoryContext walDebugCxt = NULL;
 #endif
@@ -823,7 +829,12 @@ XLogInsertRecord(XLogRecData *rdata,
 
 	if (likely(class == WALINSERT_NORMAL))
 	{
-		WALInsertLockAcquire();
+		/*
+		 * In batch insert mode, the lock is already held by the caller
+		 * (via XLogBeginBatchInsert), so skip lock acquisition.
+		 */
+		if (!walBatchInsertMode)
+			WALInsertLockAcquire();
 
 		/*
 		 * Check to see if my copy of RedoRecPtr is out of date. If so, may
@@ -856,7 +867,8 @@ XLogInsertRecord(XLogRecData *rdata,
 			 * Oops, some buffer now needs to be backed up that the caller
 			 * didn't back up.  Start over.
 			 */
-			WALInsertLockRelease();
+			if (!walBatchInsertMode)
+				WALInsertLockRelease();
 			END_CRIT_SECTION();
 			return InvalidXLogRecPtr;
 		}
@@ -948,9 +960,11 @@ XLogInsertRecord(XLogRecData *rdata,
 	}
 
 	/*
-	 * Done! Let others know that we're finished.
+	 * Done! Let others know that we're finished.  In batch mode, the lock
+	 * is released by XLogEndBatchInsert() instead.
 	 */
-	WALInsertLockRelease();
+	if (!walBatchInsertMode)
+		WALInsertLockRelease();
 
 	END_CRIT_SECTION();
 
@@ -1091,6 +1105,46 @@ XLogInsertRecord(XLogRecData *rdata,
 	}
 
 	return EndPos;
+}
+
+/*
+ * XLogBeginBatchInsert - begin a batch of WAL insertions.
+ *
+ * Acquires a WAL insertion lock that is held across multiple subsequent
+ * XLogInsertRecord calls, avoiding repeated lock acquire/release overhead.
+ * This is beneficial when inserting many small WAL records in quick
+ * succession (e.g., per-page records during bulk insert).
+ *
+ * Must be paired with XLogEndBatchInsert().  While in batch mode, only
+ * normal WAL records (not XLOG_SWITCH or XLOG_CHECKPOINT) may be inserted.
+ *
+ * IMPORTANT: The caller must be in a critical section that spans all
+ * XLogInsert calls within the batch, because the WAL lock is held for
+ * the entire duration.  Callers should minimize the work done between
+ * Begin and End to avoid starving other WAL inserters.
+ */
+void
+XLogBeginBatchInsert(void)
+{
+	Assert(!walBatchInsertMode);
+	Assert(CritSectionCount > 0);
+
+	WALInsertLockAcquire();
+	walBatchInsertMode = true;
+}
+
+/*
+ * XLogEndBatchInsert - end a batch of WAL insertions.
+ *
+ * Releases the WAL insertion lock acquired by XLogBeginBatchInsert().
+ */
+void
+XLogEndBatchInsert(void)
+{
+	Assert(walBatchInsertMode);
+
+	walBatchInsertMode = false;
+	WALInsertLockRelease();
 }
 
 /*

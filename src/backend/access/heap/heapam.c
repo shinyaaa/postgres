@@ -39,6 +39,7 @@
 #include "access/syncscan.h"
 #include "access/valid.h"
 #include "access/visibilitymap.h"
+#include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_database_d.h"
@@ -2415,6 +2416,257 @@ heap_multi_insert_pages(HeapTuple *heaptuples, int done, int ntuples, Size saveF
 }
 
 /*
+ * Maximum number of pages to batch in a single WAL lock acquisition.
+ */
+#define HEAP_MULTI_INSERT_WAL_BATCH_MAX		8
+
+/*
+ * heap_multi_insert_wal_batch - batch WAL insertions across multiple pages.
+ *
+ * Acquires additional buffers from the bistate's pre-extended range, inserts
+ * tuples on all pages in a single critical section, and uses
+ * XLogBeginBatchInsert/XLogEndBatchInsert to hold the WAL insertion lock
+ * across all per-page WAL records.  This reduces WALInsertLock acquisitions
+ * from N (one per page) to 1.
+ *
+ * WAL record format is unchanged: each page still produces a standard
+ * XLOG_HEAP2_MULTI_INSERT record.  Only the lock acquisition is batched.
+ *
+ * Prerequisites (caller must verify):
+ *  - needwal is true
+ *  - First page is empty (starting_with_empty_page)
+ *  - No HEAP_INSERT_FROZEN
+ *  - First page is not all-visible
+ *  - bistate has pre-extended pages available
+ *
+ * Returns total tuples inserted (>0) on success, 0 if batching not possible.
+ * On success, all buffers are released.  On failure, first_buffer is untouched.
+ */
+static int
+heap_multi_insert_wal_batch(Relation relation, HeapTuple *heaptuples,
+							int ntuples, int ndone,
+							Buffer first_buffer,
+							uint32 options, BulkInsertState bistate,
+							Size saveFreeSpace, TransactionId xid,
+							bool need_tuple_data, bool need_cids)
+{
+	Buffer		batch_buffers[HEAP_MULTI_INSERT_WAL_BATCH_MAX];
+	Page		batch_pages[HEAP_MULTI_INSERT_WAL_BATCH_MAX];
+	int			batch_ntuples[HEAP_MULTI_INSERT_WAL_BATCH_MAX] = {0};
+	int			batch_count = 1;
+	int			batch_total;
+
+	/* First page is already acquired by the caller */
+	batch_buffers[0] = first_buffer;
+	batch_pages[0] = BufferGetPage(first_buffer);
+
+	/* Try to acquire more pages from the bistate's pre-extended range */
+	while (batch_count < HEAP_MULTI_INSERT_WAL_BATCH_MAX &&
+		   bistate->next_free != InvalidBlockNumber &&
+		   bistate->next_free <= bistate->last_free)
+	{
+		Buffer		buffer;
+		Page		page;
+		BlockNumber nextblock = bistate->next_free;
+
+		buffer = ReadBuffer(relation, nextblock);
+		LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+		page = BufferGetPage(buffer);
+
+		/* Initialize new pages if needed */
+		if (PageIsNew(page))
+			PageInit(page, BufferGetPageSize(buffer), 0);
+
+		/* Only batch empty pages without VM involvement */
+		if (PageGetMaxOffsetNumber(page) != 0 || PageIsAllVisible(page))
+		{
+			UnlockReleaseBuffer(buffer);
+			break;
+		}
+
+		bistate->next_free++;
+		batch_buffers[batch_count] = buffer;
+		batch_pages[batch_count] = page;
+		batch_count++;
+	}
+
+	/* Need at least 2 pages to benefit from batching */
+	if (batch_count < 2)
+	{
+		for (int p = 1; p < batch_count; p++)
+			UnlockReleaseBuffer(batch_buffers[p]);
+		return 0;
+	}
+
+	/*
+	 * CRITICAL SECTION: insert tuples on all pages, then batch-insert WAL.
+	 *
+	 * We hold exclusive locks on all batch buffers.  The critical section
+	 * spans all page modifications and WAL insertions to ensure atomicity.
+	 */
+	START_CRIT_SECTION();
+
+	/* Phase 1: Insert tuples on each page */
+	{
+		int			tuple_idx = ndone;
+
+		for (int p = 0; p < batch_count && tuple_idx < ntuples; p++)
+		{
+			Buffer		buf = batch_buffers[p];
+			Page		pg = batch_pages[p];
+			int			count = 0;
+
+			/* First tuple on each page is guaranteed to fit */
+			RelationPutHeapTuple(relation, buf, heaptuples[tuple_idx], false);
+			if (need_cids)
+				log_heap_new_cid(relation, heaptuples[tuple_idx]);
+			count = 1;
+
+			/* Add more tuples while they fit */
+			while (tuple_idx + count < ntuples)
+			{
+				HeapTuple	heaptup = heaptuples[tuple_idx + count];
+
+				if (PageGetHeapFreeSpace(pg) < MAXALIGN(heaptup->t_len) + saveFreeSpace)
+					break;
+
+				RelationPutHeapTuple(relation, buf, heaptup, false);
+				if (need_cids)
+					log_heap_new_cid(relation, heaptup);
+				count++;
+			}
+
+			if (TransactionIdIsNormal(xid))
+				PageSetPrunable(pg, xid);
+
+			MarkBufferDirty(buf);
+			batch_ntuples[p] = count;
+			tuple_idx += count;
+		}
+		batch_total = tuple_idx - ndone;
+
+		/* Trim batch_count to only pages that received tuples */
+		{
+			int			used = 0;
+
+			for (int p = 0; p < batch_count; p++)
+			{
+				if (batch_ntuples[p] > 0)
+					used = p + 1;
+				else
+					break;
+			}
+			/* Release unused buffers (still in critical section is OK) */
+			for (int p = used; p < batch_count; p++)
+				UnlockReleaseBuffer(batch_buffers[p]);
+			batch_count = used;
+		}
+	}
+
+	/* Phase 2: Batch WAL insertion - one lock acquisition for all pages */
+	XLogBeginBatchInsert();
+
+	{
+		PGAlignedBlock scratch;
+		XLogRecPtr	batch_lsns[HEAP_MULTI_INSERT_WAL_BATCH_MAX];
+		int			tuple_offset = 0;
+
+		for (int p = 0; p < batch_count; p++)
+		{
+			xl_heap_multi_insert *xlrec;
+			uint8		info = XLOG_HEAP2_MULTI_INSERT;
+			char	   *tupledata;
+			char	   *scratchptr = scratch.data;
+			int			totaldatalen;
+			int			bufflags = 0;
+
+			/* All batched pages are init pages */
+			info |= XLOG_HEAP_INIT_PAGE;
+			bufflags |= REGBUF_WILL_INIT;
+
+			xlrec = (xl_heap_multi_insert *) scratchptr;
+			scratchptr += SizeOfHeapMultiInsert;
+
+			/* For init pages, no offsets needed */
+			tupledata = scratchptr;
+
+			xlrec->flags = 0;
+			xlrec->ntuples = batch_ntuples[p];
+
+			/* Assemble per-tuple data */
+			for (int t = 0; t < batch_ntuples[p]; t++)
+			{
+				HeapTuple	heaptup = heaptuples[ndone + tuple_offset + t];
+				xl_multi_insert_tuple *tuphdr;
+				int			datalen;
+
+				tuphdr = (xl_multi_insert_tuple *) SHORTALIGN(scratchptr);
+				scratchptr = ((char *) tuphdr) + SizeOfMultiInsertTuple;
+
+				tuphdr->t_infomask2 = heaptup->t_data->t_infomask2;
+				tuphdr->t_infomask = heaptup->t_data->t_infomask;
+				tuphdr->t_hoff = heaptup->t_data->t_hoff;
+
+				datalen = heaptup->t_len - SizeofHeapTupleHeader;
+				memcpy(scratchptr,
+					   (char *) heaptup->t_data + SizeofHeapTupleHeader,
+					   datalen);
+				tuphdr->datalen = datalen;
+				scratchptr += datalen;
+			}
+			totaldatalen = scratchptr - tupledata;
+			Assert((scratchptr - scratch.data) < BLCKSZ);
+
+			if (need_tuple_data)
+				xlrec->flags |= XLH_INSERT_CONTAINS_NEW_TUPLE;
+
+			if (ndone + tuple_offset + batch_ntuples[p] == ntuples)
+				xlrec->flags |= XLH_INSERT_LAST_IN_MULTI;
+
+			if (need_tuple_data)
+				bufflags |= REGBUF_KEEP_DATA;
+
+			XLogBeginInsert();
+			XLogRegisterData(xlrec, tupledata - scratch.data);
+			XLogRegisterBuffer(0, batch_buffers[p],
+							   REGBUF_STANDARD | bufflags);
+			XLogRegisterBufData(0, tupledata, totaldatalen);
+			XLogSetRecordFlags(XLOG_INCLUDE_ORIGIN);
+
+			batch_lsns[p] = XLogInsert(RM_HEAP2_ID, info);
+			tuple_offset += batch_ntuples[p];
+		}
+
+		/* Set LSNs on all pages */
+		for (int p = 0; p < batch_count; p++)
+			PageSetLSN(batch_pages[p], batch_lsns[p]);
+	}
+
+	XLogEndBatchInsert();
+
+	END_CRIT_SECTION();
+
+	/* Release all buffers */
+	for (int p = 0; p < batch_count; p++)
+		UnlockReleaseBuffer(batch_buffers[p]);
+
+	/* Clean up bistate */
+	if (bistate->current_buf != InvalidBuffer)
+	{
+		ReleaseBuffer(bistate->current_buf);
+		bistate->current_buf = InvalidBuffer;
+	}
+	if (bistate->next_free != InvalidBlockNumber &&
+		bistate->next_free > bistate->last_free)
+	{
+		bistate->next_free = InvalidBlockNumber;
+		bistate->last_free = InvalidBlockNumber;
+	}
+
+	return batch_total;
+}
+
+/*
  *	heap_multi_insert	- insert multiple tuples into a heap
  *
  * This is like heap_insert(), but inserts multiple tuples in one operation.
@@ -2536,6 +2788,37 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 		page = BufferGetPage(buffer);
 
 		starting_with_empty_page = PageGetMaxOffsetNumber(page) == 0;
+
+		/*
+		 * Try WAL insertion lock batching for empty pages without VM
+		 * involvement.  This reduces WALInsertLock acquisitions from N
+		 * (one per page) to 1 by holding the lock across all per-page
+		 * WAL records.  Each page still gets its own standard
+		 * XLOG_HEAP2_MULTI_INSERT record - only the lock is batched.
+		 */
+		if (needwal &&
+			starting_with_empty_page &&
+			!(options & HEAP_INSERT_FROZEN) &&
+			!PageIsAllVisible(page) &&
+			bistate != NULL &&
+			bistate->next_free != InvalidBlockNumber &&
+			bistate->next_free <= bistate->last_free)
+		{
+			int			batched;
+
+			batched = heap_multi_insert_wal_batch(
+				relation, heaptuples, ntuples, ndone,
+				buffer, options, bistate,
+				saveFreeSpace, xid,
+				need_tuple_data, need_cids);
+
+			if (batched > 0)
+			{
+				ndone += batched;
+				starting_with_empty_page = false;
+				continue;
+			}
+		}
 
 		if (starting_with_empty_page && (options & HEAP_INSERT_FROZEN))
 		{

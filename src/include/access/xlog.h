@@ -215,6 +215,8 @@ extern XLogRecPtr XLogInsertRecord(struct XLogRecData *rdata,
 								   int num_fpi,
 								   uint64 fpi_bytes,
 								   bool topxid_included);
+extern void XLogBeginBatchInsert(void);
+extern void XLogEndBatchInsert(void);
 extern void XLogFlush(XLogRecPtr record);
 extern bool XLogBackgroundFlush(void);
 extern bool XLogNeedsFlush(XLogRecPtr record);
