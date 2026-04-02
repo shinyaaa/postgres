@@ -1099,6 +1099,9 @@ DecodeTruncate(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 /*
  * Decode XLOG_HEAP2_MULTI_INSERT record into multiple tuplebufs.
  *
+ * Handles both single-page records (original format) and multi-page
+ * batched records (XLH_INSERT_MULTI_PAGE flag set).
+ *
  * Currently MULTI_INSERT will always contain the full tuples.
  */
 static void
@@ -1106,11 +1109,6 @@ DecodeMultiInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 {
 	XLogReaderState *r = buf->record;
 	xl_heap_multi_insert *xlrec;
-	int			i;
-	char	   *data;
-	char	   *tupledata;
-	Size		tuplelen;
-	RelFileLocator rlocator;
 
 	xlrec = (xl_heap_multi_insert *) XLogRecGetData(r);
 
@@ -1121,82 +1119,192 @@ DecodeMultiInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 	if (!(xlrec->flags & XLH_INSERT_CONTAINS_NEW_TUPLE))
 		return;
 
-	/* only interested in our database */
-	XLogRecGetBlockTag(r, 0, &rlocator, NULL, NULL);
-	if (rlocator.dbOid != ctx->slot->data.database)
-		return;
-
 	/* output plugin doesn't look for this origin, no need to queue */
 	if (FilterByOrigin(ctx, XLogRecGetOrigin(r)))
 		return;
 
-	/*
-	 * We know that this multi_insert isn't for a catalog, so the block should
-	 * always have data even if a full-page write of it is taken.
-	 */
-	tupledata = XLogRecGetBlockData(r, 0, &tuplelen);
-	Assert(tupledata != NULL);
-
-	data = tupledata;
-	for (i = 0; i < xlrec->ntuples; i++)
+	if (xlrec->flags & XLH_INSERT_MULTI_PAGE)
 	{
-		ReorderBufferChange *change;
-		xl_multi_insert_tuple *xlhdr;
-		int			datalen;
-		HeapTuple	tuple;
-		HeapTupleHeader header;
-
-		change = ReorderBufferAllocChange(ctx->reorder);
-		change->action = REORDER_BUFFER_CHANGE_INSERT;
-		change->origin_id = XLogRecGetOrigin(r);
-
-		memcpy(&change->data.tp.rlocator, &rlocator, sizeof(RelFileLocator));
-
-		xlhdr = (xl_multi_insert_tuple *) SHORTALIGN(data);
-		data = ((char *) xlhdr) + SizeOfMultiInsertTuple;
-		datalen = xlhdr->datalen;
-
-		change->data.tp.newtuple =
-			ReorderBufferAllocTupleBuf(ctx->reorder, datalen);
-
-		tuple = change->data.tp.newtuple;
-		header = tuple->t_data;
-
-		/* not a disk based tuple */
-		ItemPointerSetInvalid(&tuple->t_self);
-
 		/*
-		 * We can only figure this out after reassembling the transactions.
+		 * Multi-page batched record.  xlrec->ntuples is the page count.
+		 * Iterate over each page's block data.
 		 */
-		tuple->t_tableOid = InvalidOid;
+		int			npages = xlrec->ntuples;
+		char	   *maindata;
+		int			p;
+		int			total_tuples_decoded = 0;
+		int			total_tuples_in_record = 0;
 
-		tuple->t_len = datalen + SizeofHeapTupleHeader;
+		/* First pass: count total tuples for LAST_IN_MULTI logic */
+		maindata = (char *) xlrec + SizeOfHeapMultiInsert;
+		for (p = 0; p < npages; p++)
+		{
+			xl_heap_multi_insert_page_hdr *pagehdr =
+				(xl_heap_multi_insert_page_hdr *) maindata;
+			bool	pg_isinit = (pagehdr->page_flags & XLHIM_PAGE_WILL_INIT) != 0;
 
-		memset(header, 0, SizeofHeapTupleHeader);
+			total_tuples_in_record += pagehdr->ntuples;
+			maindata += SizeOfHeapMultiInsertPageHdr;
+			if (!pg_isinit)
+				maindata += pagehdr->ntuples * sizeof(OffsetNumber);
+		}
 
-		memcpy((char *) tuple->t_data + SizeofHeapTupleHeader, data, datalen);
-		header->t_infomask = xlhdr->t_infomask;
-		header->t_infomask2 = xlhdr->t_infomask2;
-		header->t_hoff = xlhdr->t_hoff;
+		/* Second pass: decode tuples */
+		maindata = (char *) xlrec + SizeOfHeapMultiInsert;
+		for (p = 0; p < npages; p++)
+		{
+			xl_heap_multi_insert_page_hdr *pagehdr;
+			RelFileLocator rlocator;
+			int			heap_block_id = p * 2;
+			char	   *tupledata;
+			char	   *data;
+			Size		tuplelen;
+			int			i;
+			bool		pg_isinit;
 
-		/*
-		 * Reset toast reassembly state only after the last row in the last
-		 * xl_multi_insert_tuple record emitted by one heap_multi_insert()
-		 * call.
-		 */
-		if (xlrec->flags & XLH_INSERT_LAST_IN_MULTI &&
-			(i + 1) == xlrec->ntuples)
-			change->data.tp.clear_toast_afterwards = true;
-		else
-			change->data.tp.clear_toast_afterwards = false;
+			pagehdr = (xl_heap_multi_insert_page_hdr *) maindata;
+			pg_isinit = (pagehdr->page_flags & XLHIM_PAGE_WILL_INIT) != 0;
+			maindata += SizeOfHeapMultiInsertPageHdr;
+			if (!pg_isinit)
+				maindata += pagehdr->ntuples * sizeof(OffsetNumber);
 
-		ReorderBufferQueueChange(ctx->reorder, XLogRecGetXid(r),
-								 buf->origptr, change, false);
+			/* only interested in our database */
+			XLogRecGetBlockTag(r, heap_block_id, &rlocator, NULL, NULL);
+			if (rlocator.dbOid != ctx->slot->data.database)
+			{
+				total_tuples_decoded += pagehdr->ntuples;
+				continue;
+			}
 
-		/* move to the next xl_multi_insert_tuple entry */
-		data += datalen;
+			tupledata = XLogRecGetBlockData(r, heap_block_id, &tuplelen);
+			Assert(tupledata != NULL);
+
+			data = tupledata;
+			for (i = 0; i < pagehdr->ntuples; i++)
+			{
+				ReorderBufferChange *change;
+				xl_multi_insert_tuple *xlhdr;
+				int			datalen;
+				HeapTuple	tuple;
+				HeapTupleHeader header;
+
+				total_tuples_decoded++;
+
+				change = ReorderBufferAllocChange(ctx->reorder);
+				change->action = REORDER_BUFFER_CHANGE_INSERT;
+				change->origin_id = XLogRecGetOrigin(r);
+
+				memcpy(&change->data.tp.rlocator, &rlocator,
+					   sizeof(RelFileLocator));
+
+				xlhdr = (xl_multi_insert_tuple *) SHORTALIGN(data);
+				data = ((char *) xlhdr) + SizeOfMultiInsertTuple;
+				datalen = xlhdr->datalen;
+
+				change->data.tp.newtuple =
+					ReorderBufferAllocTupleBuf(ctx->reorder, datalen);
+
+				tuple = change->data.tp.newtuple;
+				header = tuple->t_data;
+
+				ItemPointerSetInvalid(&tuple->t_self);
+				tuple->t_tableOid = InvalidOid;
+				tuple->t_len = datalen + SizeofHeapTupleHeader;
+
+				memset(header, 0, SizeofHeapTupleHeader);
+				memcpy((char *) tuple->t_data + SizeofHeapTupleHeader,
+					   data, datalen);
+				header->t_infomask = xlhdr->t_infomask;
+				header->t_infomask2 = xlhdr->t_infomask2;
+				header->t_hoff = xlhdr->t_hoff;
+
+				/*
+				 * Reset toast reassembly state only after the last tuple
+				 * in the last record emitted by heap_multi_insert().
+				 */
+				if ((xlrec->flags & XLH_INSERT_LAST_IN_MULTI) &&
+					total_tuples_decoded == total_tuples_in_record)
+					change->data.tp.clear_toast_afterwards = true;
+				else
+					change->data.tp.clear_toast_afterwards = false;
+
+				ReorderBufferQueueChange(ctx->reorder, XLogRecGetXid(r),
+										 buf->origptr, change, false);
+
+				data += datalen;
+			}
+			Assert(data == tupledata + tuplelen);
+		}
 	}
-	Assert(data == tupledata + tuplelen);
+	else
+	{
+		/*
+		 * Original single-page format.
+		 */
+		int			i;
+		char	   *data;
+		char	   *tupledata;
+		Size		tuplelen;
+		RelFileLocator rlocator;
+
+		/* only interested in our database */
+		XLogRecGetBlockTag(r, 0, &rlocator, NULL, NULL);
+		if (rlocator.dbOid != ctx->slot->data.database)
+			return;
+
+		tupledata = XLogRecGetBlockData(r, 0, &tuplelen);
+		Assert(tupledata != NULL);
+
+		data = tupledata;
+		for (i = 0; i < xlrec->ntuples; i++)
+		{
+			ReorderBufferChange *change;
+			xl_multi_insert_tuple *xlhdr;
+			int			datalen;
+			HeapTuple	tuple;
+			HeapTupleHeader header;
+
+			change = ReorderBufferAllocChange(ctx->reorder);
+			change->action = REORDER_BUFFER_CHANGE_INSERT;
+			change->origin_id = XLogRecGetOrigin(r);
+
+			memcpy(&change->data.tp.rlocator, &rlocator,
+				   sizeof(RelFileLocator));
+
+			xlhdr = (xl_multi_insert_tuple *) SHORTALIGN(data);
+			data = ((char *) xlhdr) + SizeOfMultiInsertTuple;
+			datalen = xlhdr->datalen;
+
+			change->data.tp.newtuple =
+				ReorderBufferAllocTupleBuf(ctx->reorder, datalen);
+
+			tuple = change->data.tp.newtuple;
+			header = tuple->t_data;
+
+			ItemPointerSetInvalid(&tuple->t_self);
+			tuple->t_tableOid = InvalidOid;
+			tuple->t_len = datalen + SizeofHeapTupleHeader;
+
+			memset(header, 0, SizeofHeapTupleHeader);
+			memcpy((char *) tuple->t_data + SizeofHeapTupleHeader,
+				   data, datalen);
+			header->t_infomask = xlhdr->t_infomask;
+			header->t_infomask2 = xlhdr->t_infomask2;
+			header->t_hoff = xlhdr->t_hoff;
+
+			if (xlrec->flags & XLH_INSERT_LAST_IN_MULTI &&
+				(i + 1) == xlrec->ntuples)
+				change->data.tp.clear_toast_afterwards = true;
+			else
+				change->data.tp.clear_toast_afterwards = false;
+
+			ReorderBufferQueueChange(ctx->reorder, XLogRecGetXid(r),
+									 buf->origptr, change, false);
+
+			data += datalen;
+		}
+		Assert(data == tupledata + tuplelen);
+	}
 }
 
 /*
