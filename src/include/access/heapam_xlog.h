@@ -78,9 +78,6 @@
 /* all_frozen_set always implies all_visible_set */
 #define XLH_INSERT_ALL_FROZEN_SET				(1<<5)
 
-/* This record contains tuples for multiple heap pages (batched WAL) */
-#define XLH_INSERT_MULTI_PAGE					(1<<6)
-
 /*
  * xl_heap_update flag values, 8 bits are available.
  */
@@ -200,43 +197,6 @@ typedef struct xl_multi_insert_tuple
 } xl_multi_insert_tuple;
 
 #define SizeOfMultiInsertTuple	(offsetof(xl_multi_insert_tuple, t_hoff) + sizeof(uint8))
-
-/*
- * Maximum number of heap pages that can be batched into a single
- * XLOG_HEAP2_MULTI_INSERT WAL record.  Each heap page uses one block_id
- * for the heap buffer, plus optionally one for the visibility map buffer.
- * With XLR_MAX_BLOCK_ID = 32 and VM pages possible, limit to 16.
- */
-#define MAX_MULTI_INSERT_PAGES		16
-
-/*
- * Multi-page batched WAL record for heap_multi_insert.
- *
- * When XLH_INSERT_MULTI_PAGE is set in the flags of xl_heap_multi_insert,
- * the main data area begins with this header, followed by npages
- * xl_heap_multi_insert_page_hdr entries (variable-length due to offsets[]).
- *
- * Block IDs are assigned as:
- *   Heap page i   -> block_id = i * 2
- *   VM page for i -> block_id = i * 2 + 1 (only if page_flags & XLH_INSERT_ALL_FROZEN_SET)
- *
- * Each heap block's associated data (registered via XLogRegisterBufData)
- * contains the xl_multi_insert_tuple entries for that page.
- */
-
-/* Per-page flags for xl_heap_multi_insert_page_hdr */
-#define XLHIM_PAGE_ALL_VISIBLE_CLEARED	0x01
-#define XLHIM_PAGE_ALL_FROZEN_SET		0x02
-#define XLHIM_PAGE_WILL_INIT			0x04
-
-typedef struct xl_heap_multi_insert_page_hdr
-{
-	uint8		page_flags;		/* per-page flags (XLHIM_PAGE_*) */
-	uint16		ntuples;		/* number of tuples inserted into this page */
-	OffsetNumber offsets[FLEXIBLE_ARRAY_MEMBER];	/* omitted if WILL_INIT */
-} xl_heap_multi_insert_page_hdr;
-
-#define SizeOfHeapMultiInsertPageHdr	offsetof(xl_heap_multi_insert_page_hdr, offsets)
 
 /*
  * This is what we need to know about update|hot_update

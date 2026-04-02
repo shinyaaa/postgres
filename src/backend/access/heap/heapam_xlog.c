@@ -481,45 +481,14 @@ heap_xlog_insert(XLogReaderState *record)
 		XLogRecordPageWithFreeSpace(target_locator, blkno, freespace);
 }
 
-/* Forward declarations for multi-insert replay helpers */
-static void heap_xlog_multi_insert_single(XLogReaderState *record,
-										  xl_heap_multi_insert *xlrec);
-static void heap_xlog_multi_insert_batched(XLogReaderState *record,
-										   xl_heap_multi_insert *xlrec);
-
 /*
  * Replay XLOG_HEAP2_MULTI_INSERT records.
- *
- * Handles both single-page records (original format) and multi-page
- * batched records (XLH_INSERT_MULTI_PAGE flag set).
  */
 static void
 heap_xlog_multi_insert(XLogReaderState *record)
 {
-	xl_heap_multi_insert *xlrec;
-
-	xlrec = (xl_heap_multi_insert *) XLogRecGetData(record);
-
-	if (xlrec->flags & XLH_INSERT_MULTI_PAGE)
-	{
-		/* Multi-page batched replay */
-		heap_xlog_multi_insert_batched(record, xlrec);
-	}
-	else
-	{
-		/* Original single-page replay */
-		heap_xlog_multi_insert_single(record, xlrec);
-	}
-}
-
-/*
- * Replay a single-page XLOG_HEAP2_MULTI_INSERT record (original format).
- */
-static void
-heap_xlog_multi_insert_single(XLogReaderState *record,
-							  xl_heap_multi_insert *xlrec)
-{
 	XLogRecPtr	lsn = record->EndRecPtr;
+	xl_heap_multi_insert *xlrec;
 	RelFileLocator rlocator;
 	BlockNumber blkno;
 	Buffer		buffer;
@@ -541,6 +510,8 @@ heap_xlog_multi_insert_single(XLogReaderState *record,
 	 * Insertion doesn't overwrite MVCC data, so no conflict processing is
 	 * required.
 	 */
+	xlrec = (xl_heap_multi_insert *) XLogRecGetData(record);
+
 	XLogRecGetBlockTag(record, 0, &rlocator, NULL, &blkno);
 
 	/* check that the mutually exclusive flags are not both set */
@@ -670,7 +641,7 @@ heap_xlog_multi_insert_single(XLogReaderState *record,
 	 * PD_ALL_VISIBLE must be set on the heap page if the VM bit is set.
 	 *
 	 * Note that we released the heap page lock above. During normal
-	 * operation, this would be unsafe - a concurrent modification could
+	 * operation, this would be unsafe — a concurrent modification could
 	 * clear PD_ALL_VISIBLE while the VM bit remained set, violating the
 	 * invariant.
 	 *
@@ -713,197 +684,6 @@ heap_xlog_multi_insert_single(XLogReaderState *record,
 	 */
 	if (action == BLK_NEEDS_REDO && freespace < BLCKSZ / 5)
 		XLogRecordPageWithFreeSpace(rlocator, blkno, freespace);
-}
-
-/*
- * Replay a multi-page batched XLOG_HEAP2_MULTI_INSERT record.
- *
- * When XLH_INSERT_MULTI_PAGE is set, the record contains tuples for
- * multiple heap pages.  xlrec->ntuples is repurposed as the page count.
- * The main data area contains per-page headers (xl_heap_multi_insert_page_hdr)
- * with per-page flags, tuple counts, and offsets.
- *
- * Block IDs: heap page i = i*2, VM page for i = i*2+1.
- */
-static void
-heap_xlog_multi_insert_batched(XLogReaderState *record,
-							   xl_heap_multi_insert *xlrec)
-{
-	XLogRecPtr	lsn = record->EndRecPtr;
-	int			npages = xlrec->ntuples;  /* repurposed field */
-	char	   *maindata;
-	int			p;
-	union
-	{
-		HeapTupleHeaderData hdr;
-		char		data[MaxHeapTupleSize];
-	}			tbuf;
-
-	/* Advance past the xl_heap_multi_insert header in main data */
-	maindata = (char *) XLogRecGetData(record) + SizeOfHeapMultiInsert;
-
-	for (p = 0; p < npages; p++)
-	{
-		xl_heap_multi_insert_page_hdr *pagehdr;
-		RelFileLocator rlocator;
-		BlockNumber blkno;
-		Buffer		buffer;
-		Page		page;
-		int			heap_block_id = p * 2;
-		bool		isinit;
-		bool		all_visible_cleared;
-		bool		all_frozen_set;
-		XLogRedoAction action;
-		Size		freespace = 0;
-		int			i;
-
-		/* Read per-page header */
-		pagehdr = (xl_heap_multi_insert_page_hdr *) maindata;
-		maindata += SizeOfHeapMultiInsertPageHdr;
-
-		isinit = (pagehdr->page_flags & XLHIM_PAGE_WILL_INIT) != 0;
-		all_visible_cleared = (pagehdr->page_flags & XLHIM_PAGE_ALL_VISIBLE_CLEARED) != 0;
-		all_frozen_set = (pagehdr->page_flags & XLHIM_PAGE_ALL_FROZEN_SET) != 0;
-
-		/* Skip over offsets array if present */
-		if (!isinit)
-			maindata += pagehdr->ntuples * sizeof(OffsetNumber);
-
-		XLogRecGetBlockTag(record, heap_block_id, &rlocator, NULL, &blkno);
-
-		/* Handle visibility map clearing */
-		if (all_visible_cleared)
-		{
-			Buffer		vmbuffer = InvalidBuffer;
-			Relation	reln = CreateFakeRelcacheEntry(rlocator);
-
-			visibilitymap_pin(reln, blkno, &vmbuffer);
-			visibilitymap_clear(reln, blkno, vmbuffer, VISIBILITYMAP_VALID_BITS);
-			ReleaseBuffer(vmbuffer);
-			FreeFakeRelcacheEntry(reln);
-		}
-
-		/* Initialize or read the heap page */
-		if (isinit)
-		{
-			buffer = XLogInitBufferForRedo(record, heap_block_id);
-			page = BufferGetPage(buffer);
-			PageInit(page, BufferGetPageSize(buffer), 0);
-			action = BLK_NEEDS_REDO;
-		}
-		else
-			action = XLogReadBufferForRedo(record, heap_block_id, &buffer);
-
-		if (action == BLK_NEEDS_REDO)
-		{
-			char	   *tupdata;
-			char	   *endptr;
-			Size		len;
-			OffsetNumber *offsets;
-
-			tupdata = XLogRecGetBlockData(record, heap_block_id, &len);
-			endptr = tupdata + len;
-
-			page = BufferGetPage(buffer);
-
-			/* Get offsets from the page header (already parsed above) */
-			offsets = isinit ? NULL : pagehdr->offsets;
-
-			for (i = 0; i < pagehdr->ntuples; i++)
-			{
-				OffsetNumber offnum;
-				xl_multi_insert_tuple *xlhdr;
-				HeapTupleHeader htup;
-				uint32		newlen;
-
-				if (isinit)
-					offnum = FirstOffsetNumber + i;
-				else
-					offnum = offsets[i];
-
-				if (PageGetMaxOffsetNumber(page) + 1 < offnum)
-					elog(PANIC, "invalid max offset number");
-
-				xlhdr = (xl_multi_insert_tuple *) SHORTALIGN(tupdata);
-				tupdata = ((char *) xlhdr) + SizeOfMultiInsertTuple;
-
-				newlen = xlhdr->datalen;
-				Assert(newlen <= MaxHeapTupleSize);
-				htup = &tbuf.hdr;
-				MemSet(htup, 0, SizeofHeapTupleHeader);
-				memcpy((char *) htup + SizeofHeapTupleHeader,
-					   tupdata, newlen);
-				tupdata += newlen;
-
-				newlen += SizeofHeapTupleHeader;
-				htup->t_infomask2 = xlhdr->t_infomask2;
-				htup->t_infomask = xlhdr->t_infomask;
-				htup->t_hoff = xlhdr->t_hoff;
-				HeapTupleHeaderSetXmin(htup, XLogRecGetXid(record));
-				HeapTupleHeaderSetCmin(htup, FirstCommandId);
-				ItemPointerSetBlockNumber(&htup->t_ctid, blkno);
-				ItemPointerSetOffsetNumber(&htup->t_ctid, offnum);
-
-				offnum = PageAddItem(page, htup, newlen, offnum, true, true);
-				if (offnum == InvalidOffsetNumber)
-					elog(PANIC, "failed to add tuple");
-			}
-
-			if (tupdata != endptr)
-				elog(PANIC, "total tuple length mismatch");
-
-			freespace = PageGetHeapFreeSpace(page);
-
-			PageSetLSN(page, lsn);
-
-			if (all_visible_cleared)
-				PageClearAllVisible(page);
-
-			if (all_frozen_set)
-			{
-				PageSetAllVisible(page);
-				PageClearPrunable(page);
-			}
-			else
-				PageSetPrunable(page, XLogRecGetXid(record));
-
-			MarkBufferDirty(buffer);
-		}
-
-		if (BufferIsValid(buffer))
-			UnlockReleaseBuffer(buffer);
-
-		/* Handle VM update for frozen pages */
-		if (all_frozen_set)
-		{
-			Buffer		vmbuffer = InvalidBuffer;
-
-			if (XLogReadBufferForRedoExtended(record, heap_block_id + 1,
-											  RBM_ZERO_ON_ERROR, false,
-											  &vmbuffer) == BLK_NEEDS_REDO)
-			{
-				Page		vmpage = BufferGetPage(vmbuffer);
-
-				if (PageIsNew(vmpage))
-					PageInit(vmpage, BLCKSZ, 0);
-
-				visibilitymap_set(blkno, vmbuffer,
-								  VISIBILITYMAP_ALL_VISIBLE |
-								  VISIBILITYMAP_ALL_FROZEN,
-								  rlocator);
-
-				Assert(BufferIsDirty(vmbuffer));
-				PageSetLSN(vmpage, lsn);
-			}
-
-			if (BufferIsValid(vmbuffer))
-				UnlockReleaseBuffer(vmbuffer);
-		}
-
-		/* Update FSM if page is low on free space */
-		if (action == BLK_NEEDS_REDO && freespace < BLCKSZ / 5)
-			XLogRecordPageWithFreeSpace(rlocator, blkno, freespace);
-	}
 }
 
 /*
