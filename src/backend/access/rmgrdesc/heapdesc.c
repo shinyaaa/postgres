@@ -354,54 +354,19 @@ heap2_desc(StringInfo buf, XLogReaderState *record)
 		xl_heap_multi_insert *xlrec = (xl_heap_multi_insert *) rec;
 		bool		isinit = (XLogRecGetInfo(record) & XLOG_HEAP_INIT_PAGE) != 0;
 
-		if (xlrec->flags & XLH_INSERT_MULTI_PAGE)
+		appendStringInfo(buf, "ntuples: %d, flags: 0x%02X", xlrec->ntuples,
+						 xlrec->flags);
+
+		if (xlrec->flags & XLH_INSERT_ALL_FROZEN_SET)
+			appendStringInfo(buf, ", vm_flags: 0x%02X",
+							 VISIBILITYMAP_ALL_VISIBLE |
+							 VISIBILITYMAP_ALL_FROZEN);
+
+		if (XLogRecHasBlockData(record, 0) && !isinit)
 		{
-			/* Multi-page batched record: ntuples is actually npages */
-			int			npages = xlrec->ntuples;
-			char	   *maindata = (char *) xlrec + SizeOfHeapMultiInsert;
-			int			p;
-
-			appendStringInfo(buf, "npages: %d, flags: 0x%02X",
-							 npages, xlrec->flags);
-
-			for (p = 0; p < npages; p++)
-			{
-				xl_heap_multi_insert_page_hdr *pagehdr =
-					(xl_heap_multi_insert_page_hdr *) maindata;
-				bool	pg_isinit = (pagehdr->page_flags & XLHIM_PAGE_WILL_INIT) != 0;
-
-				appendStringInfo(buf, " [page %d: ntuples: %d, page_flags: 0x%02X",
-								 p, pagehdr->ntuples, pagehdr->page_flags);
-
-				maindata += SizeOfHeapMultiInsertPageHdr;
-
-				if (!pg_isinit)
-				{
-					appendStringInfoString(buf, ", offsets:");
-					array_desc(buf, pagehdr->offsets, sizeof(OffsetNumber),
-							   pagehdr->ntuples, &offset_elem_desc, NULL);
-					maindata += pagehdr->ntuples * sizeof(OffsetNumber);
-				}
-				appendStringInfoChar(buf, ']');
-			}
-		}
-		else
-		{
-			/* Original single-page format */
-			appendStringInfo(buf, "ntuples: %d, flags: 0x%02X",
-							 xlrec->ntuples, xlrec->flags);
-
-			if (xlrec->flags & XLH_INSERT_ALL_FROZEN_SET)
-				appendStringInfo(buf, ", vm_flags: 0x%02X",
-								 VISIBILITYMAP_ALL_VISIBLE |
-								 VISIBILITYMAP_ALL_FROZEN);
-
-			if (XLogRecHasBlockData(record, 0) && !isinit)
-			{
-				appendStringInfoString(buf, ", offsets:");
-				array_desc(buf, xlrec->offsets, sizeof(OffsetNumber),
-						   xlrec->ntuples, &offset_elem_desc, NULL);
-			}
+			appendStringInfoString(buf, ", offsets:");
+			array_desc(buf, xlrec->offsets, sizeof(OffsetNumber),
+					   xlrec->ntuples, &offset_elem_desc, NULL);
 		}
 	}
 	else if (info == XLOG_HEAP2_LOCK_UPDATED)
