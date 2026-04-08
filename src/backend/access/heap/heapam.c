@@ -2462,6 +2462,7 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 			char	   *scratchptr = scratch.data;
 			bool		init;
 			int			bufflags = 0;
+			bool		common_metadata;
 
 			/*
 			 * If the page was previously empty, we can reinit the page
@@ -2482,6 +2483,48 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 			if (!init)
 				scratchptr += nthispage * sizeof(OffsetNumber);
 
+			/*
+			 * Check if all tuples share the same metadata (t_infomask2,
+			 * t_infomask, t_hoff).  This is the common case for COPY and
+			 * bulk inserts where all tuples have the same schema and
+			 * visibility state.  When true, we store the metadata once in
+			 * the record header rather than per-tuple, saving 5 bytes per
+			 * additional tuple.
+			 */
+			common_metadata = (nthispage > 1);
+			if (common_metadata)
+			{
+				HeapTupleHeader first_hdr = heaptuples[ndone]->t_data;
+
+				for (i = 1; i < nthispage; i++)
+				{
+					HeapTupleHeader this_hdr = heaptuples[ndone + i]->t_data;
+
+					if (this_hdr->t_infomask2 != first_hdr->t_infomask2 ||
+						this_hdr->t_infomask != first_hdr->t_infomask ||
+						this_hdr->t_hoff != first_hdr->t_hoff)
+					{
+						common_metadata = false;
+						break;
+					}
+				}
+			}
+
+			/*
+			 * If all tuples share the same metadata, store the common values
+			 * once in the main data area.
+			 */
+			if (common_metadata)
+			{
+				xl_heap_multi_insert_common *common;
+
+				common = (xl_heap_multi_insert_common *) scratchptr;
+				common->t_infomask2 = heaptuples[ndone]->t_data->t_infomask2;
+				common->t_infomask = heaptuples[ndone]->t_data->t_infomask;
+				common->t_hoff = heaptuples[ndone]->t_data->t_hoff;
+				scratchptr += SizeOfHeapMultiInsertCommon;
+			}
+
 			/* the rest of the scratch space is used for tuple data */
 			tupledata = scratchptr;
 
@@ -2500,35 +2543,61 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 			if (all_frozen_set)
 				xlrec->flags = XLH_INSERT_ALL_FROZEN_SET;
 
+			if (common_metadata)
+				xlrec->flags |= XLH_INSERT_COMMON_METADATA;
+
 			xlrec->ntuples = nthispage;
 
 			/*
-			 * Write out an xl_multi_insert_tuple and the tuple data itself
-			 * for each tuple.
+			 * Write out the tuple data for each tuple.  When common_metadata
+			 * is set, each entry contains only a uint16 datalen followed by
+			 * the tuple data.  Otherwise, the full xl_multi_insert_tuple
+			 * header is written per tuple.
 			 */
 			for (i = 0; i < nthispage; i++)
 			{
 				HeapTuple	heaptup = heaptuples[ndone + i];
-				xl_multi_insert_tuple *tuphdr;
 				int			datalen;
 
 				if (!init)
 					xlrec->offsets[i] = ItemPointerGetOffsetNumber(&heaptup->t_self);
-				/* xl_multi_insert_tuple needs two-byte alignment. */
-				tuphdr = (xl_multi_insert_tuple *) SHORTALIGN(scratchptr);
-				scratchptr = ((char *) tuphdr) + SizeOfMultiInsertTuple;
 
-				tuphdr->t_infomask2 = heaptup->t_data->t_infomask2;
-				tuphdr->t_infomask = heaptup->t_data->t_infomask;
-				tuphdr->t_hoff = heaptup->t_data->t_hoff;
+				if (common_metadata)
+				{
+					uint16	   *datalen_ptr;
 
-				/* write bitmap [+ padding] [+ oid] + data */
-				datalen = heaptup->t_len - SizeofHeapTupleHeader;
-				memcpy(scratchptr,
-					   (char *) heaptup->t_data + SizeofHeapTupleHeader,
-					   datalen);
-				tuphdr->datalen = datalen;
-				scratchptr += datalen;
+					/* datalen needs two-byte alignment. */
+					datalen_ptr = (uint16 *) SHORTALIGN(scratchptr);
+					scratchptr = ((char *) datalen_ptr) + sizeof(uint16);
+
+					/* write bitmap [+ padding] [+ oid] + data */
+					datalen = heaptup->t_len - SizeofHeapTupleHeader;
+					memcpy(scratchptr,
+						   (char *) heaptup->t_data + SizeofHeapTupleHeader,
+						   datalen);
+					*datalen_ptr = datalen;
+					scratchptr += datalen;
+				}
+				else
+				{
+					xl_multi_insert_tuple *tuphdr;
+
+					/* xl_multi_insert_tuple needs two-byte alignment. */
+					tuphdr = (xl_multi_insert_tuple *) SHORTALIGN(scratchptr);
+					scratchptr = ((char *) tuphdr) + SizeOfMultiInsertTuple;
+
+					tuphdr->t_infomask2 = heaptup->t_data->t_infomask2;
+					tuphdr->t_infomask = heaptup->t_data->t_infomask;
+					tuphdr->t_hoff = heaptup->t_data->t_hoff;
+
+					/* write bitmap [+ padding] [+ oid] + data */
+					datalen = heaptup->t_len - SizeofHeapTupleHeader;
+					memcpy(scratchptr,
+						   (char *) heaptup->t_data + SizeofHeapTupleHeader,
+						   datalen);
+					tuphdr->datalen = datalen;
+					scratchptr += datalen;
+				}
 			}
 			totaldatalen = scratchptr - tupledata;
 			Assert((scratchptr - scratch.data) < BLCKSZ);

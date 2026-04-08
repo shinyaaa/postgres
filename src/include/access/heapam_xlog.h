@@ -77,6 +77,14 @@
 
 /* all_frozen_set always implies all_visible_set */
 #define XLH_INSERT_ALL_FROZEN_SET				(1<<5)
+/*
+ * All tuples in the multi-insert share the same t_infomask2, t_infomask,
+ * and t_hoff.  When set, these values are stored once in the main data
+ * area (as xl_heap_multi_insert_common) rather than per-tuple, and each
+ * tuple's block data entry contains only datalen (uint16) followed by the
+ * tuple data.
+ */
+#define XLH_INSERT_COMMON_METADATA				(1<<6)
 
 /*
  * xl_heap_update flag values, 8 bits are available.
@@ -197,6 +205,23 @@ typedef struct xl_multi_insert_tuple
 } xl_multi_insert_tuple;
 
 #define SizeOfMultiInsertTuple	(offsetof(xl_multi_insert_tuple, t_hoff) + sizeof(uint8))
+
+/*
+ * When XLH_INSERT_COMMON_METADATA is set, the common tuple metadata is
+ * stored once in the main data area, right after the xl_heap_multi_insert
+ * header (and offsets array, if present).  Per-tuple block data then
+ * contains only a uint16 datalen followed by the tuple data, omitting
+ * the per-tuple t_infomask2/t_infomask/t_hoff fields.
+ */
+typedef struct xl_heap_multi_insert_common
+{
+	uint16		t_infomask2;
+	uint16		t_infomask;
+	uint8		t_hoff;
+} xl_heap_multi_insert_common;
+
+#define SizeOfHeapMultiInsertCommon \
+	(offsetof(xl_heap_multi_insert_common, t_hoff) + sizeof(uint8))
 
 /*
  * This is what we need to know about update|hot_update
