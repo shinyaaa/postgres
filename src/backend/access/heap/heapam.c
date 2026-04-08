@@ -2462,12 +2462,39 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 			char	   *scratchptr = scratch.data;
 			bool		init;
 			int			bufflags = 0;
+			bool		common_header;
 
 			/*
 			 * If the page was previously empty, we can reinit the page
 			 * instead of restoring the whole thing.
 			 */
 			init = starting_with_empty_page;
+
+			/*
+			 * Check if all tuples on this page share the same t_infomask2,
+			 * t_infomask, and t_hoff.  If so, we can store these fields
+			 * once in the main data as a common header, and omit the
+			 * per-tuple xl_multi_insert_tuple headers, saving about 5+
+			 * bytes per tuple.
+			 */
+			common_header = (nthispage > 1);
+			if (common_header)
+			{
+				HeapTupleHeader first = heaptuples[ndone]->t_data;
+
+				for (i = 1; i < nthispage; i++)
+				{
+					HeapTupleHeader cur = heaptuples[ndone + i]->t_data;
+
+					if (cur->t_infomask2 != first->t_infomask2 ||
+						cur->t_infomask != first->t_infomask ||
+						cur->t_hoff != first->t_hoff)
+					{
+						common_header = false;
+						break;
+					}
+				}
+			}
 
 			/* allocate xl_heap_multi_insert struct from the scratch area */
 			xlrec = (xl_heap_multi_insert *) scratchptr;
@@ -2481,6 +2508,20 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 			 */
 			if (!init)
 				scratchptr += nthispage * sizeof(OffsetNumber);
+
+			/*
+			 * If using common header format, write the shared xl_heap_header
+			 * into the main data area after the offsets.
+			 */
+			if (common_header)
+			{
+				xl_heap_header *common_hdr = (xl_heap_header *) scratchptr;
+
+				common_hdr->t_infomask2 = heaptuples[ndone]->t_data->t_infomask2;
+				common_hdr->t_infomask = heaptuples[ndone]->t_data->t_infomask;
+				common_hdr->t_hoff = heaptuples[ndone]->t_data->t_hoff;
+				scratchptr += SizeOfHeapHeader;
+			}
 
 			/* the rest of the scratch space is used for tuple data */
 			tupledata = scratchptr;
@@ -2500,34 +2541,51 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 			if (all_frozen_set)
 				xlrec->flags = XLH_INSERT_ALL_FROZEN_SET;
 
+			if (common_header)
+				xlrec->flags |= XLH_INSERT_COMMON_HEADER;
+
 			xlrec->ntuples = nthispage;
 
 			/*
-			 * Write out an xl_multi_insert_tuple and the tuple data itself
-			 * for each tuple.
+			 * Write out the tuple data for each tuple.  When using the
+			 * common header format, each tuple is stored as just a uint16
+			 * datalen followed by the data.  Otherwise, use the traditional
+			 * xl_multi_insert_tuple format with per-tuple header fields.
 			 */
 			for (i = 0; i < nthispage; i++)
 			{
 				HeapTuple	heaptup = heaptuples[ndone + i];
-				xl_multi_insert_tuple *tuphdr;
 				int			datalen;
 
 				if (!init)
 					xlrec->offsets[i] = ItemPointerGetOffsetNumber(&heaptup->t_self);
-				/* xl_multi_insert_tuple needs two-byte alignment. */
-				tuphdr = (xl_multi_insert_tuple *) SHORTALIGN(scratchptr);
-				scratchptr = ((char *) tuphdr) + SizeOfMultiInsertTuple;
-
-				tuphdr->t_infomask2 = heaptup->t_data->t_infomask2;
-				tuphdr->t_infomask = heaptup->t_data->t_infomask;
-				tuphdr->t_hoff = heaptup->t_data->t_hoff;
 
 				/* write bitmap [+ padding] [+ oid] + data */
 				datalen = heaptup->t_len - SizeofHeapTupleHeader;
+
+				if (common_header)
+				{
+					/* Store only datalen + raw tuple data */
+					memcpy(scratchptr, &datalen, sizeof(uint16));
+					scratchptr += sizeof(uint16);
+				}
+				else
+				{
+					xl_multi_insert_tuple *tuphdr;
+
+					/* xl_multi_insert_tuple needs two-byte alignment. */
+					tuphdr = (xl_multi_insert_tuple *) SHORTALIGN(scratchptr);
+					scratchptr = ((char *) tuphdr) + SizeOfMultiInsertTuple;
+
+					tuphdr->t_infomask2 = heaptup->t_data->t_infomask2;
+					tuphdr->t_infomask = heaptup->t_data->t_infomask;
+					tuphdr->t_hoff = heaptup->t_data->t_hoff;
+					tuphdr->datalen = datalen;
+				}
+
 				memcpy(scratchptr,
 					   (char *) heaptup->t_data + SizeofHeapTupleHeader,
 					   datalen);
-				tuphdr->datalen = datalen;
 				scratchptr += datalen;
 			}
 			totaldatalen = scratchptr - tupledata;

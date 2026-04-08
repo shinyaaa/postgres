@@ -362,6 +362,9 @@ heap2_desc(StringInfo buf, XLogReaderState *record)
 							 VISIBILITYMAP_ALL_VISIBLE |
 							 VISIBILITYMAP_ALL_FROZEN);
 
+		if (xlrec->flags & XLH_INSERT_COMMON_HEADER)
+			appendStringInfoString(buf, ", common_header");
+
 		if (XLogRecHasBlockData(record, 0) && !isinit)
 		{
 			appendStringInfoString(buf, ", offsets:");

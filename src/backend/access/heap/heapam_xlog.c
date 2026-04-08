@@ -547,17 +547,33 @@ heap_xlog_multi_insert(XLogReaderState *record)
 		char	   *tupdata;
 		char	   *endptr;
 		Size		len;
+		bool		common_header = (xlrec->flags & XLH_INSERT_COMMON_HEADER) != 0;
+		xl_heap_header common_hdr;
 
 		/* Tuples are stored as block data */
 		tupdata = XLogRecGetBlockData(record, 0, &len);
 		endptr = tupdata + len;
+
+		/*
+		 * If the common header flag is set, read the shared tuple header
+		 * fields from the main data area.  These follow the
+		 * xl_heap_multi_insert struct (and offsets array, if present).
+		 */
+		if (common_header)
+		{
+			char   *maindata = (char *) xlrec;
+
+			maindata += SizeOfHeapMultiInsert;
+			if (!isinit)
+				maindata += xlrec->ntuples * sizeof(OffsetNumber);
+			memcpy(&common_hdr, maindata, SizeOfHeapHeader);
+		}
 
 		page = BufferGetPage(buffer);
 
 		for (i = 0; i < xlrec->ntuples; i++)
 		{
 			OffsetNumber offnum;
-			xl_multi_insert_tuple *xlhdr;
 
 			/*
 			 * If we're reinitializing the page, the tuples are stored in
@@ -571,23 +587,55 @@ heap_xlog_multi_insert(XLogReaderState *record)
 			if (PageGetMaxOffsetNumber(page) + 1 < offnum)
 				elog(PANIC, "invalid max offset number");
 
-			xlhdr = (xl_multi_insert_tuple *) SHORTALIGN(tupdata);
-			tupdata = ((char *) xlhdr) + SizeOfMultiInsertTuple;
+			if (common_header)
+			{
+				/*
+				 * Common header format: each tuple is stored as a uint16
+				 * datalen followed by the raw tuple data, with no alignment
+				 * padding.
+				 */
+				uint16		datalen;
 
-			newlen = xlhdr->datalen;
-			Assert(newlen <= MaxHeapTupleSize);
-			htup = &tbuf.hdr;
-			MemSet(htup, 0, SizeofHeapTupleHeader);
-			/* PG73FORMAT: get bitmap [+ padding] [+ oid] + data */
-			memcpy((char *) htup + SizeofHeapTupleHeader,
-				   tupdata,
-				   newlen);
-			tupdata += newlen;
+				memcpy(&datalen, tupdata, sizeof(uint16));
+				tupdata += sizeof(uint16);
 
-			newlen += SizeofHeapTupleHeader;
-			htup->t_infomask2 = xlhdr->t_infomask2;
-			htup->t_infomask = xlhdr->t_infomask;
-			htup->t_hoff = xlhdr->t_hoff;
+				newlen = datalen;
+				Assert(newlen <= MaxHeapTupleSize);
+				htup = &tbuf.hdr;
+				MemSet(htup, 0, SizeofHeapTupleHeader);
+				memcpy((char *) htup + SizeofHeapTupleHeader,
+					   tupdata,
+					   newlen);
+				tupdata += newlen;
+
+				newlen += SizeofHeapTupleHeader;
+				htup->t_infomask2 = common_hdr.t_infomask2;
+				htup->t_infomask = common_hdr.t_infomask;
+				htup->t_hoff = common_hdr.t_hoff;
+			}
+			else
+			{
+				xl_multi_insert_tuple *xlhdr;
+
+				xlhdr = (xl_multi_insert_tuple *) SHORTALIGN(tupdata);
+				tupdata = ((char *) xlhdr) + SizeOfMultiInsertTuple;
+
+				newlen = xlhdr->datalen;
+				Assert(newlen <= MaxHeapTupleSize);
+				htup = &tbuf.hdr;
+				MemSet(htup, 0, SizeofHeapTupleHeader);
+				/* PG73FORMAT: get bitmap [+ padding] [+ oid] + data */
+				memcpy((char *) htup + SizeofHeapTupleHeader,
+					   tupdata,
+					   newlen);
+				tupdata += newlen;
+
+				newlen += SizeofHeapTupleHeader;
+				htup->t_infomask2 = xlhdr->t_infomask2;
+				htup->t_infomask = xlhdr->t_infomask;
+				htup->t_hoff = xlhdr->t_hoff;
+			}
+
 			HeapTupleHeaderSetXmin(htup, XLogRecGetXid(record));
 			HeapTupleHeaderSetCmin(htup, FirstCommandId);
 			ItemPointerSetBlockNumber(&htup->t_ctid, blkno);

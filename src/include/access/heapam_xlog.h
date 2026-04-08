@@ -79,6 +79,15 @@
 #define XLH_INSERT_ALL_FROZEN_SET				(1<<5)
 
 /*
+ * All tuples in a multi-insert share the same t_infomask2, t_infomask, and
+ * t_hoff.  When set, these common fields are stored once in the main data
+ * (as xl_heap_header) instead of per-tuple in xl_multi_insert_tuple headers.
+ * The per-tuple block data then contains only datalen (uint16) followed by
+ * the tuple data, without SHORTALIGN padding between tuples.
+ */
+#define XLH_INSERT_COMMON_HEADER				(1<<6)
+
+/*
  * xl_heap_update flag values, 8 bits are available.
  */
 /* PD_ALL_VISIBLE was cleared */
@@ -174,9 +183,16 @@ typedef struct xl_heap_insert
  * 'offsets' array is omitted if the whole page is reinitialized
  * (XLOG_HEAP_INIT_PAGE).
  *
- * In block 0's data portion, there is an xl_multi_insert_tuple struct,
- * followed by the tuple data for each tuple. There is padding to align
- * each xl_multi_insert_tuple struct.
+ * When XLH_INSERT_COMMON_HEADER is set, all tuples share the same
+ * t_infomask2, t_infomask, and t_hoff values.  In that case, a single
+ * xl_heap_header follows the xl_heap_multi_insert header (and offsets
+ * array, if present) in the main data, and block 0's data contains only
+ * a uint16 datalen followed by tuple data for each tuple, with no
+ * alignment padding between them.
+ *
+ * When XLH_INSERT_COMMON_HEADER is not set, block 0's data portion
+ * contains an xl_multi_insert_tuple struct followed by the tuple data
+ * for each tuple, with padding to align each xl_multi_insert_tuple struct.
  */
 typedef struct xl_heap_multi_insert
 {

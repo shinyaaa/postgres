@@ -1127,6 +1127,8 @@ DecodeMultiInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 	char	   *tupledata;
 	Size		tuplelen;
 	RelFileLocator rlocator;
+	bool		common_header;
+	xl_heap_header common_hdr;
 
 	xlrec = (xl_heap_multi_insert *) XLogRecGetData(r);
 
@@ -1147,6 +1149,22 @@ DecodeMultiInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 		return;
 
 	/*
+	 * If the common header flag is set, read the shared tuple header fields
+	 * from the main data area.
+	 */
+	common_header = (xlrec->flags & XLH_INSERT_COMMON_HEADER) != 0;
+	if (common_header)
+	{
+		bool	isinit = (XLogRecGetInfo(r) & XLOG_HEAP_INIT_PAGE) != 0;
+		char   *maindata = (char *) xlrec;
+
+		maindata += SizeOfHeapMultiInsert;
+		if (!isinit)
+			maindata += xlrec->ntuples * sizeof(OffsetNumber);
+		memcpy(&common_hdr, maindata, SizeOfHeapHeader);
+	}
+
+	/*
 	 * We know that this multi_insert isn't for a catalog, so the block should
 	 * always have data even if a full-page write of it is taken.
 	 */
@@ -1157,10 +1175,12 @@ DecodeMultiInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 	for (i = 0; i < xlrec->ntuples; i++)
 	{
 		ReorderBufferChange *change;
-		xl_multi_insert_tuple *xlhdr;
 		int			datalen;
 		HeapTuple	tuple;
 		HeapTupleHeader header;
+		uint16		t_infomask;
+		uint16		t_infomask2;
+		uint8		t_hoff;
 
 		change = ReorderBufferAllocChange(ctx->reorder);
 		change->action = REORDER_BUFFER_CHANGE_INSERT;
@@ -1168,9 +1188,28 @@ DecodeMultiInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 
 		memcpy(&change->data.tp.rlocator, &rlocator, sizeof(RelFileLocator));
 
-		xlhdr = (xl_multi_insert_tuple *) SHORTALIGN(data);
-		data = ((char *) xlhdr) + SizeOfMultiInsertTuple;
-		datalen = xlhdr->datalen;
+		if (common_header)
+		{
+			uint16		dl;
+
+			memcpy(&dl, data, sizeof(uint16));
+			data += sizeof(uint16);
+			datalen = dl;
+			t_infomask = common_hdr.t_infomask;
+			t_infomask2 = common_hdr.t_infomask2;
+			t_hoff = common_hdr.t_hoff;
+		}
+		else
+		{
+			xl_multi_insert_tuple *xlhdr;
+
+			xlhdr = (xl_multi_insert_tuple *) SHORTALIGN(data);
+			data = ((char *) xlhdr) + SizeOfMultiInsertTuple;
+			datalen = xlhdr->datalen;
+			t_infomask = xlhdr->t_infomask;
+			t_infomask2 = xlhdr->t_infomask2;
+			t_hoff = xlhdr->t_hoff;
+		}
 
 		change->data.tp.newtuple =
 			ReorderBufferAllocTupleBuf(ctx->reorder, datalen);
@@ -1191,9 +1230,9 @@ DecodeMultiInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 		memset(header, 0, SizeofHeapTupleHeader);
 
 		memcpy((char *) tuple->t_data + SizeofHeapTupleHeader, data, datalen);
-		header->t_infomask = xlhdr->t_infomask;
-		header->t_infomask2 = xlhdr->t_infomask2;
-		header->t_hoff = xlhdr->t_hoff;
+		header->t_infomask = t_infomask;
+		header->t_infomask2 = t_infomask2;
+		header->t_hoff = t_hoff;
 
 		/*
 		 * Reset toast reassembly state only after the last row in the last
@@ -1209,7 +1248,7 @@ DecodeMultiInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 		ReorderBufferQueueChange(ctx->reorder, XLogRecGetXid(r),
 								 buf->origptr, change, false);
 
-		/* move to the next xl_multi_insert_tuple entry */
+		/* move to the next tuple entry */
 		data += datalen;
 	}
 	Assert(data == tupledata + tuplelen);
