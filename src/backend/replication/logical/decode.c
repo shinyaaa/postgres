@@ -1155,8 +1155,14 @@ DecodeMultiInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 	common_header = (xlrec->flags & XLH_INSERT_COMMON_HEADER) != 0;
 	if (common_header)
 	{
-		bool	isinit = (XLogRecGetInfo(r) & XLOG_HEAP_INIT_PAGE) != 0;
-		char   *maindata = (char *) xlrec;
+		bool		isinit = (XLogRecGetInfo(r) & XLOG_HEAP_INIT_PAGE) != 0;
+		Size		expected;
+		char	   *maindata = (char *) xlrec;
+
+		expected = SizeOfHeapMultiInsert +
+			(isinit ? 0 : xlrec->ntuples * sizeof(OffsetNumber)) +
+			SizeOfHeapHeader;
+		Assert(XLogRecGetDataLen(r) >= expected);
 
 		maindata += SizeOfHeapMultiInsert;
 		if (!isinit)

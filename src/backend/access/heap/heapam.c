@@ -2474,8 +2474,16 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 			 * Check if all tuples on this page share the same t_infomask2,
 			 * t_infomask, and t_hoff.  If so, we can store these fields
 			 * once in the main data as a common header, and omit the
-			 * per-tuple xl_multi_insert_tuple headers, saving about 5+
+			 * per-tuple xl_multi_insert_tuple headers, saving about 6
 			 * bytes per tuple.
+			 *
+			 * This runtime check is necessary because heap_form_tuple() sets
+			 * structural flags such as HEAP_HASNULL and HEAP_HASVARWIDTH
+			 * per-tuple based on actual column values, and t_hoff varies
+			 * with the null bitmap size.  For example, a batch of tuples
+			 * where some rows have NULLs and others don't will have
+			 * differing t_infomask/t_hoff.  In the common case (e.g. COPY
+			 * with no NULLs), all tuples are uniform and we get the savings.
 			 */
 			common_header = (nthispage > 1);
 			if (common_header)
@@ -2515,11 +2523,12 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 			 */
 			if (common_header)
 			{
-				xl_heap_header *common_hdr = (xl_heap_header *) scratchptr;
+				xl_heap_header common_hdr;
 
-				common_hdr->t_infomask2 = heaptuples[ndone]->t_data->t_infomask2;
-				common_hdr->t_infomask = heaptuples[ndone]->t_data->t_infomask;
-				common_hdr->t_hoff = heaptuples[ndone]->t_data->t_hoff;
+				common_hdr.t_infomask2 = heaptuples[ndone]->t_data->t_infomask2;
+				common_hdr.t_infomask = heaptuples[ndone]->t_data->t_infomask;
+				common_hdr.t_hoff = heaptuples[ndone]->t_data->t_hoff;
+				memcpy(scratchptr, &common_hdr, SizeOfHeapHeader);
 				scratchptr += SizeOfHeapHeader;
 			}
 
@@ -2566,7 +2575,9 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 				if (common_header)
 				{
 					/* Store only datalen + raw tuple data */
-					memcpy(scratchptr, &datalen, sizeof(uint16));
+					uint16		datalen_short = (uint16) datalen;
+
+					memcpy(scratchptr, &datalen_short, sizeof(uint16));
 					scratchptr += sizeof(uint16);
 				}
 				else
