@@ -1530,6 +1530,7 @@ CopyFrom(CopyFromState cstate)
  * 'options': List of DefElem. See copy_opt_item in gram.y for selections.
  *
  * Returns a CopyFromState, to be passed to NextCopyFrom and related functions.
+ * After all tuples have been processed, call EndCopyFrom to release resources.
  */
 CopyFromState
 BeginCopyFrom(ParseState *pstate,
