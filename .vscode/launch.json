@@ -49,6 +49,41 @@
             ]
         },
         {
+            // logical replication tablesync worker にアタッチ
+            // sync worker は bgworker として起動し post_auth_delay が適用される
+            // (bgworker.c:768  pg_usleep(PostAuthDelay * 1000000L))
+            //
+            // PID 取得:
+            //   SELECT pid, relid
+            //   FROM pg_stat_subscription
+            //   WHERE worker_type = 'table synchronization';
+            //
+            // 猶予時間の作り方:
+            //   postgresql.conf に  post_auth_delay = 15  を追加して reload/再起動。
+            //   subscription を作成 / テーブル追加をトリガーに sync worker が起動し、
+            //   entry point (TableSyncWorkerMain) の直前に 15 秒スリープする。
+            //   その間に pg_stat_subscription で PID を確認してアタッチすること。
+            "name": "Attach to logical replication sync worker",
+            "type": "cppdbg",
+            "request": "attach",
+            "program": "${workspaceFolder}/src/backend/postgres",
+            "processId": "${input:syncWorkerPid}",
+            "MIMode": "gdb",
+            "miDebuggerPath": "/usr/bin/gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Load PostgreSQL GDB helpers",
+                    "text": "source ${workspaceFolder}/.gdbinit",
+                    "ignoreFailures": true
+                }
+            ]
+        },
+        {
             // postmaster プロセス自体にアタッチ
             "name": "Attach to postmaster",
             "type": "cppdbg",
@@ -86,6 +121,11 @@
             "id": "backendPid",
             "type": "promptString",
             "description": "PostgreSQL backend PID  (psql: SELECT pg_backend_pid();)"
+        },
+        {
+            "id": "syncWorkerPid",
+            "type": "promptString",
+            "description": "sync worker PID  (psql: SELECT pid,relid FROM pg_stat_subscription WHERE worker_type='table synchronization';)"
         },
         {
             "id": "postmasterPid",

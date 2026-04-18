@@ -13,6 +13,17 @@
             "problemMatcher": []
         },
         {
+            "label": "Show logical replication sync worker PIDs",
+            "type": "shell",
+            "command": "psql -c \"SELECT pid, subname, relid, worker_type FROM pg_stat_subscription WHERE worker_type = 'table synchronization';\"",
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared",
+                "focus": true
+            },
+            "problemMatcher": []
+        },
+        {
             "label": "Show postmaster PID",
             "type": "shell",
             "command": "head -1 \"${env:PGDATA}/postmaster.pid\" 2>/dev/null || echo 'PGDATA not set or postmaster not running'",
