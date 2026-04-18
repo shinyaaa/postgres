@@ -1,0 +1,27 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Show PostgreSQL backend PIDs",
+            "type": "shell",
+            "command": "ps -eo pid,command | grep 'postgres:' | grep -v grep",
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared",
+                "focus": true
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Show postmaster PID",
+            "type": "shell",
+            "command": "head -1 \"${env:PGDATA}/postmaster.pid\" 2>/dev/null || echo 'PGDATA not set or postmaster not running'",
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared",
+                "focus": true
+            },
+            "problemMatcher": []
+        }
+    ]
+}

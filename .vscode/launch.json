@@ -1,0 +1,96 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            // プロセスリストからバックエンドを選択してアタッチ
+            // 接続前に postgresql.conf で post_auth_delay = 15 を設定し、
+            // psql 接続後の猶予時間中にアタッチすること
+            "name": "Attach to PostgreSQL backend (pick process)",
+            "type": "cppdbg",
+            "request": "attach",
+            "program": "${workspaceFolder}/src/backend/postgres",
+            "processId": "${command:pickProcess}",
+            "MIMode": "gdb",
+            "miDebuggerPath": "/usr/bin/gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Load PostgreSQL GDB helpers",
+                    "text": "source ${workspaceFolder}/.gdbinit",
+                    "ignoreFailures": true
+                }
+            ]
+        },
+        {
+            // PIDを直接入力してアタッチ
+            // psql で SELECT pg_backend_pid(); を実行して PID を取得する
+            "name": "Attach to PostgreSQL backend (enter PID)",
+            "type": "cppdbg",
+            "request": "attach",
+            "program": "${workspaceFolder}/src/backend/postgres",
+            "processId": "${input:backendPid}",
+            "MIMode": "gdb",
+            "miDebuggerPath": "/usr/bin/gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Load PostgreSQL GDB helpers",
+                    "text": "source ${workspaceFolder}/.gdbinit",
+                    "ignoreFailures": true
+                }
+            ]
+        },
+        {
+            // postmaster プロセス自体にアタッチ
+            "name": "Attach to postmaster",
+            "type": "cppdbg",
+            "request": "attach",
+            "program": "${workspaceFolder}/src/backend/postgres",
+            "processId": "${input:postmasterPid}",
+            "MIMode": "gdb",
+            "miDebuggerPath": "/usr/bin/gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Load PostgreSQL GDB helpers",
+                    "text": "source ${workspaceFolder}/.gdbinit",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Follow child on fork",
+                    "text": "set follow-fork-mode child",
+                    "ignoreFailures": false
+                },
+                {
+                    "description": "Detach from parent on fork",
+                    "text": "set detach-on-fork on",
+                    "ignoreFailures": false
+                }
+            ]
+        }
+    ],
+    "inputs": [
+        {
+            "id": "backendPid",
+            "type": "promptString",
+            "description": "PostgreSQL backend PID  (psql: SELECT pg_backend_pid();)"
+        },
+        {
+            "id": "postmasterPid",
+            "type": "promptString",
+            "description": "postmaster PID  (pg_ctl status / head -1 $PGDATA/postmaster.pid)"
+        }
+    ]
+}
