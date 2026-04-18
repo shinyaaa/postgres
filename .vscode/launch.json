@@ -2,9 +2,6 @@
     "version": "0.2.0",
     "configurations": [
         {
-            // プロセスリストからバックエンドを選択してアタッチ
-            // 接続前に postgresql.conf で post_auth_delay = 15 を設定し、
-            // psql 接続後の猶予時間中にアタッチすること
             "name": "Attach to PostgreSQL backend (pick process)",
             "type": "cppdbg",
             "request": "attach",
@@ -26,8 +23,6 @@
             ]
         },
         {
-            // PIDを直接入力してアタッチ
-            // psql で SELECT pg_backend_pid(); を実行して PID を取得する
             "name": "Attach to PostgreSQL backend (enter PID)",
             "type": "cppdbg",
             "request": "attach",
@@ -49,20 +44,6 @@
             ]
         },
         {
-            // logical replication tablesync worker にアタッチ
-            // sync worker は bgworker として起動し post_auth_delay が適用される
-            // (bgworker.c:768  pg_usleep(PostAuthDelay * 1000000L))
-            //
-            // PID 取得:
-            //   SELECT pid, relid
-            //   FROM pg_stat_subscription
-            //   WHERE worker_type = 'table synchronization';
-            //
-            // 猶予時間の作り方:
-            //   postgresql.conf に  post_auth_delay = 15  を追加して reload/再起動。
-            //   subscription を作成 / テーブル追加をトリガーに sync worker が起動し、
-            //   entry point (TableSyncWorkerMain) の直前に 15 秒スリープする。
-            //   その間に pg_stat_subscription で PID を確認してアタッチすること。
             "name": "Attach to logical replication sync worker",
             "type": "cppdbg",
             "request": "attach",
@@ -84,7 +65,6 @@
             ]
         },
         {
-            // postmaster プロセス自体にアタッチ
             "name": "Attach to postmaster",
             "type": "cppdbg",
             "request": "attach",
