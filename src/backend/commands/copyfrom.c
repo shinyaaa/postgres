@@ -84,6 +84,11 @@ typedef struct CopyMultiInsertBuffer
 	BulkInsertState bistate;	/* BulkInsertState for this rel if plain
 								 * table; NULL if foreign table */
 	int			nused;			/* number of 'slots' containing tuples */
+	bool		skip_per_tuple_post;	/* True iff the target relation has no
+										 * indexes and no AFTER ROW or
+										 * transition-table insert triggers,
+										 * so the post-flush loop only needs
+										 * ExecClearTuple() per slot. */
 	uint64		linenos[MAX_BUFFERED_TUPLES];	/* Line # of tuple in copy
 												 * stream */
 } CopyMultiInsertBuffer;
@@ -365,12 +370,24 @@ static CopyMultiInsertBuffer *
 CopyMultiInsertBufferInit(ResultRelInfo *rri)
 {
 	CopyMultiInsertBuffer *buffer;
+	TriggerDesc *td = rri->ri_TrigDesc;
 
 	buffer = palloc_object(CopyMultiInsertBuffer);
 	memset(buffer->slots, 0, sizeof(TupleTableSlot *) * MAX_BUFFERED_TUPLES);
 	buffer->resultRelInfo = rri;
 	buffer->bistate = (rri->ri_FdwRoutine == NULL) ? GetBulkInsertState() : NULL;
 	buffer->nused = 0;
+
+	/*
+	 * If the target relation has no indexes and no AFTER ROW or
+	 * transition-table insert triggers, the post-flush loop has nothing
+	 * per-tuple to do besides ExecClearTuple().  Pre-compute that here so we
+	 * can take a tighter loop in CopyMultiInsertBufferFlush().
+	 */
+	buffer->skip_per_tuple_post =
+		(rri->ri_NumIndices == 0) &&
+		(td == NULL ||
+		 (!td->trig_insert_after_row && !td->trig_insert_new_table));
 
 	return buffer;
 }
@@ -537,7 +554,6 @@ CopyMultiInsertBufferFlush(CopyMultiInsertInfo *miinfo,
 		CommandId	mycid = miinfo->mycid;
 		uint32		ti_options = miinfo->ti_options;
 		bool		line_buf_valid = cstate->line_buf_valid;
-		uint64		save_cur_lineno = cstate->cur_lineno;
 		MemoryContext oldcontext;
 
 		Assert(buffer->bistate != NULL);
@@ -561,42 +577,58 @@ CopyMultiInsertBufferFlush(CopyMultiInsertInfo *miinfo,
 						   buffer->bistate);
 		MemoryContextSwitchTo(oldcontext);
 
-		for (i = 0; i < nused; i++)
+		if (buffer->skip_per_tuple_post)
 		{
 			/*
-			 * If there are any indexes, update them for all the inserted
-			 * tuples, and run AFTER ROW INSERT triggers.
+			 * Hot path: no indexes and no AFTER ROW / transition-table
+			 * triggers, so there is nothing per tuple to do besides releasing
+			 * the slot.  cur_lineno is not touched, so no save/restore is
+			 * needed.
 			 */
-			if (resultRelInfo->ri_NumIndices > 0)
-			{
-				List	   *recheckIndexes;
+			for (i = 0; i < nused; i++)
+				ExecClearTuple(slots[i]);
+		}
+		else
+		{
+			uint64		save_cur_lineno = cstate->cur_lineno;
 
-				cstate->cur_lineno = buffer->linenos[i];
-				recheckIndexes =
-					ExecInsertIndexTuples(resultRelInfo,
-										  estate, 0, buffer->slots[i],
-										  NIL, NULL);
-				ExecARInsertTriggers(estate, resultRelInfo,
-									 slots[i], recheckIndexes,
-									 cstate->transition_capture);
-				list_free(recheckIndexes);
-			}
-
-			/*
-			 * There's no indexes, but see if we need to run AFTER ROW INSERT
-			 * triggers anyway.
-			 */
-			else if (resultRelInfo->ri_TrigDesc != NULL &&
-					 (resultRelInfo->ri_TrigDesc->trig_insert_after_row ||
-					  resultRelInfo->ri_TrigDesc->trig_insert_new_table))
+			for (i = 0; i < nused; i++)
 			{
 				cstate->cur_lineno = buffer->linenos[i];
-				ExecARInsertTriggers(estate, resultRelInfo,
-									 slots[i], NIL,
-									 cstate->transition_capture);
+
+				if (resultRelInfo->ri_NumIndices > 0)
+				{
+					List	   *recheckIndexes;
+
+					recheckIndexes =
+						ExecInsertIndexTuples(resultRelInfo,
+											  estate, 0, buffer->slots[i],
+											  NIL, NULL);
+					ExecARInsertTriggers(estate, resultRelInfo,
+										 slots[i], recheckIndexes,
+										 cstate->transition_capture);
+					list_free(recheckIndexes);
+				}
+				else
+				{
+					/*
+					 * No indexes; skip_per_tuple_post is false, so we know
+					 * there is at least one AFTER ROW or transition-table
+					 * insert trigger.
+					 */
+					Assert(resultRelInfo->ri_TrigDesc != NULL &&
+						   (resultRelInfo->ri_TrigDesc->trig_insert_after_row ||
+							resultRelInfo->ri_TrigDesc->trig_insert_new_table));
+					ExecARInsertTriggers(estate, resultRelInfo,
+										 slots[i], NIL,
+										 cstate->transition_capture);
+				}
+
+				ExecClearTuple(slots[i]);
 			}
 
-			ExecClearTuple(slots[i]);
+			/* reset cur_lineno to what it was */
+			cstate->cur_lineno = save_cur_lineno;
 		}
 
 		/* Update the row counter and progress of the COPY command */
@@ -604,9 +636,8 @@ CopyMultiInsertBufferFlush(CopyMultiInsertInfo *miinfo,
 		pgstat_progress_update_param(PROGRESS_COPY_TUPLES_PROCESSED,
 									 *processed);
 
-		/* reset cur_lineno and line_buf_valid to what they were */
+		/* reset line_buf_valid to what it was */
 		cstate->line_buf_valid = line_buf_valid;
-		cstate->cur_lineno = save_cur_lineno;
 	}
 
 	/* Mark that all slots are free */
