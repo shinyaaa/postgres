@@ -353,16 +353,20 @@ heap2_desc(StringInfo buf, XLogReaderState *record)
 	{
 		xl_heap_multi_insert *xlrec = (xl_heap_multi_insert *) rec;
 		bool		isinit = (XLogRecGetInfo(record) & XLOG_HEAP_INIT_PAGE) != 0;
+		bool		aggregated = (xlrec->flags & XLH_INSERT_AGGREGATED) != 0;
 
 		appendStringInfo(buf, "ntuples: %d, flags: 0x%02X", xlrec->ntuples,
 						 xlrec->flags);
+
+		if (aggregated)
+			appendStringInfo(buf, ", nblocks: %d", XLogRecMaxBlockId(record) + 1);
 
 		if (xlrec->flags & XLH_INSERT_ALL_FROZEN_SET)
 			appendStringInfo(buf, ", vm_flags: 0x%02X",
 							 VISIBILITYMAP_ALL_VISIBLE |
 							 VISIBILITYMAP_ALL_FROZEN);
 
-		if (XLogRecHasBlockData(record, 0) && !isinit)
+		if (XLogRecHasBlockData(record, 0) && !isinit && !aggregated)
 		{
 			appendStringInfoString(buf, ", offsets:");
 			array_desc(buf, xlrec->offsets, sizeof(OffsetNumber),

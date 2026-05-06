@@ -487,6 +487,129 @@ heap_xlog_insert(XLogReaderState *record)
 
 /*
  * Replay XLOG_HEAP2_MULTI_INSERT records.
+ *
+ * Two on-disk forms exist:
+ *  - Single-block: block 0 carries all tuples; PD_ALL_VISIBLE clearing and
+ *    XLH_INSERT_ALL_FROZEN_SET (with VM at block 1) are supported.
+ *  - Aggregated (XLH_INSERT_AGGREGATED): blocks 0..N-1 are all INIT_PAGE
+ *    heap blocks. Each block's data starts with a uint16 tuple count
+ *    followed by xl_multi_insert_tuple/data entries, exactly as in the
+ *    single-block INIT_PAGE form.
+ */
+static void
+heap_xlog_multi_insert_block(XLogReaderState *record, uint8 block_id,
+							 BlockNumber blkno, RelFileLocator rlocator,
+							 bool isinit, uint16 ntuples_in_block,
+							 char **tupdata_inout, char *endptr,
+							 uint8 flags, Size *freespace_out,
+							 XLogRedoAction *action_out)
+{
+	XLogRecPtr	lsn = record->EndRecPtr;
+	Buffer		buffer;
+	Page		page;
+	XLogRedoAction action;
+	union
+	{
+		HeapTupleHeaderData hdr;
+		char		data[MaxHeapTupleSize];
+	}			tbuf;
+	HeapTupleHeader htup;
+	uint32		newlen;
+	char	   *tupdata = *tupdata_inout;
+
+	if (isinit)
+	{
+		buffer = XLogInitBufferForRedo(record, block_id);
+		page = BufferGetPage(buffer);
+		PageInit(page, BufferGetPageSize(buffer), 0);
+		action = BLK_NEEDS_REDO;
+	}
+	else
+		action = XLogReadBufferForRedo(record, block_id, &buffer);
+
+	if (action == BLK_NEEDS_REDO)
+	{
+		uint16		i;
+
+		page = BufferGetPage(buffer);
+
+		for (i = 0; i < ntuples_in_block; i++)
+		{
+			OffsetNumber offnum;
+			xl_multi_insert_tuple *xlhdr;
+
+			/*
+			 * For INIT_PAGE forms (including aggregated), tuples are stored
+			 * sequentially starting at FirstOffsetNumber.  The non-INIT
+			 * single-block form uses an explicit offsets array kept in the
+			 * caller.
+			 */
+			if (isinit)
+				offnum = FirstOffsetNumber + i;
+			else
+			{
+				/* Caller-managed offset array; not reached in aggregated path */
+				elog(PANIC, "non-init aggregated multi-insert is unsupported");
+				offnum = InvalidOffsetNumber;	/* keep compiler quiet */
+			}
+
+			if (PageGetMaxOffsetNumber(page) + 1 < offnum)
+				elog(PANIC, "invalid max offset number");
+
+			xlhdr = (xl_multi_insert_tuple *) SHORTALIGN(tupdata);
+			tupdata = ((char *) xlhdr) + SizeOfMultiInsertTuple;
+
+			newlen = xlhdr->datalen;
+			Assert(newlen <= MaxHeapTupleSize);
+			htup = &tbuf.hdr;
+			MemSet(htup, 0, SizeofHeapTupleHeader);
+			memcpy((char *) htup + SizeofHeapTupleHeader,
+				   tupdata, newlen);
+			tupdata += newlen;
+
+			newlen += SizeofHeapTupleHeader;
+			htup->t_infomask2 = xlhdr->t_infomask2;
+			htup->t_infomask = xlhdr->t_infomask;
+			htup->t_hoff = xlhdr->t_hoff;
+			HeapTupleHeaderSetXmin(htup, XLogRecGetXid(record));
+			HeapTupleHeaderSetCmin(htup, FirstCommandId);
+			ItemPointerSetBlockNumber(&htup->t_ctid, blkno);
+			ItemPointerSetOffsetNumber(&htup->t_ctid, offnum);
+
+			offnum = PageAddItem(page, htup, newlen, offnum, true, true);
+			if (offnum == InvalidOffsetNumber)
+				elog(PANIC, "failed to add tuple");
+		}
+
+		if (tupdata > endptr)
+			elog(PANIC, "tuple data overran block buffer");
+
+		*freespace_out = PageGetHeapFreeSpace(page);
+
+		PageSetLSN(page, lsn);
+
+		if (flags & XLH_INSERT_ALL_VISIBLE_CLEARED)
+			PageClearAllVisible(page);
+		if (flags & XLH_INSERT_ALL_FROZEN_SET)
+		{
+			PageSetAllVisible(page);
+			PageClearPrunable(page);
+		}
+		else
+			PageSetPrunable(page, XLogRecGetXid(record));
+
+		MarkBufferDirty(buffer);
+	}
+
+	*tupdata_inout = tupdata;
+	*action_out = action;
+
+	if (BufferIsValid(buffer))
+		UnlockReleaseBuffer(buffer);
+}
+
+/*
+ * Replay XLOG_HEAP2_MULTI_INSERT records.
  */
 static void
 heap_xlog_multi_insert(XLogReaderState *record)
@@ -510,11 +633,60 @@ heap_xlog_multi_insert(XLogReaderState *record)
 	XLogRedoAction action;
 	Buffer		vmbuffer = InvalidBuffer;
 
-	/*
-	 * Insertion doesn't overwrite MVCC data, so no conflict processing is
-	 * required.
-	 */
 	xlrec = (xl_heap_multi_insert *) XLogRecGetData(record);
+
+	/*
+	 * Aggregated form: process every referenced block.  The aggregated form
+	 * is INIT_PAGE-only and never carries XLH_INSERT_ALL_FROZEN_SET, so we
+	 * don't have to deal with VM blocks here.
+	 */
+	if (xlrec->flags & XLH_INSERT_AGGREGATED)
+	{
+		uint8		nblocks = XLogRecMaxBlockId(record) + 1;
+		uint16		total_seen = 0;
+		XLogRedoAction last_action = BLK_NOTFOUND;
+
+		Assert(isinit);
+		Assert(!(xlrec->flags & XLH_INSERT_ALL_FROZEN_SET));
+
+		for (i = 0; i < (int) nblocks; i++)
+		{
+			char	   *tupdata;
+			char	   *endptr;
+			Size		blklen;
+			uint16		nblk16;
+			RelFileLocator blk_rl;
+			BlockNumber blk_no;
+			XLogRedoAction blk_action;
+			Size		blk_freespace = 0;
+
+			XLogRecGetBlockTag(record, i, &blk_rl, NULL, &blk_no);
+
+			tupdata = XLogRecGetBlockData(record, i, &blklen);
+			endptr = tupdata + blklen;
+
+			memcpy(&nblk16, tupdata, sizeof(uint16));
+			tupdata += sizeof(uint16);
+			total_seen += nblk16;
+
+			heap_xlog_multi_insert_block(record, (uint8) i, blk_no, blk_rl,
+										 true /* isinit */, nblk16,
+										 &tupdata, endptr, xlrec->flags,
+										 &blk_freespace, &blk_action);
+
+			if (blk_action == BLK_NEEDS_REDO && blk_freespace < BLCKSZ / 5)
+				XLogRecordPageWithFreeSpace(blk_rl, blk_no, blk_freespace);
+
+			last_action = blk_action;
+		}
+
+		if (total_seen != xlrec->ntuples)
+			elog(PANIC, "aggregated multi-insert tuple count mismatch (%u vs %u)",
+				 total_seen, xlrec->ntuples);
+
+		(void) last_action;		/* unused */
+		return;
+	}
 
 	XLogRecGetBlockTag(record, 0, &rlocator, NULL, &blkno);
 

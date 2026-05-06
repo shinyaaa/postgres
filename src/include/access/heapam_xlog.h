@@ -79,6 +79,16 @@
 #define XLH_INSERT_ALL_FROZEN_SET				(1<<5)
 
 /*
+ * Set on multi-insert records that span more than one heap block.  When this
+ * flag is set, every block referenced by the record is INIT_PAGE (the pages
+ * were freshly extended), and each block's data is preceded by a uint16
+ * giving the number of tuples on that block.  The xl_heap_multi_insert
+ * 'ntuples' field is the total tuple count across all blocks, and the
+ * 'offsets' array is omitted (since INIT_PAGE is implied).
+ */
+#define XLH_INSERT_AGGREGATED					(1<<6)
+
+/*
  * xl_heap_update flag values, 8 bits are available.
  */
 /* PD_ALL_VISIBLE was cleared */
@@ -174,11 +184,18 @@ typedef struct xl_heap_insert
  *
  * The main data of the record consists of this xl_heap_multi_insert header.
  * 'offsets' array is omitted if the whole page is reinitialized
- * (XLOG_HEAP_INIT_PAGE).
+ * (XLOG_HEAP_INIT_PAGE) -- this includes the aggregated form below.
  *
  * In block 0's data portion, there is an xl_multi_insert_tuple struct,
  * followed by the tuple data for each tuple. There is padding to align
  * each xl_multi_insert_tuple struct.
+ *
+ * Aggregated form (XLH_INSERT_AGGREGATED set):
+ *   The record references multiple blocks (block_id 0 .. nblocks-1), each of
+ *   which is INIT_PAGE.  Each block's data starts with a uint16 carrying
+ *   the per-block tuple count, followed by xl_multi_insert_tuple structs
+ *   plus tuple data exactly as in the single-block case.  ntuples below is
+ *   the SUM across all blocks (used as a sanity check on replay).
  */
 typedef struct xl_heap_multi_insert
 {

@@ -47,6 +47,7 @@
 #include "pgstat.h"
 #include "port/pg_bitutils.h"
 #include "storage/lmgr.h"
+#include "storage/freespace.h"
 #include "storage/predicate.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
@@ -2268,6 +2269,53 @@ heap_multi_insert_pages(HeapTuple *heaptuples, int done, int ntuples, Size saveF
 }
 
 /*
+ * Helper for heap_multi_insert() that, given a buffer whose page is
+ * about to be filled and the index of the first tuple, returns how many of
+ * the upcoming tuples will fit on the page.  This mirrors the per-tuple
+ * fit check used in the actual insertion loop, but does not modify the
+ * page so it can be called outside a critical section.  The caller has
+ * already established (via RelationGetBufferForTuple) that the tuple at
+ * 'base' fits.
+ */
+static int
+heap_multi_insert_count_fits(HeapTuple *heaptuples, int base, int ntuples,
+							 Page page, Size saveFreeSpace)
+{
+	int			n = 1;			/* first tuple guaranteed to fit */
+	Size		remaining = PageGetHeapFreeSpace(page);
+
+	/* Account for the guaranteed first tuple's storage. */
+	remaining -= MAXALIGN(heaptuples[base]->t_len) + sizeof(ItemIdData);
+
+	while (base + n < ntuples)
+	{
+		Size		need = MAXALIGN(heaptuples[base + n]->t_len);
+
+		/*
+		 * Mirror the check from heap_multi_insert()'s inner loop: a tuple
+		 * fits if PageGetHeapFreeSpace() (here represented by 'remaining')
+		 * is at least MAXALIGN(t_len) + saveFreeSpace.
+		 */
+		if (remaining < need + saveFreeSpace)
+			break;
+
+		remaining -= need + sizeof(ItemIdData);
+		n++;
+	}
+
+	return n;
+}
+
+/*
+ * Maximum number of heap blocks that heap_multi_insert() will fold into a
+ * single XLOG_HEAP2_MULTI_INSERT WAL record.  Capped well below
+ * XLR_MAX_BLOCK_ID (32) to keep the maximum critical-section duration and
+ * the worst-case scratch buffer footprint modest while still amortising
+ * the per-record overhead.
+ */
+#define HEAP_MULTI_INSERT_AGG_MAX	4
+
+/*
  *	heap_multi_insert	- insert multiple tuples into a heap
  *
  * This is like heap_insert(), but inserts multiple tuples in one operation.
@@ -2353,6 +2401,247 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 		int			nthispage;
 
 		CHECK_FOR_INTERRUPTS();
+
+		/*
+		 * Aggregated WAL path: bulk-extend several brand-new heap blocks via
+		 * ExtendBufferedRelBy(), fill them all, and emit a single
+		 * XLOG_HEAP2_MULTI_INSERT record covering all of them.  This
+		 * amortises the per-record WAL overhead (XLogRecord, block reference
+		 * headers, CRC) across multiple pages.
+		 *
+		 * We only attempt this when:
+		 *   - we are emitting WAL,
+		 *   - the caller isn't using HEAP_INSERT_FROZEN (which entangles VM
+		 *     updates with the per-record flags),
+		 *   - we don't need to take care of bistate state that conflicts
+		 *     with bulk extension (existing partial page or pre-extended
+		 *     blocks already cached in bistate),
+		 *   - and at least two pages worth of remaining tuples justify the
+		 *     work.
+		 *
+		 * On success the block advances 'ndone' and continues the outer
+		 * loop; otherwise it leaves the loop state untouched and the
+		 * existing single-page logic handles this iteration.
+		 */
+		if (needwal && !(options & HEAP_INSERT_FROZEN) &&
+			ndone + 1 < ntuples &&
+			(bistate == NULL ||
+			 (bistate->current_buf == InvalidBuffer &&
+			  bistate->next_free == InvalidBlockNumber)))
+		{
+			Buffer		agg_bufs[HEAP_MULTI_INSERT_AGG_MAX];
+			int			agg_n[HEAP_MULTI_INSERT_AGG_MAX];
+			int			wanted_pages;
+			int			extend_target;
+			int			agg_count = 0;
+
+			wanted_pages = heap_multi_insert_pages(heaptuples, ndone, ntuples,
+												   saveFreeSpace);
+			extend_target = Min(wanted_pages, HEAP_MULTI_INSERT_AGG_MAX);
+
+			if (extend_target >= 2)
+			{
+				uint32		extended;
+				uint32		k;
+
+				ExtendBufferedRelBy(BMR_REL(relation), MAIN_FORKNUM,
+									bistate ? bistate->strategy : NULL,
+									EB_LOCK_FIRST,
+									(uint32) extend_target,
+									agg_bufs, &extended);
+
+				if (extended >= 2)
+				{
+					/*
+					 * EB_LOCK_FIRST locks only buffer 0; lock the rest, and
+					 * make sure every page is initialised.  All extended
+					 * pages have monotonically increasing block numbers, so
+					 * locking them in array order respects standard
+					 * page-locking discipline.
+					 */
+					for (k = 0; k < extended; k++)
+					{
+						Page		p = BufferGetPage(agg_bufs[k]);
+
+						if (k > 0)
+							LockBuffer(agg_bufs[k], BUFFER_LOCK_EXCLUSIVE);
+						if (PageIsNew(p))
+							PageInit(p, BLCKSZ, 0);
+					}
+
+					agg_count = (int) extended;
+				}
+				else if (extended == 1)
+				{
+					/* Couldn't bulk-extend; release and fall back. */
+					UnlockReleaseBuffer(agg_bufs[0]);
+					agg_count = 0;
+				}
+			}
+
+			if (agg_count >= 2)
+			{
+				/* Determine how many tuples each page can host. */
+				int			tup_idx = ndone;
+				int			ai;
+				int			agg_total = 0;
+				int			used_pages = 0;
+				XLogRecPtr	recptr;
+				xl_heap_multi_insert *xlrec;
+				uint8		info = XLOG_HEAP2_MULTI_INSERT | XLOG_HEAP_INIT_PAGE;
+				char	   *scratch_main;
+				char	   *scratch_blk;
+				Size		blk_datalen[HEAP_MULTI_INSERT_AGG_MAX];
+
+				for (ai = 0; ai < agg_count && tup_idx < ntuples; ai++)
+				{
+					Page		p = BufferGetPage(agg_bufs[ai]);
+					int			nfit;
+
+					nfit = heap_multi_insert_count_fits(heaptuples, tup_idx,
+														ntuples, p,
+														saveFreeSpace);
+					agg_n[ai] = nfit;
+					agg_total += nfit;
+					tup_idx += nfit;
+					used_pages++;
+				}
+
+				/*
+				 * If some extended pages didn't get any tuples (shouldn't
+				 * happen given heap_multi_insert_pages() agrees, but be
+				 * defensive), release them so they can be picked up by
+				 * later inserters via FSM.
+				 */
+				while (used_pages < agg_count)
+				{
+					Buffer		extra = agg_bufs[used_pages];
+					Page		p = BufferGetPage(extra);
+					Size		fs;
+
+					fs = PageGetHeapFreeSpace(p);
+					LockBuffer(extra, BUFFER_LOCK_UNLOCK);
+					RecordPageWithFreeSpace(relation,
+											BufferGetBlockNumber(extra), fs);
+					ReleaseBuffer(extra);
+					used_pages++;
+				}
+				agg_count = ai;
+
+				if (agg_count < 2)
+				{
+					/* Only one page actually needed; release and fall back. */
+					if (agg_count == 1)
+						UnlockReleaseBuffer(agg_bufs[0]);
+					goto agg_fallback;
+				}
+
+				scratch_main = palloc(SizeOfHeapMultiInsert);
+				scratch_blk = palloc((Size) HEAP_MULTI_INSERT_AGG_MAX * BLCKSZ);
+
+				xlrec = (xl_heap_multi_insert *) scratch_main;
+				xlrec->flags = XLH_INSERT_AGGREGATED;
+				xlrec->ntuples = agg_total;
+				if (ndone + agg_total == ntuples)
+					xlrec->flags |= XLH_INSERT_LAST_IN_MULTI;
+				if (need_tuple_data)
+					xlrec->flags |= XLH_INSERT_CONTAINS_NEW_TUPLE;
+
+				tup_idx = ndone;
+
+				START_CRIT_SECTION();
+
+				/* Fill each page and prepare per-block WAL data. */
+				for (ai = 0; ai < agg_count; ai++)
+				{
+					Buffer		buf = agg_bufs[ai];
+					Page		p = BufferGetPage(buf);
+					int			n_in_block = agg_n[ai];
+					char	   *blkbuf = scratch_blk + ai * BLCKSZ;
+					char	   *bp = blkbuf;
+					int			j;
+					uint16		nblk16;
+
+					nblk16 = (uint16) n_in_block;
+					memcpy(bp, &nblk16, sizeof(uint16));
+					bp += sizeof(uint16);
+
+					for (j = 0; j < n_in_block; j++)
+					{
+						HeapTuple	heaptup = heaptuples[tup_idx + j];
+						xl_multi_insert_tuple *tuphdr;
+						int			datalen;
+
+						RelationPutHeapTuple(relation, buf, heaptup, false);
+
+						if (need_cids)
+							log_heap_new_cid(relation, heaptup);
+
+						/* Two-byte alignment for xl_multi_insert_tuple. */
+						tuphdr = (xl_multi_insert_tuple *) SHORTALIGN(bp);
+						bp = ((char *) tuphdr) + SizeOfMultiInsertTuple;
+
+						tuphdr->t_infomask2 = heaptup->t_data->t_infomask2;
+						tuphdr->t_infomask = heaptup->t_data->t_infomask;
+						tuphdr->t_hoff = heaptup->t_data->t_hoff;
+
+						datalen = heaptup->t_len - SizeofHeapTupleHeader;
+						memcpy(bp,
+							   (char *) heaptup->t_data + SizeofHeapTupleHeader,
+							   datalen);
+						tuphdr->datalen = datalen;
+						bp += datalen;
+					}
+
+					Assert((bp - blkbuf) <= BLCKSZ);
+					blk_datalen[ai] = bp - blkbuf;
+					tup_idx += n_in_block;
+
+					if (TransactionIdIsNormal(xid))
+						PageSetPrunable(p, xid);
+
+					MarkBufferDirty(buf);
+				}
+
+				/* Register everything and emit the WAL record. */
+				XLogBeginInsert();
+				XLogRegisterData(scratch_main, SizeOfHeapMultiInsert);
+
+				for (ai = 0; ai < agg_count; ai++)
+				{
+					int			bufflags = REGBUF_STANDARD | REGBUF_WILL_INIT;
+					char	   *blkbuf = scratch_blk + ai * BLCKSZ;
+
+					if (need_tuple_data)
+						bufflags |= REGBUF_KEEP_DATA;
+
+					XLogRegisterBuffer(ai, agg_bufs[ai], bufflags);
+					XLogRegisterBufData(ai, blkbuf, blk_datalen[ai]);
+				}
+
+				XLogSetRecordFlags(XLOG_INCLUDE_ORIGIN);
+				recptr = XLogInsert(RM_HEAP2_ID, info);
+
+				for (ai = 0; ai < agg_count; ai++)
+					PageSetLSN(BufferGetPage(agg_bufs[ai]), recptr);
+
+				END_CRIT_SECTION();
+
+				for (ai = 0; ai < agg_count; ai++)
+					UnlockReleaseBuffer(agg_bufs[ai]);
+
+				pfree(scratch_main);
+				pfree(scratch_blk);
+
+				ndone += agg_total;
+				starting_with_empty_page = true;
+				/* Force npages recomputation on next iteration. */
+				npages_used = npages;
+				continue;
+			}
+agg_fallback:
+			;					/* Fall through to single-page path. */
+		}
 
 		/*
 		 * Compute number of pages needed to fit the to-be-inserted tuples in
