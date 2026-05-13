@@ -231,6 +231,13 @@
   max => '10000',
 },
 
+{ name => 'autovacuum_warning', type => 'bool', context => 'PGC_SIGHUP', group => 'VACUUM_AUTOVACUUM',
+  short_desc => 'Enables warnings when autovacuum cannot keep up.',
+  long_desc => 'Write a message to the server log if autovacuum attempts to process a table that is already being vacuumed by another worker.',
+  variable => 'autovacuum_warning',
+  boot_val => 'false',
+},
+
 { name => 'autovacuum_vacuum_insert_scale_factor', type => 'real', context => 'PGC_SIGHUP', group => 'VACUUM_AUTOVACUUM',
   short_desc => 'Number of tuple inserts prior to vacuum as a fraction of reltuples.',
   variable => 'autovacuum_vac_ins_scale',
