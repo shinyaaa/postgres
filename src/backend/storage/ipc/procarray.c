@@ -58,11 +58,13 @@
 #include "pgstat.h"
 #include "postmaster/bgworker.h"
 #include "port/pg_lfind.h"
+#include "replication/slot.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
 #include "storage/procsignal.h"
 #include "storage/subsystems.h"
 #include "utils/acl.h"
+#include "utils/backend_status.h"
 #include "utils/builtins.h"
 #include "utils/injection_point.h"
 #include "utils/lsyscache.h"
@@ -1997,6 +1999,265 @@ GetReplicationHorizons(TransactionId *xmin, TransactionId *catalog_xmin)
 	 */
 	*xmin = horizons.shared_oldest_nonremovable_raw;
 	*catalog_xmin = horizons.slot_catalog_xmin;
+}
+
+/*
+ * Fetch the standby's application_name as reported by the walsender backend.
+ */
+static void
+GetStandbyAppname(int pid, char *name, Size len)
+{
+	int			nbackends = pgstat_fetch_stat_numbackends();
+
+	name[0] = '\0';
+
+	for (int i = 1; i <= nbackends; i++)
+	{
+		LocalPgBackendStatus *local_beentry;
+		PgBackendStatus *beentry;
+
+		local_beentry = pgstat_get_local_beentry_by_index(i);
+		if (local_beentry == NULL)
+			continue;
+
+		beentry = &local_beentry->backendStatus;
+		if (beentry->st_procpid != pid)
+			continue;
+
+		if (beentry->st_appname && beentry->st_appname[0] != '\0')
+			strlcpy(name, beentry->st_appname, len);
+		return;
+	}
+}
+
+/*
+ * Return XidHorizonBlockerType for a backend whose xid matches the horizon.
+ */
+static inline XidHorizonBlockerType
+XidHorizonBlockerTypeForBackend(const PGPROC *proc)
+{
+	if (proc->wait_event_info == WAIT_EVENT_CLIENT_READ)
+		return XHB_IDLE_IN_TRANSACTION;
+	return XHB_ACTIVE_TRANSACTION;
+}
+
+/*
+ * Return XidHorizonBlockerType for a backend whose xmin matches the horizon.
+ */
+static inline XidHorizonBlockerType
+XidHorizonBlockerTypeForXminBackend(const PGPROC *proc)
+{
+	if (proc->wait_event_info == WAIT_EVENT_CLIENT_READ)
+		return XHB_XMIN_IDLE_IN_TRANSACTION;
+	return XHB_XMIN_ACTIVE_TRANSACTION;
+}
+
+/*
+ * Find the blockers that are holding back the given xid horizon.
+ *
+ * This function searches for what is preventing the given horizon from being
+ * advanced to allow removal of dead tuples. It checks:
+ * 1. Active transactions (running statements)
+ * 2. Idle-in-transaction sessions
+ * 3. Prepared transactions
+ * 4. Hot standby feedback
+ * 5. Logical replication slots
+ *
+ * Because the horizon was computed earlier, the original blocker may have
+ * already committed by the time this function runs.  The result is therefore
+ * best-effort: it may return a different blocker, or no blocker at all.
+ *
+ * Returns a palloc'd array of blockers and stores the number of entries in
+ * *nblockers. The array may be empty if no blocker is found.
+ *
+ * Note: the same underlying cause (e.g. a physical replication slot with
+ * hot_standby_feedback) can appear as both an XHB_HOT_STANDBY_FEEDBACK entry
+ * (from the walsender PGPROC) and an XHB_REPLICATION_SLOT entry (from the
+ * slot's xmin).  Callers that consume all entries should be prepared for such
+ * duplicates.
+ */
+static XidHorizonBlocker *
+GetXidHorizonBlockers(TransactionId horizon, int *nblockers)
+{
+	ProcArrayStruct *arrayP = procArray;
+	TransactionId *other_xids = ProcGlobal->xids;
+	XidHorizonBlocker *result;
+	int			count = 0;
+	int			max_blockers;
+
+	Assert(TransactionIdIsValid(horizon));
+	Assert(nblockers != NULL);
+
+	/*
+	 * Allocate enough space for every PGPROC plus all replication slots. This
+	 * is a generous upper bound (typically only 0-2 entries are returned),
+	 * but keeps the logic simple for a diagnostic function that runs
+	 * infrequently.
+	 */
+	max_blockers = arrayP->maxProcs + max_replication_slots;
+	result = palloc0_array(XidHorizonBlocker, max_blockers);
+
+	LWLockAcquire(ProcArrayLock, LW_SHARED);
+
+	for (int index = 0; index < arrayP->numProcs; index++)
+	{
+		int			pgprocno = arrayP->pgprocnos[index];
+		PGPROC	   *proc = &allProcs[pgprocno];
+		int8		statusFlags = ProcGlobal->statusFlags[index];
+		TransactionId proc_xid;
+		TransactionId proc_xmin;
+		XidHorizonBlockerType candidate_type = XHB_NONE;
+		int			candidate_pid = 0;
+		TransactionId candidate_xid = InvalidTransactionId;
+
+		/*
+		 * Skip over backends either vacuuming (which is ok with rows being
+		 * removed, as long as pg_subtrans is not truncated), doing logical
+		 * decoding (which manages xmin separately, check below), or myself.
+		 */
+		if (statusFlags & (PROC_IN_VACUUM | PROC_IN_LOGICAL_DECODING) ||
+			proc == MyProc)
+			continue;
+
+		/* Fetch xid just once - see GetNewTransactionId */
+		proc_xid = UINT32_ACCESS_ONCE(other_xids[index]);
+		proc_xmin = UINT32_ACCESS_ONCE(proc->xmin);
+
+		/* Check if this proc's xid matches */
+		if (TransactionIdEquals(proc_xid, horizon))
+		{
+			if (proc->pid == 0)
+			{
+				candidate_type = XHB_PREPARED_TRANSACTION;
+				candidate_pid = 0;
+				candidate_xid = proc_xid;
+			}
+			else
+			{
+				candidate_type = XidHorizonBlockerTypeForBackend(proc);
+				candidate_pid = proc->pid;
+				candidate_xid = proc_xid;
+			}
+		}
+		/* Check if this proc's xmin matches */
+		else if (TransactionIdEquals(proc_xmin, horizon))
+		{
+			if (statusFlags & PROC_AFFECTS_ALL_HORIZONS)
+			{
+				candidate_type = XHB_HOT_STANDBY_FEEDBACK;
+				candidate_pid = proc->pid;
+				candidate_xid = proc_xmin;
+			}
+			else
+			{
+				candidate_type = XidHorizonBlockerTypeForXminBackend(proc);
+				candidate_pid = proc->pid;
+				candidate_xid = proc_xmin;
+			}
+		}
+
+		/*
+		 * If we found a candidate, record it. Candidates are collected in
+		 * ProcArray order; callers can reorder if needed.
+		 */
+		if (candidate_type != XHB_NONE)
+		{
+			XidHorizonBlocker *dst;
+
+			dst = &result[count++];
+			dst->type = candidate_type;
+			dst->pid = candidate_pid;
+			dst->xid = candidate_xid;
+		}
+	}
+
+	LWLockRelease(ProcArrayLock);
+
+	/*
+	 * Now that ProcArrayLock is released, fetch any extra details we want to
+	 * attach to blockers, such as prepared transaction GIDs and standby
+	 * application names.
+	 */
+	for (int i = 0; i < count; i++)
+	{
+		if (result[i].type == XHB_PREPARED_TRANSACTION)
+			GetPreparedTransactionGid(result[i].xid, result[i].name);
+		else if (result[i].type == XHB_HOT_STANDBY_FEEDBACK)
+			GetStandbyAppname(result[i].pid, result[i].name,
+							  sizeof(result[i].name));
+	}
+
+	/*
+	 * Also check replication slots.
+	 */
+	if (max_replication_slots > 0)
+	{
+		LWLockAcquire(ReplicationSlotControlLock, LW_SHARED);
+
+		for (int i = 0; i < max_replication_slots; i++)
+		{
+			ReplicationSlot *s = &ReplicationSlotCtl->replication_slots[i];
+			TransactionId slot_xmin;
+			TransactionId slot_catalog_xmin;
+
+			if (!s->in_use)
+				continue;
+
+			SpinLockAcquire(&s->mutex);
+			slot_xmin = s->data.xmin;
+			slot_catalog_xmin = s->data.catalog_xmin;
+			SpinLockRelease(&s->mutex);
+
+			if (TransactionIdEquals(slot_xmin, horizon) ||
+				TransactionIdEquals(slot_catalog_xmin, horizon))
+			{
+				XidHorizonBlocker *dst;
+
+				dst = &result[count++];
+				dst->type = XHB_REPLICATION_SLOT;
+				dst->pid = 0;
+				dst->xid = TransactionIdIsValid(slot_xmin) ?
+					slot_xmin :
+					slot_catalog_xmin;
+				strlcpy(dst->name, NameStr(s->data.name), sizeof(dst->name));
+			}
+		}
+
+		LWLockRelease(ReplicationSlotControlLock);
+	}
+
+	*nblockers = count;
+	return result;
+}
+
+/*
+ * Get the highest-priority blocker holding back the xid horizon.
+ *
+ * Returns true and stores the blocker in *blocker if any are found.
+ */
+bool
+GetXidHorizonBlocker(TransactionId horizon, XidHorizonBlocker *blocker)
+{
+	XidHorizonBlocker *blockers;
+	XidHorizonBlocker *best = NULL;
+	int			nblockers;
+
+	Assert(TransactionIdIsValid(horizon));
+	Assert(blocker != NULL);
+
+	blockers = GetXidHorizonBlockers(horizon, &nblockers);
+	for (int i = 0; i < nblockers; i++)
+	{
+		if (best == NULL || blockers[i].type < best->type)
+			best = &blockers[i];
+	}
+
+	if (best != NULL)
+		*blocker = *best;
+
+	pfree(blockers);
+
+	return (best != NULL);
 }
 
 /*
