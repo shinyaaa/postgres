@@ -128,6 +128,8 @@ static const char BinarySignature[11] = "PGCOPY\n\377\r\n\0";
 static void EndCopy(CopyToState cstate);
 static void ClosePipeToProgram(CopyToState cstate);
 static void CopyOneRowTo(CopyToState cstate, TupleTableSlot *slot);
+static void CopyAttributeOutTextInternal(CopyToState cstate, const char *string,
+										 bool encoding_embeds_ascii);
 static void CopyAttributeOutText(CopyToState cstate, const char *string);
 static void CopyAttributeOutCSV(CopyToState cstate, const char *string,
 								bool use_quote);
@@ -1417,8 +1419,9 @@ CopyOneRowTo(CopyToState cstate, TupleTableSlot *slot)
 			CopySendData(cstate, start, ptr - start); \
 	} while (0)
 
-static void
-CopyAttributeOutText(CopyToState cstate, const char *string)
+static pg_attribute_always_inline void
+CopyAttributeOutTextInternal(CopyToState cstate, const char *string,
+							 bool encoding_embeds_ascii)
 {
 	const char *ptr;
 	const char *start;
@@ -1437,133 +1440,82 @@ CopyAttributeOutText(CopyToState cstate, const char *string)
 	 * character, we dump out all characters between escaped characters in a
 	 * single call.  The loop invariant is that the data from "start" to "ptr"
 	 * can be sent literally, but hasn't yet been.
-	 *
-	 * We can skip pg_encoding_mblen() overhead when encoding is safe, because
-	 * in valid backend encodings, extra bytes of a multibyte character never
-	 * look like ASCII.  This loop is sufficiently performance-critical that
-	 * it's worth making two copies of it to get the IS_HIGHBIT_SET() test out
-	 * of the normal safe-encoding path.
 	 */
-	if (cstate->encoding_embeds_ascii)
+	start = ptr;
+	while ((c = *ptr) != '\0')
 	{
-		start = ptr;
-		while ((c = *ptr) != '\0')
+		if ((unsigned char) c < (unsigned char) 0x20)
 		{
-			if ((unsigned char) c < (unsigned char) 0x20)
+			/*
+			 * \r and \n must be escaped, the others are traditional. We
+			 * prefer to dump these using the C-like notation, rather than a
+			 * backslash and the literal character, because it makes the dump
+			 * file a bit more proof against Microsoftish data mangling.
+			 */
+			switch (c)
 			{
-				/*
-				 * \r and \n must be escaped, the others are traditional. We
-				 * prefer to dump these using the C-like notation, rather than
-				 * a backslash and the literal character, because it makes the
-				 * dump file a bit more proof against Microsoftish data
-				 * mangling.
-				 */
-				switch (c)
-				{
-					case '\b':
-						c = 'b';
+				case '\b':
+					c = 'b';
+					break;
+				case '\f':
+					c = 'f';
+					break;
+				case '\n':
+					c = 'n';
+					break;
+				case '\r':
+					c = 'r';
+					break;
+				case '\t':
+					c = 't';
+					break;
+				case '\v':
+					c = 'v';
+					break;
+				default:
+					/* If it's the delimiter, must backslash it */
+					if (c == delimc)
 						break;
-					case '\f':
-						c = 'f';
-						break;
-					case '\n':
-						c = 'n';
-						break;
-					case '\r':
-						c = 'r';
-						break;
-					case '\t':
-						c = 't';
-						break;
-					case '\v':
-						c = 'v';
-						break;
-					default:
-						/* If it's the delimiter, must backslash it */
-						if (c == delimc)
-							break;
-						/* All ASCII control chars are length 1 */
-						ptr++;
-						continue;	/* fall to end of loop */
-				}
-				/* if we get here, we need to convert the control char */
-				DUMPSOFAR();
-				CopySendChar(cstate, '\\');
-				CopySendChar(cstate, c);
-				start = ++ptr;	/* do not include char in next run */
+					/* All ASCII control chars are length 1 */
+					ptr++;
+					continue;	/* fall to end of loop */
 			}
-			else if (c == '\\' || c == delimc)
-			{
-				DUMPSOFAR();
-				CopySendChar(cstate, '\\');
-				start = ptr++;	/* we include char in next run */
-			}
-			else if (IS_HIGHBIT_SET(c))
-				ptr += pg_encoding_mblen(cstate->file_encoding, ptr);
-			else
-				ptr++;
+			/* if we get here, we need to convert the control char */
+			DUMPSOFAR();
+			CopySendChar(cstate, '\\');
+			CopySendChar(cstate, c);
+			start = ++ptr;		/* do not include char in next run */
 		}
-	}
-	else
-	{
-		start = ptr;
-		while ((c = *ptr) != '\0')
+		else if (c == '\\' || c == delimc)
 		{
-			if ((unsigned char) c < (unsigned char) 0x20)
-			{
-				/*
-				 * \r and \n must be escaped, the others are traditional. We
-				 * prefer to dump these using the C-like notation, rather than
-				 * a backslash and the literal character, because it makes the
-				 * dump file a bit more proof against Microsoftish data
-				 * mangling.
-				 */
-				switch (c)
-				{
-					case '\b':
-						c = 'b';
-						break;
-					case '\f':
-						c = 'f';
-						break;
-					case '\n':
-						c = 'n';
-						break;
-					case '\r':
-						c = 'r';
-						break;
-					case '\t':
-						c = 't';
-						break;
-					case '\v':
-						c = 'v';
-						break;
-					default:
-						/* If it's the delimiter, must backslash it */
-						if (c == delimc)
-							break;
-						/* All ASCII control chars are length 1 */
-						ptr++;
-						continue;	/* fall to end of loop */
-				}
-				/* if we get here, we need to convert the control char */
-				DUMPSOFAR();
-				CopySendChar(cstate, '\\');
-				CopySendChar(cstate, c);
-				start = ++ptr;	/* do not include char in next run */
-			}
-			else if (c == '\\' || c == delimc)
-			{
-				DUMPSOFAR();
-				CopySendChar(cstate, '\\');
-				start = ptr++;	/* we include char in next run */
-			}
-			else
-				ptr++;
+			DUMPSOFAR();
+			CopySendChar(cstate, '\\');
+			start = ptr++;		/* we include char in next run */
 		}
+		else if (encoding_embeds_ascii && IS_HIGHBIT_SET(c))
+			ptr += pg_encoding_mblen(cstate->file_encoding, ptr);
+		else
+			ptr++;
 	}
 
 	DUMPSOFAR();
+}
+
+static void
+CopyAttributeOutText(CopyToState cstate, const char *string)
+{
+	/*
+	 * We can skip pg_encoding_mblen() overhead when encoding is safe, because
+	 * in valid backend encodings, extra bytes of a multibyte character never
+	 * look like ASCII.  This loop is sufficiently performance-critical that
+	 * it's worth instantiating two copies of it to get the IS_HIGHBIT_SET()
+	 * test out of the normal safe-encoding path; we rely on the compiler to
+	 * specialize the always-inlined worker on its constant argument.
+	 */
+	if (cstate->encoding_embeds_ascii)
+		CopyAttributeOutTextInternal(cstate, string, true);
+	else
+		CopyAttributeOutTextInternal(cstate, string, false);
 }
 
 /*
