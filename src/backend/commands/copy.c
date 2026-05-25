@@ -562,6 +562,29 @@ defGetCopyLogVerbosityChoice(DefElem *def, ParseState *pstate)
 }
 
 /*
+ * Extract a column-name list from a DefElem, as used by the FORCE_QUOTE,
+ * FORCE_NOT_NULL and FORCE_NULL options.
+ *
+ * The option's argument may be "*" (apply to all columns), in which case
+ * *all is set to true, or a List of column names, which is stored in *names.
+ */
+static void
+defGetCopyColumnList(DefElem *defel, ParseState *pstate,
+					 List **names, bool *all)
+{
+	if (defel->arg && IsA(defel->arg, A_Star))
+		*all = true;
+	else if (defel->arg && IsA(defel->arg, List))
+		*names = castNode(List, defel->arg);
+	else
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("argument to option \"%s\" must be a list of column names",
+						defel->defname),
+				 parser_errposition(pstate, defel->location)));
+}
+
+/*
  * Process the statement option list for COPY.
  *
  * Scan the options list (a list of DefElem) and transpose the information
@@ -674,46 +697,25 @@ ProcessCopyOptions(ParseState *pstate,
 		{
 			if (opts_out->force_quote || opts_out->force_quote_all)
 				errorConflictingDefElem(defel, pstate);
-			if (defel->arg && IsA(defel->arg, A_Star))
-				opts_out->force_quote_all = true;
-			else if (defel->arg && IsA(defel->arg, List))
-				opts_out->force_quote = castNode(List, defel->arg);
-			else
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("argument to option \"%s\" must be a list of column names",
-								defel->defname),
-						 parser_errposition(pstate, defel->location)));
+			defGetCopyColumnList(defel, pstate,
+								 &opts_out->force_quote,
+								 &opts_out->force_quote_all);
 		}
 		else if (strcmp(defel->defname, "force_not_null") == 0)
 		{
 			if (opts_out->force_notnull || opts_out->force_notnull_all)
 				errorConflictingDefElem(defel, pstate);
-			if (defel->arg && IsA(defel->arg, A_Star))
-				opts_out->force_notnull_all = true;
-			else if (defel->arg && IsA(defel->arg, List))
-				opts_out->force_notnull = castNode(List, defel->arg);
-			else
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("argument to option \"%s\" must be a list of column names",
-								defel->defname),
-						 parser_errposition(pstate, defel->location)));
+			defGetCopyColumnList(defel, pstate,
+								 &opts_out->force_notnull,
+								 &opts_out->force_notnull_all);
 		}
 		else if (strcmp(defel->defname, "force_null") == 0)
 		{
 			if (opts_out->force_null || opts_out->force_null_all)
 				errorConflictingDefElem(defel, pstate);
-			if (defel->arg && IsA(defel->arg, A_Star))
-				opts_out->force_null_all = true;
-			else if (defel->arg && IsA(defel->arg, List))
-				opts_out->force_null = castNode(List, defel->arg);
-			else
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("argument to option \"%s\" must be a list of column names",
-								defel->defname),
-						 parser_errposition(pstate, defel->location)));
+			defGetCopyColumnList(defel, pstate,
+								 &opts_out->force_null,
+								 &opts_out->force_null_all);
 		}
 		else if (strcmp(defel->defname, "convert_selectively") == 0)
 		{
