@@ -120,6 +120,9 @@ static void CopyFromBinaryInFunc(CopyFromState cstate, Oid atttypid,
 								 FmgrInfo *finfo, Oid *typioparam);
 static void CopyFromBinaryStart(CopyFromState cstate, TupleDesc tupDesc);
 static void CopyFromBinaryEnd(CopyFromState cstate);
+static void CopyFromProcessForceFlags(CopyFromState cstate, TupleDesc tupDesc,
+									  int num_phys_attrs, bool all, List *columns,
+									  bool *flags, const char *optname);
 
 
 /*
@@ -1519,6 +1522,41 @@ CopyFrom(CopyFromState cstate)
 }
 
 /*
+ * Convert a FORCE_NOT_NULL or FORCE_NULL column-name list into per-column
+ * flags, checking that each named column is actually being copied.
+ *
+ * 'flags' must already be allocated with num_phys_attrs entries.  If 'all'
+ * is set the option was given as "*", so every column's flag is set.
+ */
+static void
+CopyFromProcessForceFlags(CopyFromState cstate, TupleDesc tupDesc,
+						  int num_phys_attrs, bool all, List *columns,
+						  bool *flags, const char *optname)
+{
+	if (all)
+		MemSet(flags, true, num_phys_attrs * sizeof(bool));
+	else if (columns)
+	{
+		List	   *attnums = CopyGetAttnums(tupDesc, cstate->rel, columns);
+		ListCell   *cur;
+
+		foreach(cur, attnums)
+		{
+			int			attnum = lfirst_int(cur);
+			Form_pg_attribute attr = TupleDescAttr(tupDesc, attnum - 1);
+
+			if (!list_member_int(cstate->attnumlist, attnum))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
+				/*- translator: %s is the name of a COPY option, e.g. FORCE_NOT_NULL */
+						 errmsg("%s column \"%s\" not referenced by COPY",
+								optname, NameStr(attr->attname))));
+			flags[attnum - 1] = true;
+		}
+	}
+}
+
+/*
  * Setup to read tuples from a file for COPY FROM.
  *
  * 'rel': Used as a template for the tuples
@@ -1596,29 +1634,11 @@ BeginCopyFrom(ParseState *pstate,
 
 	/* Convert FORCE_NOT_NULL name list to per-column flags, check validity */
 	cstate->opts.force_notnull_flags = (bool *) palloc0(num_phys_attrs * sizeof(bool));
-	if (cstate->opts.force_notnull_all)
-		MemSet(cstate->opts.force_notnull_flags, true, num_phys_attrs * sizeof(bool));
-	else if (cstate->opts.force_notnull)
-	{
-		List	   *attnums;
-		ListCell   *cur;
-
-		attnums = CopyGetAttnums(tupDesc, cstate->rel, cstate->opts.force_notnull);
-
-		foreach(cur, attnums)
-		{
-			int			attnum = lfirst_int(cur);
-			Form_pg_attribute attr = TupleDescAttr(tupDesc, attnum - 1);
-
-			if (!list_member_int(cstate->attnumlist, attnum))
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
-				/*- translator: first %s is the name of a COPY option, e.g. FORCE_NOT_NULL */
-						 errmsg("%s column \"%s\" not referenced by COPY",
-								"FORCE_NOT_NULL", NameStr(attr->attname))));
-			cstate->opts.force_notnull_flags[attnum - 1] = true;
-		}
-	}
+	CopyFromProcessForceFlags(cstate, tupDesc, num_phys_attrs,
+							  cstate->opts.force_notnull_all,
+							  cstate->opts.force_notnull,
+							  cstate->opts.force_notnull_flags,
+							  "FORCE_NOT_NULL");
 
 	/* Set up soft error handler for ON_ERROR */
 	if (cstate->opts.on_error != COPY_ON_ERROR_STOP)
@@ -1656,29 +1676,11 @@ BeginCopyFrom(ParseState *pstate,
 
 	/* Convert FORCE_NULL name list to per-column flags, check validity */
 	cstate->opts.force_null_flags = (bool *) palloc0(num_phys_attrs * sizeof(bool));
-	if (cstate->opts.force_null_all)
-		MemSet(cstate->opts.force_null_flags, true, num_phys_attrs * sizeof(bool));
-	else if (cstate->opts.force_null)
-	{
-		List	   *attnums;
-		ListCell   *cur;
-
-		attnums = CopyGetAttnums(tupDesc, cstate->rel, cstate->opts.force_null);
-
-		foreach(cur, attnums)
-		{
-			int			attnum = lfirst_int(cur);
-			Form_pg_attribute attr = TupleDescAttr(tupDesc, attnum - 1);
-
-			if (!list_member_int(cstate->attnumlist, attnum))
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
-				/*- translator: first %s is the name of a COPY option, e.g. FORCE_NOT_NULL */
-						 errmsg("%s column \"%s\" not referenced by COPY",
-								"FORCE_NULL", NameStr(attr->attname))));
-			cstate->opts.force_null_flags[attnum - 1] = true;
-		}
-	}
+	CopyFromProcessForceFlags(cstate, tupDesc, num_phys_attrs,
+							  cstate->opts.force_null_all,
+							  cstate->opts.force_null,
+							  cstate->opts.force_null_flags,
+							  "FORCE_NULL");
 
 	/* Convert convert_selectively name list to per-column flags */
 	if (cstate->opts.convert_selectively)
