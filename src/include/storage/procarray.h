@@ -38,7 +38,9 @@ typedef enum XidHorizonBlockerType
 	/* xmin-match types (horizon == proc's xmin or slot's xmin) */
 	XHB_XMIN_ACTIVE_TRANSACTION,	/* backend running a statement */
 	XHB_XMIN_IDLE_IN_TRANSACTION,	/* backend idle in transaction */
-	XHB_HOT_STANDBY_FEEDBACK,	/* walsender with hot_standby_feedback */
+	XHB_HOT_STANDBY_FEEDBACK,	/* connected standby with hot_standby_feedback */
+	XHB_PHYSICAL_REPLICATION_SLOT,	/* physical slot reserving xmin (no
+									 * connected standby) */
 	XHB_REPLICATION_SLOT,		/* logical replication slot */
 } XidHorizonBlockerType;
 

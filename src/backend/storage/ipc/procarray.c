@@ -2061,7 +2061,22 @@ XidHorizonBlockerTypeForXminBackend(const PGPROC *proc)
  * 2. Idle-in-transaction sessions
  * 3. Prepared transactions
  * 4. Hot standby feedback
- * 5. Logical replication slots
+ * 5. Replication slots (physical or logical)
+ *
+ * Hot standby feedback deserves a note, because where the standby's xmin is
+ * stored depends on whether the connection uses a replication slot (see
+ * ProcessStandbyHSFeedbackMessage):
+ *
+ * - Without a slot, the xmin is held in the walsender's PGPROC and is found by
+ *   the ProcArray scan below as XHB_HOT_STANDBY_FEEDBACK.
+ * - With a physical slot, the xmin is held in the slot (the walsender's PGPROC
+ *   xmin is reset to invalid), so the ProcArray scan does not see it.  The slot
+ *   scan finds it instead: if a standby is currently connected (the slot is
+ *   active) it is still reported as XHB_HOT_STANDBY_FEEDBACK, otherwise the
+ *   persisted
+ *   reservation is reported as XHB_PHYSICAL_REPLICATION_SLOT.
+ *
+ * Logical slots reserve catalog_xmin and are reported as XHB_REPLICATION_SLOT.
  *
  * Because the horizon was computed earlier, the original blocker may have
  * already committed by the time this function runs.  The result is therefore
@@ -2069,12 +2084,6 @@ XidHorizonBlockerTypeForXminBackend(const PGPROC *proc)
  *
  * Returns a palloc'd array of blockers and stores the number of entries in
  * *nblockers. The array may be empty if no blocker is found.
- *
- * Note: the same underlying cause (e.g. a physical replication slot with
- * hot_standby_feedback) can appear as both an XHB_HOT_STANDBY_FEEDBACK entry
- * (from the walsender PGPROC) and an XHB_REPLICATION_SLOT entry (from the
- * slot's xmin).  Callers that consume all entries should be prepared for such
- * duplicates.
  */
 static XidHorizonBlocker *
 GetXidHorizonBlockers(TransactionId horizon, int *nblockers)
@@ -2174,21 +2183,14 @@ GetXidHorizonBlockers(TransactionId horizon, int *nblockers)
 	LWLockRelease(ProcArrayLock);
 
 	/*
-	 * Now that ProcArrayLock is released, fetch any extra details we want to
-	 * attach to blockers, such as prepared transaction GIDs and standby
-	 * application names.
-	 */
-	for (int i = 0; i < count; i++)
-	{
-		if (result[i].type == XHB_PREPARED_TRANSACTION)
-			GetPreparedTransactionGid(result[i].xid, result[i].name);
-		else if (result[i].type == XHB_HOT_STANDBY_FEEDBACK)
-			GetStandbyAppname(result[i].pid, result[i].name,
-							  sizeof(result[i].name));
-	}
-
-	/*
 	 * Also check replication slots.
+	 *
+	 * A physical slot reserves xmin on behalf of a standby using hot standby
+	 * feedback.  If a standby is currently connected we attribute the
+	 * reservation to that feedback (and record the walsender pid so its
+	 * application_name can be looked up below); otherwise it is a persisted
+	 * physical-slot reservation with no connected standby.  A logical slot
+	 * reserves catalog_xmin for logical decoding.
 	 */
 	if (max_replication_slots > 0)
 	{
@@ -2199,6 +2201,8 @@ GetXidHorizonBlockers(TransactionId horizon, int *nblockers)
 			ReplicationSlot *s = &ReplicationSlotCtl->replication_slots[i];
 			TransactionId slot_xmin;
 			TransactionId slot_catalog_xmin;
+			ProcNumber	active_proc;
+			XidHorizonBlocker *dst;
 
 			if (!s->in_use)
 				continue;
@@ -2206,24 +2210,58 @@ GetXidHorizonBlockers(TransactionId horizon, int *nblockers)
 			SpinLockAcquire(&s->mutex);
 			slot_xmin = s->data.xmin;
 			slot_catalog_xmin = s->data.catalog_xmin;
+			active_proc = s->active_proc;
 			SpinLockRelease(&s->mutex);
 
-			if (TransactionIdEquals(slot_xmin, horizon) ||
-				TransactionIdEquals(slot_catalog_xmin, horizon))
-			{
-				XidHorizonBlocker *dst;
+			if (!TransactionIdEquals(slot_xmin, horizon) &&
+				!TransactionIdEquals(slot_catalog_xmin, horizon))
+				continue;
 
-				dst = &result[count++];
+			dst = &result[count++];
+			dst->xid = TransactionIdIsValid(slot_xmin) ?
+				slot_xmin :
+				slot_catalog_xmin;
+
+			if (SlotIsPhysical(s))
+			{
+				if (active_proc != INVALID_PROC_NUMBER)
+				{
+					/* Connected standby: report as hot standby feedback. */
+					dst->type = XHB_HOT_STANDBY_FEEDBACK;
+					dst->pid = GetPGProcByNumber(active_proc)->pid;
+					dst->name[0] = '\0';
+				}
+				else
+				{
+					dst->type = XHB_PHYSICAL_REPLICATION_SLOT;
+					dst->pid = 0;
+					strlcpy(dst->name, NameStr(s->data.name), sizeof(dst->name));
+				}
+			}
+			else
+			{
 				dst->type = XHB_REPLICATION_SLOT;
 				dst->pid = 0;
-				dst->xid = TransactionIdIsValid(slot_xmin) ?
-					slot_xmin :
-					slot_catalog_xmin;
 				strlcpy(dst->name, NameStr(s->data.name), sizeof(dst->name));
 			}
 		}
 
 		LWLockRelease(ReplicationSlotControlLock);
+	}
+
+	/*
+	 * Now that all locks are released, fetch any extra details we want to
+	 * attach to blockers, such as prepared transaction GIDs and standby
+	 * application names.  This covers hot standby feedback found via either
+	 * the ProcArray scan (no slot) or the slot scan (physical slot).
+	 */
+	for (int i = 0; i < count; i++)
+	{
+		if (result[i].type == XHB_PREPARED_TRANSACTION)
+			GetPreparedTransactionGid(result[i].xid, result[i].name);
+		else if (result[i].type == XHB_HOT_STANDBY_FEEDBACK)
+			GetStandbyAppname(result[i].pid, result[i].name,
+							  sizeof(result[i].name));
 	}
 
 	*nblockers = count;

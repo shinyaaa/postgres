@@ -32,6 +32,21 @@ hot_standby_feedback = on
 wal_receiver_status_interval = 100ms
 ]);
 
+# A second standby that streams through a physical replication slot, used to
+# check that hot standby feedback held via a slot is reported correctly: as
+# "hot standby feedback" while the standby is connected, and as "physical
+# replication slot" once it has disconnected but the slot still reserves xmin.
+$node->safe_psql('postgres',
+	"SELECT pg_create_physical_replication_slot('physical_slot');");
+my $slot_standby = PostgreSQL::Test::Cluster->new('oldestxmin_slot_standby');
+$slot_standby->init_from_backup($node, 'oldestxmin_hotstandby_bkp',
+	has_streaming => 1);
+$slot_standby->append_conf('postgresql.conf', q[
+primary_slot_name = 'physical_slot'
+hot_standby_feedback = on
+wal_receiver_status_interval = 100ms
+]);
+
 
 #
 # Active statement
@@ -307,8 +322,88 @@ like(
 # Cleanup
 $standby->safe_psql('postgres', "SELECT pg_terminate_backend($standby_reader_pid);");
 $node->safe_psql('postgres', "DROP TABLE $hs_table;");
-
-
 $standby->stop;
+
+
+#
+# Hot standby feedback held via a physical replication slot
+#
+# When the standby streams through a physical slot, the feedback xmin is held
+# by the slot rather than the walsender's PGPROC.  While the standby is
+# connected this must still be reported as hot standby feedback.
+#
+my $slot_hs_table = 'blocker_slot_hotstandby';
+$node->safe_psql('postgres', qq[
+CREATE TABLE $slot_hs_table(id int);
+INSERT INTO $slot_hs_table VALUES (0);
+]);
+
+$slot_standby->start;
+$node->wait_for_catchup($slot_standby, 'replay', $node->lsn('flush'));
+
+my $slot_reader = $slot_standby->background_psql('postgres');
+my $slot_reader_pid = $slot_reader->query_safe('SELECT pg_backend_pid();');
+chomp($slot_reader_pid);
+
+$slot_reader->query_until(qr//, qq[
+BEGIN;
+SELECT * FROM $slot_hs_table, pg_sleep(60);
+]);
+
+# Wait for hot standby feedback to be sent through the slot
+$node->poll_query_until('postgres', q[
+SELECT backend_xmin IS NOT NULL
+FROM pg_stat_replication
+WHERE application_name = 'oldestxmin_slot_standby';
+]);
+
+my $slot_hs_pid = $node->safe_psql('postgres', q[
+SELECT pid FROM pg_stat_replication
+WHERE application_name = 'oldestxmin_slot_standby';
+]);
+chomp($slot_hs_pid);
+
+$node->safe_psql('postgres', "DELETE FROM $slot_hs_table;");
+
+$stderr = '';
+$node->psql('postgres', "VACUUM (VERBOSE) $slot_hs_table;", stderr => \$stderr);
+like(
+	$stderr,
+	qr/oldest xmin blocker: hot standby feedback \(standby name = oldestxmin_slot_standby, pid = $slot_hs_pid\)/,
+	'VACUUM VERBOSE reported slot-based hot standby feedback as oldest xmin blocker');
+
+
+#
+# Physical replication slot with no connected standby
+#
+# After the standby disconnects, the physical slot keeps reserving the xmin.
+# With no walsender connected, this must be reported as a physical replication
+# slot rather than as hot standby feedback.
+#
+$slot_standby->stop;
+
+# Wait for the walsender to exit so the slot is no longer active.
+$node->poll_query_until('postgres', q[
+SELECT NOT EXISTS (
+  SELECT 1 FROM pg_stat_replication
+  WHERE application_name = 'oldestxmin_slot_standby')
+AND NOT (SELECT active FROM pg_replication_slots
+         WHERE slot_name = 'physical_slot');
+]);
+
+$stderr = '';
+$node->psql('postgres', "VACUUM (VERBOSE) $slot_hs_table;", stderr => \$stderr);
+like(
+	$stderr,
+	qr/oldest xmin blocker: physical replication slot \(slot name = physical_slot\)/,
+	'VACUUM VERBOSE reported physical replication slot as oldest xmin blocker');
+
+# Cleanup
+$node->safe_psql('postgres', qq[
+DROP TABLE $slot_hs_table;
+SELECT pg_drop_replication_slot('physical_slot');
+]);
+
+
 $node->stop;
 done_testing();

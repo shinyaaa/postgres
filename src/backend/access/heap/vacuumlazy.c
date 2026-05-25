@@ -1123,6 +1123,11 @@ heap_vacuum_rel(Relation rel, const VacuumParams *params,
 												 _("oldest xmin blocker: hot standby feedback (pid = %d)\n"),
 												 blocker.pid);
 							break;
+						case XHB_PHYSICAL_REPLICATION_SLOT:
+							appendStringInfo(&buf,
+											 _("oldest xmin blocker: physical replication slot (slot name = %s)\n"),
+											 blocker.name);
+							break;
 						case XHB_REPLICATION_SLOT:
 							appendStringInfo(&buf,
 											 _("oldest xmin blocker: logical replication slot (slot name = %s)\n"),
