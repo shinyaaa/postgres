@@ -107,6 +107,16 @@ EXPLAIN ANALYZE ...;
 ROLLBACK;
 </programlisting>
    </para>
+   <para>
+    The same applies to <command>COPY (query) TO</command> when the inner
+    query is a data-modifying statement
+    (<command>INSERT</command>, <command>UPDATE</command>,
+    <command>DELETE</command>, or <command>MERGE</command> with a
+    <literal>RETURNING</literal> clause, or a <literal>WITH</literal> clause
+    containing such statements).  The inner query will be executed and data
+    will be modified, even though no output is written to the
+    <command>COPY</command> destination.
+   </para>
   </important>
  </refsect1>
 
