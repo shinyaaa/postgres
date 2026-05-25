@@ -53,6 +53,24 @@ typedef enum CopyInsertMethod
 } CopyInsertMethod;
 
 /*
+ * Fast-path input parser selector for text/CSV COPY FROM.
+ *
+ * For a handful of very common built-in types we can bypass the fmgr
+ * machinery in the per-row loop and call the underlying parser directly.
+ * This is purely an optimization; COPY_FASTPATH_NONE falls back to
+ * InputFunctionCallSafe() and produces identical results and errors.
+ */
+typedef enum CopyAttrFastPath
+{
+	COPY_FASTPATH_NONE = 0,		/* go through InputFunctionCallSafe() */
+	COPY_FASTPATH_INT2,
+	COPY_FASTPATH_INT4,
+	COPY_FASTPATH_INT8,
+	COPY_FASTPATH_FLOAT4,
+	COPY_FASTPATH_FLOAT8,
+} CopyAttrFastPath;
+
+/*
  * This struct contains all the state variables used throughout a COPY FROM
  * operation.
  */
@@ -98,6 +116,8 @@ typedef struct CopyFromStateData
 								 * default value */
 	FmgrInfo   *in_functions;	/* array of input functions for each attrs */
 	Oid		   *typioparams;	/* array of element types for in_functions */
+	CopyAttrFastPath *attfastpath;	/* per-attr fast-path parser, or
+									 * COPY_FASTPATH_NONE (text/CSV only) */
 	ErrorSaveContext *escontext;	/* soft error trapped during in_functions
 									 * execution */
 	uint64		num_errors;		/* total number of rows which contained soft

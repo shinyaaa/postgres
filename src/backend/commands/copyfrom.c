@@ -46,6 +46,7 @@
 #include "rewrite/rewriteHandler.h"
 #include "storage/fd.h"
 #include "tcop/tcopprot.h"
+#include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/portal.h"
@@ -209,6 +210,34 @@ CopyFromTextLikeInFunc(CopyFromState cstate, Oid atttypid, FmgrInfo *finfo,
 
 	getTypeInputInfo(atttypid, &func_oid, typioparam);
 	fmgr_info(func_oid, finfo);
+}
+
+/*
+ * Classify a text/CSV input function for the per-row fast path.
+ *
+ * Returns the matching CopyAttrFastPath for a handful of common built-in
+ * types whose input functions are strict and ignore typmod, or
+ * COPY_FASTPATH_NONE for everything else (including domains and binary
+ * receive functions, whose OIDs never match here).
+ */
+static CopyAttrFastPath
+CopyFromInFuncFastPath(Oid func_oid)
+{
+	switch (func_oid)
+	{
+		case F_INT2IN:
+			return COPY_FASTPATH_INT2;
+		case F_INT4IN:
+			return COPY_FASTPATH_INT4;
+		case F_INT8IN:
+			return COPY_FASTPATH_INT8;
+		case F_FLOAT4IN:
+			return COPY_FASTPATH_FLOAT4;
+		case F_FLOAT8IN:
+			return COPY_FASTPATH_FLOAT8;
+		default:
+			return COPY_FASTPATH_NONE;
+	}
 }
 
 /* Implementation of the end callback for text and CSV formats */
@@ -1775,6 +1804,8 @@ BeginCopyFrom(ParseState *pstate,
 	 */
 	in_functions = (FmgrInfo *) palloc(num_phys_attrs * sizeof(FmgrInfo));
 	typioparams = (Oid *) palloc(num_phys_attrs * sizeof(Oid));
+	cstate->attfastpath = (CopyAttrFastPath *)
+		palloc0(num_phys_attrs * sizeof(CopyAttrFastPath));
 	defmap = (int *) palloc(num_phys_attrs * sizeof(int));
 	defexprs = (ExprState **) palloc(num_phys_attrs * sizeof(ExprState *));
 
@@ -1790,6 +1821,13 @@ BeginCopyFrom(ParseState *pstate,
 		cstate->routine->CopyFromInFunc(cstate, att->atttypid,
 										&in_functions[attnum - 1],
 										&typioparams[attnum - 1]);
+
+		/*
+		 * Determine whether this attribute can use the per-row fast path.
+		 * Only meaningful for text/CSV; binary receive functions never match.
+		 */
+		cstate->attfastpath[attnum - 1] =
+			CopyFromInFuncFastPath(in_functions[attnum - 1].fn_oid);
 
 		/* Get default info if available */
 		defexprs[attnum - 1] = NULL;

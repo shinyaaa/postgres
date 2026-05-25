@@ -75,6 +75,7 @@
 #include "port/pg_bswap.h"
 #include "port/simd.h"
 #include "utils/builtins.h"
+#include "utils/float.h"
 #include "utils/rel.h"
 #include "utils/wait_event.h"
 
@@ -944,6 +945,65 @@ CopyFromCSVOneRow(CopyFromState cstate, ExprContext *econtext, Datum *values,
 }
 
 /*
+ * Parse one text/CSV field into *result.
+ *
+ * For a few common built-in types this bypasses the fmgr machinery and calls
+ * the underlying parser directly; all other types fall back to
+ * InputFunctionCallSafe().  The behavior is identical either way: it returns
+ * true on success and, on a soft error (only possible when ON_ERROR is not
+ * STOP, so cstate->escontext is set), false.  When escontext is NULL the
+ * parser reports a hard ereport(ERROR), just as int4in() etc. would.
+ */
+static pg_attribute_always_inline bool
+CopyFromTextLikeInFuncCall(CopyFromState cstate, int m, char *string,
+						   Form_pg_attribute att, Datum *result)
+{
+	Node	   *escontext = (Node *) cstate->escontext;
+	CopyAttrFastPath fastpath = cstate->attfastpath[m];
+
+	if (fastpath == COPY_FASTPATH_NONE)
+		return InputFunctionCallSafe(&cstate->in_functions[m], string,
+									 cstate->typioparams[m],
+									 att->atttypmod, escontext, result);
+
+	/* All fast-path types are strict: a NULL field yields a NULL result. */
+	if (string == NULL)
+	{
+		*result = (Datum) 0;
+		return true;
+	}
+
+	switch (fastpath)
+	{
+		case COPY_FASTPATH_INT2:
+			*result = Int16GetDatum(pg_strtoint16_safe(string, escontext));
+			break;
+		case COPY_FASTPATH_INT4:
+			*result = Int32GetDatum(pg_strtoint32_safe(string, escontext));
+			break;
+		case COPY_FASTPATH_INT8:
+			*result = Int64GetDatum(pg_strtoint64_safe(string, escontext));
+			break;
+		case COPY_FASTPATH_FLOAT4:
+			*result = Float4GetDatum(float4in_internal(string, NULL, "real",
+													   string, escontext));
+			break;
+		case COPY_FASTPATH_FLOAT8:
+			*result = Float8GetDatum(float8in_internal(string, NULL,
+													   "double precision",
+													   string, escontext));
+			break;
+		case COPY_FASTPATH_NONE:
+			break;				/* handled above; keep compiler happy */
+	}
+
+	/* A fast-path parser may have trapped a soft error in escontext. */
+	if (SOFT_ERROR_OCCURRED(escontext))
+		return false;
+	return true;
+}
+
+/*
  * Workhorse for CopyFromTextOneRow() and CopyFromCSVOneRow().
  *
  * We use pg_attribute_always_inline to reduce function call overhead
@@ -1043,12 +1103,8 @@ CopyFromTextLikeOneRow(CopyFromState cstate, ExprContext *econtext,
 		/*
 		 * If ON_ERROR is specified, handle the different options
 		 */
-		else if (!InputFunctionCallSafe(&in_functions[m],
-										string,
-										typioparams[m],
-										att->atttypmod,
-										(Node *) cstate->escontext,
-										&values[m]))
+		else if (!CopyFromTextLikeInFuncCall(cstate, m, string, att,
+											 &values[m]))
 		{
 			Assert(cstate->opts.on_error != COPY_ON_ERROR_STOP);
 
