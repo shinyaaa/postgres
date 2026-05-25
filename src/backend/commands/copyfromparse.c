@@ -1806,6 +1806,112 @@ GetDecimalFromHex(char hex)
 		return pg_ascii_tolower((unsigned char) hex) - 'a' + 10;
 }
 
+/* result of matching a field's raw input against the NULL/DEFAULT markers */
+typedef enum CopyAttrMarker
+{
+	COPY_ATTR_DATA,				/* field contains ordinary data */
+	COPY_ATTR_NULL,				/* field matched the null marker */
+	COPY_ATTR_DEFAULT,			/* field matched the default marker */
+} CopyAttrMarker;
+
+/*
+ * Shared setup for CopyReadAttributesText/CSV.
+ *
+ * Handles the zero-column special case and prepares attribute_buf and the
+ * input scan pointers.  Returns false if there are no columns to read (the
+ * caller should then return 0); otherwise returns true with *output_ptr,
+ * *cur_ptr and *line_end_ptr initialized for the field-scanning loop.
+ */
+static bool
+CopyReadAttributesSetup(CopyFromState cstate, char **output_ptr,
+						char **cur_ptr, char **line_end_ptr)
+{
+	/*
+	 * We need a special case for zero-column tables: check that the input
+	 * line is empty, and return.
+	 */
+	if (cstate->max_fields <= 0)
+	{
+		if (cstate->line_buf.len != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
+					 errmsg("extra data after last expected column")));
+		return false;
+	}
+
+	resetStringInfo(&cstate->attribute_buf);
+
+	/*
+	 * The de-escaped attributes will certainly not be longer than the input
+	 * data line, so we can just force attribute_buf to be large enough and
+	 * then transfer data without any checks for enough space.  We need to do
+	 * it this way because enlarging attribute_buf mid-stream would invalidate
+	 * pointers already stored into cstate->raw_fields[].
+	 */
+	if (cstate->attribute_buf.maxlen <= cstate->line_buf.len)
+		enlargeStringInfo(&cstate->attribute_buf, cstate->line_buf.len);
+	*output_ptr = cstate->attribute_buf.data;
+
+	/* set pointer variables for loop */
+	*cur_ptr = cstate->line_buf.data;
+	*line_end_ptr = cstate->line_buf.data + cstate->line_buf.len;
+
+	return true;
+}
+
+/*
+ * Match a field's raw input against the NULL and DEFAULT markers, shared by
+ * CopyReadAttributesText/CSV.
+ *
+ * 'start_ptr'/'input_len' describe the raw (pre-de-escaping) field content.
+ * 'suppress_null_match' prevents NULL-marker matching (used by CSV when the
+ * field was quoted).  When the field matches the DEFAULT marker, the relevant
+ * cstate->defaults[] entry is set (or an error is raised if the column has no
+ * default).
+ */
+static pg_attribute_always_inline CopyAttrMarker
+CopyReadAttributeMatchMarkers(CopyFromState cstate, int fieldno,
+							  const char *start_ptr, int input_len,
+							  bool suppress_null_match)
+{
+	/* Check whether raw input matched null marker */
+	if (!suppress_null_match &&
+		input_len == cstate->opts.null_print_len &&
+		strncmp(start_ptr, cstate->opts.null_print, input_len) == 0)
+		return COPY_ATTR_NULL;
+
+	/* Check whether raw input matched default marker */
+	if (fieldno < list_length(cstate->attnumlist) &&
+		cstate->opts.default_print &&
+		input_len == cstate->opts.default_print_len &&
+		strncmp(start_ptr, cstate->opts.default_print, input_len) == 0)
+	{
+		/* fieldno is 0-indexed and attnum is 1-indexed */
+		int			m = list_nth_int(cstate->attnumlist, fieldno) - 1;
+
+		if (cstate->defexprs[m] != NULL)
+		{
+			/* defaults contain entries for all physical attributes */
+			cstate->defaults[m] = true;
+		}
+		else
+		{
+			TupleDesc	tupDesc = RelationGetDescr(cstate->rel);
+			Form_pg_attribute att = TupleDescAttr(tupDesc, m);
+
+			ereport(ERROR,
+					(errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
+					 errmsg("unexpected default marker in COPY data"),
+					 errdetail("Column \"%s\" has no default value.",
+							   NameStr(att->attname))));
+		}
+
+		return COPY_ATTR_DEFAULT;
+	}
+
+	return COPY_ATTR_DATA;
+}
+
 /*
  * Parse the current line into separate attributes (fields),
  * performing de-escaping as needed.
@@ -1834,35 +1940,8 @@ CopyReadAttributesText(CopyFromState cstate)
 	char	   *cur_ptr;
 	char	   *line_end_ptr;
 
-	/*
-	 * We need a special case for zero-column tables: check that the input
-	 * line is empty, and return.
-	 */
-	if (cstate->max_fields <= 0)
-	{
-		if (cstate->line_buf.len != 0)
-			ereport(ERROR,
-					(errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
-					 errmsg("extra data after last expected column")));
+	if (!CopyReadAttributesSetup(cstate, &output_ptr, &cur_ptr, &line_end_ptr))
 		return 0;
-	}
-
-	resetStringInfo(&cstate->attribute_buf);
-
-	/*
-	 * The de-escaped attributes will certainly not be longer than the input
-	 * data line, so we can just force attribute_buf to be large enough and
-	 * then transfer data without any checks for enough space.  We need to do
-	 * it this way because enlarging attribute_buf mid-stream would invalidate
-	 * pointers already stored into cstate->raw_fields[].
-	 */
-	if (cstate->attribute_buf.maxlen <= cstate->line_buf.len)
-		enlargeStringInfo(&cstate->attribute_buf, cstate->line_buf.len);
-	output_ptr = cstate->attribute_buf.data;
-
-	/* set pointer variables for loop */
-	cur_ptr = cstate->line_buf.data;
-	line_end_ptr = cstate->line_buf.data + cstate->line_buf.len;
 
 	/* Outer loop iterates over fields */
 	fieldno = 0;
@@ -2009,51 +2088,31 @@ CopyReadAttributesText(CopyFromState cstate)
 			*output_ptr++ = c;
 		}
 
-		/* Check whether raw input matched null marker */
+		/* Check whether raw input matched null/default markers */
 		input_len = end_ptr - start_ptr;
-		if (input_len == cstate->opts.null_print_len &&
-			strncmp(start_ptr, cstate->opts.null_print, input_len) == 0)
-			cstate->raw_fields[fieldno] = NULL;
-		/* Check whether raw input matched default marker */
-		else if (fieldno < list_length(cstate->attnumlist) &&
-				 cstate->opts.default_print &&
-				 input_len == cstate->opts.default_print_len &&
-				 strncmp(start_ptr, cstate->opts.default_print, input_len) == 0)
+		switch (CopyReadAttributeMatchMarkers(cstate, fieldno, start_ptr,
+											  input_len, false))
 		{
-			/* fieldno is 0-indexed and attnum is 1-indexed */
-			int			m = list_nth_int(cstate->attnumlist, fieldno) - 1;
+			case COPY_ATTR_NULL:
+				cstate->raw_fields[fieldno] = NULL;
+				break;
+			case COPY_ATTR_DEFAULT:
+				break;
+			case COPY_ATTR_DATA:
 
-			if (cstate->defexprs[m] != NULL)
-			{
-				/* defaults contain entries for all physical attributes */
-				cstate->defaults[m] = true;
-			}
-			else
-			{
-				TupleDesc	tupDesc = RelationGetDescr(cstate->rel);
-				Form_pg_attribute att = TupleDescAttr(tupDesc, m);
+				/*
+				 * At this point we know the field is supposed to contain data.
+				 *
+				 * If we de-escaped any non-7-bit-ASCII chars, make sure the
+				 * resulting string is valid data for the db encoding.
+				 */
+				if (saw_non_ascii)
+				{
+					char	   *fld = cstate->raw_fields[fieldno];
 
-				ereport(ERROR,
-						(errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
-						 errmsg("unexpected default marker in COPY data"),
-						 errdetail("Column \"%s\" has no default value.",
-								   NameStr(att->attname))));
-			}
-		}
-		else
-		{
-			/*
-			 * At this point we know the field is supposed to contain data.
-			 *
-			 * If we de-escaped any non-7-bit-ASCII chars, make sure the
-			 * resulting string is valid data for the db encoding.
-			 */
-			if (saw_non_ascii)
-			{
-				char	   *fld = cstate->raw_fields[fieldno];
-
-				pg_verifymbstr(fld, output_ptr - fld, false);
-			}
+					pg_verifymbstr(fld, output_ptr - fld, false);
+				}
+				break;
 		}
 
 		/* Terminate attribute value in output area */
@@ -2090,35 +2149,8 @@ CopyReadAttributesCSV(CopyFromState cstate)
 	char	   *cur_ptr;
 	char	   *line_end_ptr;
 
-	/*
-	 * We need a special case for zero-column tables: check that the input
-	 * line is empty, and return.
-	 */
-	if (cstate->max_fields <= 0)
-	{
-		if (cstate->line_buf.len != 0)
-			ereport(ERROR,
-					(errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
-					 errmsg("extra data after last expected column")));
+	if (!CopyReadAttributesSetup(cstate, &output_ptr, &cur_ptr, &line_end_ptr))
 		return 0;
-	}
-
-	resetStringInfo(&cstate->attribute_buf);
-
-	/*
-	 * The de-escaped attributes will certainly not be longer than the input
-	 * data line, so we can just force attribute_buf to be large enough and
-	 * then transfer data without any checks for enough space.  We need to do
-	 * it this way because enlarging attribute_buf mid-stream would invalidate
-	 * pointers already stored into cstate->raw_fields[].
-	 */
-	if (cstate->attribute_buf.maxlen <= cstate->line_buf.len)
-		enlargeStringInfo(&cstate->attribute_buf, cstate->line_buf.len);
-	output_ptr = cstate->attribute_buf.data;
-
-	/* set pointer variables for loop */
-	cur_ptr = cstate->line_buf.data;
-	line_end_ptr = cstate->line_buf.data + cstate->line_buf.len;
 
 	/* Outer loop iterates over fields */
 	fieldno = 0;
@@ -2224,37 +2256,11 @@ endfield:
 		/* Terminate attribute value in output area */
 		*output_ptr++ = '\0';
 
-		/* Check whether raw input matched null marker */
+		/* Check whether raw input matched null/default markers */
 		input_len = end_ptr - start_ptr;
-		if (!saw_quote && input_len == cstate->opts.null_print_len &&
-			strncmp(start_ptr, cstate->opts.null_print, input_len) == 0)
+		if (CopyReadAttributeMatchMarkers(cstate, fieldno, start_ptr,
+										  input_len, saw_quote) == COPY_ATTR_NULL)
 			cstate->raw_fields[fieldno] = NULL;
-		/* Check whether raw input matched default marker */
-		else if (fieldno < list_length(cstate->attnumlist) &&
-				 cstate->opts.default_print &&
-				 input_len == cstate->opts.default_print_len &&
-				 strncmp(start_ptr, cstate->opts.default_print, input_len) == 0)
-		{
-			/* fieldno is 0-index and attnum is 1-index */
-			int			m = list_nth_int(cstate->attnumlist, fieldno) - 1;
-
-			if (cstate->defexprs[m] != NULL)
-			{
-				/* defaults contain entries for all physical attributes */
-				cstate->defaults[m] = true;
-			}
-			else
-			{
-				TupleDesc	tupDesc = RelationGetDescr(cstate->rel);
-				Form_pg_attribute att = TupleDescAttr(tupDesc, m);
-
-				ereport(ERROR,
-						(errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
-						 errmsg("unexpected default marker in COPY data"),
-						 errdetail("Column \"%s\" has no default value.",
-								   NameStr(att->attname))));
-			}
-		}
 
 		fieldno++;
 		/* Done if we hit EOL instead of a delim */
