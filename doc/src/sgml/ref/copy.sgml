@@ -147,6 +147,10 @@ COPY { <replaceable class="parameter">table_name</replaceable> [ ( <replaceable 
       <literal>ALSO</literal> rule, nor an <literal>INSTEAD</literal> rule
       that expands to multiple statements.
      </para>
+     <para>
+      The execution plan for the query can be examined with
+      <link linkend="sql-explain"><command>EXPLAIN</command></link>.
+     </para>
     </listitem>
    </varlistentry>
 

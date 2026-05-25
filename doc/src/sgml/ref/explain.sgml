@@ -343,9 +343,16 @@ ROLLBACK;
       Any <command>SELECT</command>, <command>INSERT</command>, <command>UPDATE</command>,
       <command>DELETE</command>, <command>MERGE</command>,
       <command>VALUES</command>, <command>EXECUTE</command>,
-      <command>DECLARE</command>, <command>CREATE TABLE AS</command>, or
-      <command>CREATE MATERIALIZED VIEW AS</command> statement, whose execution
-      plan you wish to see.
+      <command>DECLARE</command>, <command>CREATE TABLE AS</command>,
+      <command>CREATE MATERIALIZED VIEW AS</command>, or
+      <command>COPY (query) TO</command> statement, whose execution
+      plan you wish to see.  When explaining a <command>COPY (query) TO</command>
+      statement, the plan shown is for the inner query only; the
+      <command>COPY</command> command itself does not write any output, even
+      when <literal>ANALYZE</literal> is used.  Only the
+      <literal>COPY (<replaceable>query</replaceable>) TO</literal> form is
+      supported; <command>COPY FROM</command> and table-based
+      <command>COPY TO</command> have no query plan to display.
      </para>
     </listitem>
    </varlistentry>
@@ -525,6 +532,22 @@ EXPLAIN ANALYZE EXECUTE query(100, 200);
  Planning Time: 0.244 ms
  Execution Time: 0.073 ms
 (10 rows)
+</programlisting>
+  </para>
+
+  <para>
+   Here is an example of using <command>EXPLAIN</command> to display the
+   execution plan for a <command>COPY (query) TO</command> statement.  Only
+   the plan for the inner query is shown; no file is written:
+
+<programlisting>
+EXPLAIN COPY (SELECT * FROM foo WHERE i &lt; 10) TO '/tmp/foo.csv';
+
+                         QUERY PLAN
+--------------------------------------------------------------
+ Index Scan using fi on foo  (cost=0.00..23.92 rows=6 width=4)
+   Index Cond: (i &lt; 10)
+(2 rows)
 </programlisting>
   </para>
 
