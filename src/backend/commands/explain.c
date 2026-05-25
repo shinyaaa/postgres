@@ -474,6 +474,50 @@ ExplainOneUtility(Node *utilityStmt, IntoClause *into, ExplainState *es,
 		else
 			ExplainDummyGroup("Notify", NULL, es);
 	}
+	else if (IsA(utilityStmt, CopyStmt))
+	{
+		CopyStmt   *copyStmt = (CopyStmt *) utilityStmt;
+
+		/*
+		 * Only COPY (query) TO is supported for EXPLAIN.  COPY FROM and
+		 * table-based COPY TO don't have a standalone query plan to show.
+		 */
+		if (copyStmt->is_from || copyStmt->query == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("EXPLAIN is not supported for this form of COPY"),
+					 errhint("Use EXPLAIN with COPY (query) TO.")));
+
+		{
+			RawStmt    *rawstmt;
+			List	   *rewritten;
+			Query	   *query;
+			JumbleState *jstate = NULL;
+
+			rawstmt = makeNode(RawStmt);
+			rawstmt->stmt = copyStmt->query;
+			rawstmt->stmt_location = 0;
+			rawstmt->stmt_len = 0;
+
+			rewritten = pg_analyze_and_rewrite_fixedparams(rawstmt,
+														   pstate->p_sourcetext,
+														   NULL, 0,
+														   NULL);
+			if (list_length(rewritten) != 1)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("unexpected rewrite result for COPY")));
+
+			query = linitial_node(Query, rewritten);
+			if (IsQueryIdEnabled())
+				jstate = JumbleQuery(query);
+			if (post_parse_analyze_hook)
+				(*post_parse_analyze_hook) (pstate, query, jstate);
+
+			ExplainOneQuery(query, CURSOR_OPT_PARALLEL_OK, NULL, es,
+							pstate, params);
+		}
+	}
 	else
 	{
 		if (es->format == EXPLAIN_FORMAT_TEXT)

@@ -12854,6 +12854,7 @@ ExplainableStmt:
 			| CreateMatViewStmt
 			| RefreshMatViewStmt
 			| ExecuteStmt					/* by default all are $$=$1 */
+			| CopyStmt
 		;
 
 /*****************************************************************************
