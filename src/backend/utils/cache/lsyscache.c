@@ -44,6 +44,7 @@
 #include "catalog/pg_type.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
+#include "nodes/supportnodes.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/catcache.h"
@@ -2102,6 +2103,37 @@ get_func_support(Oid funcid)
 	}
 	else
 		return (RegProcedure) InvalidOid;
+}
+
+/*
+ * get_fast_input_function
+ *
+ *		If the given type input function exposes an optimized, fcinfo-free
+ *		fast entry point (via its planner support function) that is valid for
+ *		the supplied typmod/collation/typioparam, return it; otherwise return
+ *		NULL so the caller falls back to InputFunctionCallSafe().
+ */
+FastInputFunction
+get_fast_input_function(Oid input_func_oid, Oid typioparam,
+						int32 typmod, Oid collation)
+{
+	RegProcedure support = get_func_support(input_func_oid);
+	SupportRequestInputFunction req;
+	SupportRequestInputFunction *res;
+
+	if (!OidIsValid(support))
+		return NULL;
+
+	req.type = T_SupportRequestInputFunction;
+	req.typmod = typmod;
+	req.collation = collation;
+	req.typioparam = typioparam;
+	req.fn = NULL;
+
+	res = (SupportRequestInputFunction *)
+		DatumGetPointer(OidFunctionCall1(support, PointerGetDatum(&req)));
+
+	return res ? res->fn : NULL;
 }
 
 /*				---------- RELATION CACHE ----------					 */

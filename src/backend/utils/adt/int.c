@@ -36,6 +36,7 @@
 #include "common/int.h"
 #include "funcapi.h"
 #include "libpq/pqformat.h"
+#include "nodes/miscnodes.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/supportnodes.h"
 #include "optimizer/optimizer.h"
@@ -318,6 +319,46 @@ int4in(PG_FUNCTION_ARGS)
 	char	   *num = PG_GETARG_CSTRING(0);
 
 	PG_RETURN_INT32(pg_strtoint32_safe(num, fcinfo->context));
+}
+
+/*
+ * int4in_fast - fcinfo-free fast entry point for int4in().
+ *
+ * Calls the very same guts (pg_strtoint32_safe) as int4in(), so it is
+ * semantically identical, including soft-error reporting via escontext.
+ * int4 ignores typioparam, typmod and collation.
+ */
+static bool
+int4in_fast(const char *str, Oid typioparam, int32 typmod,
+			Oid collation, Node *escontext, Datum *result)
+{
+	int32		val = pg_strtoint32_safe(str, escontext);
+
+	if (SOFT_ERROR_OCCURRED(escontext))
+		return false;
+	*result = Int32GetDatum(val);
+	return true;
+}
+
+/*
+ * Planner support function for int4in(): advertises int4in_fast() as an
+ * optimized input entry point.  int4 ignores typmod/collation/typioparam, so
+ * the fast path is always valid.
+ */
+Datum
+int4in_support(PG_FUNCTION_ARGS)
+{
+	Node	   *rawreq = (Node *) PG_GETARG_POINTER(0);
+
+	if (IsA(rawreq, SupportRequestInputFunction))
+	{
+		SupportRequestInputFunction *req = (SupportRequestInputFunction *) rawreq;
+
+		req->fn = int4in_fast;
+		PG_RETURN_POINTER(req);
+	}
+
+	PG_RETURN_POINTER(NULL);
 }
 
 /*

@@ -944,6 +944,27 @@ CopyFromCSVOneRow(CopyFromState cstate, ExprContext *econtext, Datum *values,
 }
 
 /*
+ * Convert one input field to a Datum for CopyFromTextLikeOneRow().
+ *
+ * Uses the type's optimized fcinfo-free fast entry point when it advertised
+ * one (see get_fast_input_function); it is semantically identical to
+ * InputFunctionCallSafe().  NULL strings (strict NULL handling) always go
+ * through the regular path.  Returns false on a soft error.
+ */
+static pg_attribute_always_inline bool
+CopyFromInputOneField(CopyFromState cstate, FastInputFunction fastfn,
+					  FmgrInfo *flinfo, char *string, Oid typioparam,
+					  int32 typmod, Oid collation, Datum *result)
+{
+	if (fastfn != NULL && string != NULL)
+		return fastfn(string, typioparam, typmod, collation,
+					  (Node *) cstate->escontext, result);
+
+	return InputFunctionCallSafe(flinfo, string, typioparam, typmod,
+								 (Node *) cstate->escontext, result);
+}
+
+/*
  * Workhorse for CopyFromTextOneRow() and CopyFromCSVOneRow().
  *
  * We use pg_attribute_always_inline to reduce function call overhead
@@ -956,6 +977,7 @@ CopyFromTextLikeOneRow(CopyFromState cstate, ExprContext *econtext,
 	TupleDesc	tupDesc;
 	AttrNumber	attr_count;
 	FmgrInfo   *in_functions = cstate->in_functions;
+	FastInputFunction *fast_in_functions = cstate->fast_in_functions;
 	Oid		   *typioparams = cstate->typioparams;
 	ExprState **defexprs = cstate->defexprs;
 	char	  **field_strings;
@@ -1043,11 +1065,9 @@ CopyFromTextLikeOneRow(CopyFromState cstate, ExprContext *econtext,
 		/*
 		 * If ON_ERROR is specified, handle the different options
 		 */
-		else if (!InputFunctionCallSafe(&in_functions[m],
-										string,
-										typioparams[m],
-										att->atttypmod,
-										(Node *) cstate->escontext,
+		else if (!CopyFromInputOneField(cstate, fast_in_functions[m],
+										&in_functions[m], string, typioparams[m],
+										att->atttypmod, att->attcollation,
 										&values[m]))
 		{
 			Assert(cstate->opts.on_error != COPY_ON_ERROR_STOP);

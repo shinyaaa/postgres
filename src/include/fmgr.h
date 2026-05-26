@@ -40,6 +40,18 @@ typedef struct FunctionCallInfoBaseData *FunctionCallInfo;
 typedef Datum (*PGFunction) (FunctionCallInfo fcinfo);
 
 /*
+ * Optimized, fcinfo-free entry point that a datatype's input function may
+ * optionally expose (see SupportRequestInputFunction in supportnodes.h).
+ * It must be semantically identical to calling the regular input function
+ * via InputFunctionCallSafe(): on success it stores the converted value in
+ * *result and returns true; on a soft error it fills escontext and returns
+ * false.  Callers only invoke it for non-NULL input strings.
+ */
+typedef bool (*FastInputFunction) (const char *str, Oid typioparam,
+								   int32 typmod, Oid collation,
+								   Node *escontext, Datum *result);
+
+/*
  * This struct holds the system-catalog information that must be looked up
  * before a function can be called through fmgr.  If the same function is
  * to be called multiple times, the lookup need be done only once and the

@@ -16,6 +16,7 @@
 #include "access/attnum.h"
 #include "access/cmptype.h"
 #include "access/htup.h"
+#include "fmgr.h"
 #include "nodes/pg_list.h"
 
 /* avoid including subscripting.h here */
@@ -140,6 +141,9 @@ extern char func_parallel(Oid funcid);
 extern char get_func_prokind(Oid funcid);
 extern bool get_func_leakproof(Oid funcid);
 extern RegProcedure get_func_support(Oid funcid);
+extern FastInputFunction get_fast_input_function(Oid input_func_oid,
+												 Oid typioparam, int32 typmod,
+												 Oid collation);
 extern Oid	get_relname_relid(const char *relname, Oid relnamespace);
 extern char *get_rel_name(Oid relid);
 extern Oid	get_rel_namespace(Oid relid);

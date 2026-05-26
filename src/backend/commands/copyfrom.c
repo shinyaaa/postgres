@@ -1547,6 +1547,7 @@ BeginCopyFrom(ParseState *pstate,
 	AttrNumber	num_phys_attrs,
 				num_defaults;
 	FmgrInfo   *in_functions;
+	FastInputFunction *fast_in_functions;
 	Oid		   *typioparams;
 	int		   *defmap;
 	ExprState **defexprs;
@@ -1774,6 +1775,8 @@ BeginCopyFrom(ParseState *pstate,
 	 * input function we use depends on text/binary format choice.)
 	 */
 	in_functions = (FmgrInfo *) palloc(num_phys_attrs * sizeof(FmgrInfo));
+	fast_in_functions = (FastInputFunction *)
+		palloc0(num_phys_attrs * sizeof(FastInputFunction));
 	typioparams = (Oid *) palloc(num_phys_attrs * sizeof(Oid));
 	defmap = (int *) palloc(num_phys_attrs * sizeof(int));
 	defexprs = (ExprState **) palloc(num_phys_attrs * sizeof(ExprState *));
@@ -1790,6 +1793,16 @@ BeginCopyFrom(ParseState *pstate,
 		cstate->routine->CopyFromInFunc(cstate, att->atttypid,
 										&in_functions[attnum - 1],
 										&typioparams[attnum - 1]);
+
+		/*
+		 * If the input function exposes an optimized fcinfo-free entry point
+		 * valid for this column's typmod/collation, cache it for the hot path
+		 * (only consulted by the text/CSV per-row routine).
+		 */
+		fast_in_functions[attnum - 1] =
+			get_fast_input_function(in_functions[attnum - 1].fn_oid,
+									typioparams[attnum - 1],
+									att->atttypmod, att->attcollation);
 
 		/* Get default info if available */
 		defexprs[attnum - 1] = NULL;
@@ -1851,6 +1864,7 @@ BeginCopyFrom(ParseState *pstate,
 
 	/* We keep those variables in cstate. */
 	cstate->in_functions = in_functions;
+	cstate->fast_in_functions = fast_in_functions;
 	cstate->typioparams = typioparams;
 	cstate->defmap = defmap;
 	cstate->defexprs = defexprs;

@@ -33,6 +33,7 @@
 #ifndef SUPPORTNODES_H
 #define SUPPORTNODES_H
 
+#include "fmgr.h"
 #include "nodes/plannodes.h"
 
 typedef struct PlannerInfo PlannerInfo; /* avoid including pathnodes.h here */
@@ -444,5 +445,27 @@ typedef struct SupportRequestModifyInPlace
 	List	   *args;			/* Arguments to the function */
 	int			paramid;		/* ID of Param(s) representing variable */
 } SupportRequestModifyInPlace;
+
+/*
+ * The InputFunction request allows a datatype's input function to expose an
+ * optimized, fcinfo-free entry point (see FastInputFunction in fmgr.h) that
+ * callers performing bulk string-to-Datum conversion (such as COPY FROM) can
+ * use to bypass the generic fmgr call path.
+ *
+ * The request carries the typmod, collation, and typioparam that the caller
+ * will use.  The support function must fill "fn" with a fast entry point only
+ * if it can produce results semantically identical to the regular input
+ * function for those parameters; otherwise it must leave "fn" as NULL (or
+ * return NULL), causing the caller to fall back to InputFunctionCallSafe().
+ */
+typedef struct SupportRequestInputFunction
+{
+	NodeTag		type;
+
+	int32		typmod;			/* typmod the caller will pass, or -1 */
+	Oid			collation;		/* collation the caller will pass */
+	Oid			typioparam;		/* typioparam the caller will pass */
+	FastInputFunction fn;		/* output: fast entry, or NULL if unsupported */
+} SupportRequestInputFunction;
 
 #endif							/* SUPPORTNODES_H */

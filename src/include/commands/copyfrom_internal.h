@@ -97,6 +97,8 @@ typedef struct CopyFromStateData
 	AttrNumber	num_defaults;	/* count of att that are missing and have
 								 * default value */
 	FmgrInfo   *in_functions;	/* array of input functions for each attrs */
+	FastInputFunction *fast_in_functions;	/* optional fcinfo-free fast entry
+											 * per attr; NULL where unavailable */
 	Oid		   *typioparams;	/* array of element types for in_functions */
 	ErrorSaveContext *escontext;	/* soft error trapped during in_functions
 									 * execution */
