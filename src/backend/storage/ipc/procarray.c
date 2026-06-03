@@ -261,6 +261,38 @@ typedef struct ComputeXidHorizonsResult
 } ComputeXidHorizonsResult;
 
 /*
+ * Optional diagnostic output of ComputeXidHorizons(): identifies which backend
+ * (or subsystem) held a horizon back to its computed value.
+ *
+ * This is only populated when a non-NULL XidHorizonBlocker is passed, so that
+ * hot callers (e.g. GlobalVisUpdate()) pay nothing for collecting it.  The
+ * collection itself is confined to ComputeXidHorizons(); see
+ * TransactionIdOlderTracked().
+ *
+ * The pgprocno fields identify the backend whose xmin/xid determined the
+ * corresponding horizon, or -1 when no running backend was the limiting factor
+ * (for example because a replication slot, or the KnownAssignedXids machinery
+ * during recovery, backed the horizon off further -- indicated by the *_by_slot
+ * and by_known_assigned flags).
+ *
+ * Note: a pgprocno is only meaningful as of the moment ComputeXidHorizons()
+ * inspected the ProcArray.  The backend may have exited (and its slot been
+ * reused) by the time the caller resolves it, so consumers must treat the
+ * resolved PID as best-effort diagnostic information.
+ *
+ * Only the shared and data horizons are tracked for now; the catalog horizon
+ * is derived from the data horizon and could be added later if needed.
+ */
+typedef struct XidHorizonBlocker
+{
+	int			shared_pgprocno;	/* backend behind shared_oldest_nonremovable */
+	int			data_pgprocno;	/* backend behind data_oldest_nonremovable */
+	bool		shared_by_slot; /* a replication slot backed shared off */
+	bool		data_by_slot;	/* a replication slot backed data off */
+	bool		by_known_assigned;	/* KnownAssignedXids backed horizons off */
+} XidHorizonBlocker;
+
+/*
  * Return value for GlobalVisHorizonKindForRel().
  */
 typedef enum GlobalVisHorizonKind
@@ -1615,6 +1647,31 @@ TransactionIdIsInProgress(TransactionId xid)
 
 
 /*
+ * Like TransactionIdOlder(), but also records the index of the "winning"
+ * candidate (candidx) whenever it advances the horizon.  ComputeXidHorizons()
+ * uses this to track which backend is holding a horizon back.
+ *
+ * blockeridx may be NULL, in which case no tracking is performed.  Hot callers
+ * pass NULL, so the only added cost on their path is a single, well-predicted
+ * branch -- the blocker bookkeeping is never reached.
+ */
+static inline TransactionId
+TransactionIdOlderTracked(TransactionId cur, TransactionId cand,
+						  int candidx, int *blockeridx)
+{
+	if (!TransactionIdIsValid(cand))
+		return cur;
+
+	if (!TransactionIdIsValid(cur) || TransactionIdPrecedes(cand, cur))
+	{
+		if (blockeridx)
+			*blockeridx = candidx;
+		return cand;
+	}
+	return cur;
+}
+
+/*
  * Determine XID horizons.
  *
  * This is used by wrapper functions like GetOldestNonRemovableTransactionId()
@@ -1671,7 +1728,7 @@ TransactionIdIsInProgress(TransactionId xid)
  * code doesn't expect (breaking HOT).
  */
 static void
-ComputeXidHorizons(ComputeXidHorizonsResult *h)
+ComputeXidHorizons(ComputeXidHorizonsResult *h, XidHorizonBlocker *blocker)
 {
 	ProcArrayStruct *arrayP = procArray;
 	TransactionId kaxmin;
@@ -1680,6 +1737,16 @@ ComputeXidHorizons(ComputeXidHorizonsResult *h)
 
 	/* inferred after ProcArrayLock is released */
 	h->catalog_oldest_nonremovable = InvalidTransactionId;
+
+	/* optional blocker diagnostics start out "nobody" */
+	if (blocker)
+	{
+		blocker->shared_pgprocno = -1;
+		blocker->data_pgprocno = -1;
+		blocker->shared_by_slot = false;
+		blocker->data_by_slot = false;
+		blocker->by_known_assigned = false;
+	}
 
 	LWLockAcquire(ProcArrayLock, LW_SHARED);
 
@@ -1772,7 +1839,9 @@ ComputeXidHorizons(ComputeXidHorizonsResult *h)
 
 		/* shared tables need to take backends in all databases into account */
 		h->shared_oldest_nonremovable =
-			TransactionIdOlder(h->shared_oldest_nonremovable, xmin);
+			TransactionIdOlderTracked(h->shared_oldest_nonremovable, xmin,
+									  pgprocno,
+									  blocker ? &blocker->shared_pgprocno : NULL);
 
 		/*
 		 * Normally sessions in other databases are ignored for anything but
@@ -1799,7 +1868,9 @@ ComputeXidHorizons(ComputeXidHorizonsResult *h)
 			in_recovery)
 		{
 			h->data_oldest_nonremovable =
-				TransactionIdOlder(h->data_oldest_nonremovable, xmin);
+				TransactionIdOlderTracked(h->data_oldest_nonremovable, xmin,
+										  pgprocno,
+										  blocker ? &blocker->data_pgprocno : NULL);
 		}
 	}
 
@@ -1825,6 +1896,24 @@ ComputeXidHorizons(ComputeXidHorizonsResult *h)
 		h->data_oldest_nonremovable =
 			TransactionIdOlder(h->data_oldest_nonremovable, kaxmin);
 		/* temp relations cannot be accessed in recovery */
+
+		/*
+		 * If KnownAssignedXids backed a horizon off, whatever backend we
+		 * recorded above is no longer the limiting factor.
+		 */
+		if (blocker && TransactionIdIsValid(kaxmin))
+		{
+			if (TransactionIdEquals(h->shared_oldest_nonremovable, kaxmin))
+			{
+				blocker->shared_pgprocno = -1;
+				blocker->by_known_assigned = true;
+			}
+			if (TransactionIdEquals(h->data_oldest_nonremovable, kaxmin))
+			{
+				blocker->data_pgprocno = -1;
+				blocker->by_known_assigned = true;
+			}
+		}
 	}
 
 	Assert(TransactionIdPrecedesOrEquals(h->oldest_considered_running,
@@ -1839,6 +1928,24 @@ ComputeXidHorizons(ComputeXidHorizonsResult *h)
 		TransactionIdOlder(h->shared_oldest_nonremovable, h->slot_xmin);
 	h->data_oldest_nonremovable =
 		TransactionIdOlder(h->data_oldest_nonremovable, h->slot_xmin);
+
+	/*
+	 * If a replication slot's xmin backed a horizon off, the slot -- not any
+	 * running backend -- is the limiting factor.
+	 */
+	if (blocker && TransactionIdIsValid(h->slot_xmin))
+	{
+		if (TransactionIdEquals(h->shared_oldest_nonremovable, h->slot_xmin))
+		{
+			blocker->shared_pgprocno = -1;
+			blocker->shared_by_slot = true;
+		}
+		if (TransactionIdEquals(h->data_oldest_nonremovable, h->slot_xmin))
+		{
+			blocker->data_pgprocno = -1;
+			blocker->data_by_slot = true;
+		}
+	}
 
 	/*
 	 * The only difference between catalog / data horizons is that the slot's
@@ -1930,6 +2037,33 @@ GlobalVisHorizonKindForRel(Relation rel)
 }
 
 /*
+ * Emit a diagnostic line describing what held a horizon back to its computed
+ * value.  This is a thin demonstration of how the blocker information collected
+ * by ComputeXidHorizons() can be surfaced; a production implementation would
+ * more likely route this into VACUUM VERBOSE / autovacuum logging rather than
+ * an unconditional DEBUG2 message.
+ *
+ * The resolved PID is best-effort: see the note on XidHorizonBlocker.
+ */
+static void
+LogXidHorizonBlocker(const char *which, TransactionId horizon,
+					 int pgprocno, bool by_slot, bool by_known_assigned)
+{
+	if (by_slot)
+		elog(DEBUG2, "%s removal horizon %u held back by a replication slot",
+			 which, horizon);
+	else if (by_known_assigned)
+		elog(DEBUG2, "%s removal horizon %u held back by KnownAssignedXids during recovery",
+			 which, horizon);
+	else if (pgprocno >= 0)
+		elog(DEBUG2, "%s removal horizon %u held back by PID %d",
+			 which, horizon, allProcs[pgprocno].pid);
+	else
+		elog(DEBUG2, "%s removal horizon %u not held back by any running backend",
+			 which, horizon);
+}
+
+/*
  * Return the oldest XID for which deleted tuples must be preserved in the
  * passed table.
  *
@@ -1944,16 +2078,27 @@ TransactionId
 GetOldestNonRemovableTransactionId(Relation rel)
 {
 	ComputeXidHorizonsResult horizons;
+	XidHorizonBlocker blocker;
 
-	ComputeXidHorizons(&horizons);
+	/*
+	 * Unlike the hot GlobalVisUpdate() path, VACUUM reaches this once per
+	 * relation, so we can afford to collect blocker diagnostics here.
+	 */
+	ComputeXidHorizons(&horizons, &blocker);
 
 	switch (GlobalVisHorizonKindForRel(rel))
 	{
 		case VISHORIZON_SHARED:
+			LogXidHorizonBlocker("shared", horizons.shared_oldest_nonremovable,
+								 blocker.shared_pgprocno, blocker.shared_by_slot,
+								 blocker.by_known_assigned);
 			return horizons.shared_oldest_nonremovable;
 		case VISHORIZON_CATALOG:
 			return horizons.catalog_oldest_nonremovable;
 		case VISHORIZON_DATA:
+			LogXidHorizonBlocker("data", horizons.data_oldest_nonremovable,
+								 blocker.data_pgprocno, blocker.data_by_slot,
+								 blocker.by_known_assigned);
 			return horizons.data_oldest_nonremovable;
 		case VISHORIZON_TEMP:
 			return horizons.temp_oldest_nonremovable;
@@ -1974,7 +2119,7 @@ GetOldestTransactionIdConsideredRunning(void)
 {
 	ComputeXidHorizonsResult horizons;
 
-	ComputeXidHorizons(&horizons);
+	ComputeXidHorizons(&horizons, NULL);
 
 	return horizons.oldest_considered_running;
 }
@@ -1987,7 +2132,7 @@ GetReplicationHorizons(TransactionId *xmin, TransactionId *catalog_xmin)
 {
 	ComputeXidHorizonsResult horizons;
 
-	ComputeXidHorizons(&horizons);
+	ComputeXidHorizons(&horizons, NULL);
 
 	/*
 	 * Don't want to use shared_oldest_nonremovable here, as that contains the
@@ -4205,8 +4350,8 @@ GlobalVisUpdate(void)
 {
 	ComputeXidHorizonsResult horizons;
 
-	/* updates the horizons as a side-effect */
-	ComputeXidHorizons(&horizons);
+	/* updates the horizons as a side-effect; no blocker collection on this hot path */
+	ComputeXidHorizons(&horizons, NULL);
 }
 
 /*
