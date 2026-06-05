@@ -261,24 +261,26 @@ typedef struct ComputeXidHorizonsResult
 } ComputeXidHorizonsResult;
 
 /*
- * Optional diagnostic output of ComputeXidHorizons(): identifies which backend
- * (or subsystem) held a horizon back to its computed value.
+ * Optional diagnostic output of ComputeXidHorizons(): the ProcArray index of
+ * the backend whose xmin/xid determined a given removal horizon.
  *
- * This is only populated when a non-NULL XidHorizonBlocker is passed, so that
- * hot callers (e.g. GlobalVisUpdate()) pay nothing for collecting it.  The
- * collection itself is confined to ComputeXidHorizons(); see
- * TransactionIdOlderTracked().
+ * This is the only blocker bookkeeping done inside ComputeXidHorizons(), and
+ * even that is confined to the existing MIN() comparisons via
+ * TransactionIdOlderTracked(); everything else (initialization, resolving the
+ * index to a PID, and reconciling against replication slots) is left to the
+ * caller so the hot path stays untouched.  Hot callers (e.g. GlobalVisUpdate())
+ * pass NULL and pay nothing.
  *
- * The pgprocno fields identify the backend whose xmin/xid determined the
- * corresponding horizon, or -1 when no running backend was the limiting factor
- * (for example because a replication slot, or the KnownAssignedXids machinery
- * during recovery, backed the horizon off further -- indicated by the *_by_slot
- * and by_known_assigned flags).
+ * A field is left at its caller-initialized -1 when no running backend was the
+ * limiting factor -- e.g. when a replication slot backed the horizon off
+ * further; the caller detects that by comparing the returned horizon against
+ * the slot xmins exposed in ComputeXidHorizonsResult.
  *
- * Note: a pgprocno is only meaningful as of the moment ComputeXidHorizons()
+ * Note: an index is only meaningful as of the moment ComputeXidHorizons()
  * inspected the ProcArray.  The backend may have exited (and its slot been
- * reused) by the time the caller resolves it, so consumers must treat the
- * resolved PID as best-effort diagnostic information.
+ * reused) by the time the caller resolves it, so the resolved PID is
+ * best-effort.  The horizon attribution itself (which slot held the MIN) is
+ * exact, since it is decided under the same ProcArrayLock acquisition.
  *
  * Only the shared and data horizons are tracked for now; the catalog horizon
  * is derived from the data horizon and could be added later if needed.
@@ -287,9 +289,6 @@ typedef struct XidHorizonBlocker
 {
 	int			shared_pgprocno;	/* backend behind shared_oldest_nonremovable */
 	int			data_pgprocno;	/* backend behind data_oldest_nonremovable */
-	bool		shared_by_slot; /* a replication slot backed shared off */
-	bool		data_by_slot;	/* a replication slot backed data off */
-	bool		by_known_assigned;	/* KnownAssignedXids backed horizons off */
 } XidHorizonBlocker;
 
 /*
@@ -1738,15 +1737,13 @@ ComputeXidHorizons(ComputeXidHorizonsResult *h, XidHorizonBlocker *blocker)
 	/* inferred after ProcArrayLock is released */
 	h->catalog_oldest_nonremovable = InvalidTransactionId;
 
-	/* optional blocker diagnostics start out "nobody" */
-	if (blocker)
-	{
-		blocker->shared_pgprocno = -1;
-		blocker->data_pgprocno = -1;
-		blocker->shared_by_slot = false;
-		blocker->data_by_slot = false;
-		blocker->by_known_assigned = false;
-	}
+	/*
+	 * Blocker tracking (if requested) only ever lowers from the caller's
+	 * initialization, and is not wired up for the recovery (KnownAssignedXids)
+	 * path -- which is fine because the sole caller that requests it, VACUUM's
+	 * GetOldestNonRemovableTransactionId(), never runs during recovery.
+	 */
+	Assert(blocker == NULL || !in_recovery);
 
 	LWLockAcquire(ProcArrayLock, LW_SHARED);
 
@@ -1896,24 +1893,6 @@ ComputeXidHorizons(ComputeXidHorizonsResult *h, XidHorizonBlocker *blocker)
 		h->data_oldest_nonremovable =
 			TransactionIdOlder(h->data_oldest_nonremovable, kaxmin);
 		/* temp relations cannot be accessed in recovery */
-
-		/*
-		 * If KnownAssignedXids backed a horizon off, whatever backend we
-		 * recorded above is no longer the limiting factor.
-		 */
-		if (blocker && TransactionIdIsValid(kaxmin))
-		{
-			if (TransactionIdEquals(h->shared_oldest_nonremovable, kaxmin))
-			{
-				blocker->shared_pgprocno = -1;
-				blocker->by_known_assigned = true;
-			}
-			if (TransactionIdEquals(h->data_oldest_nonremovable, kaxmin))
-			{
-				blocker->data_pgprocno = -1;
-				blocker->by_known_assigned = true;
-			}
-		}
 	}
 
 	Assert(TransactionIdPrecedesOrEquals(h->oldest_considered_running,
@@ -1928,24 +1907,6 @@ ComputeXidHorizons(ComputeXidHorizonsResult *h, XidHorizonBlocker *blocker)
 		TransactionIdOlder(h->shared_oldest_nonremovable, h->slot_xmin);
 	h->data_oldest_nonremovable =
 		TransactionIdOlder(h->data_oldest_nonremovable, h->slot_xmin);
-
-	/*
-	 * If a replication slot's xmin backed a horizon off, the slot -- not any
-	 * running backend -- is the limiting factor.
-	 */
-	if (blocker && TransactionIdIsValid(h->slot_xmin))
-	{
-		if (TransactionIdEquals(h->shared_oldest_nonremovable, h->slot_xmin))
-		{
-			blocker->shared_pgprocno = -1;
-			blocker->shared_by_slot = true;
-		}
-		if (TransactionIdEquals(h->data_oldest_nonremovable, h->slot_xmin))
-		{
-			blocker->data_pgprocno = -1;
-			blocker->data_by_slot = true;
-		}
-	}
 
 	/*
 	 * The only difference between catalog / data horizons is that the slot's
@@ -2047,13 +2008,10 @@ GlobalVisHorizonKindForRel(Relation rel)
  */
 static void
 LogXidHorizonBlocker(const char *which, TransactionId horizon,
-					 int pgprocno, bool by_slot, bool by_known_assigned)
+					 int pgprocno, bool by_slot)
 {
 	if (by_slot)
 		elog(DEBUG2, "%s removal horizon %u held back by a replication slot",
-			 which, horizon);
-	else if (by_known_assigned)
-		elog(DEBUG2, "%s removal horizon %u held back by KnownAssignedXids during recovery",
 			 which, horizon);
 	else if (pgprocno >= 0)
 		elog(DEBUG2, "%s removal horizon %u held back by PID %d",
@@ -2078,28 +2036,46 @@ TransactionId
 GetOldestNonRemovableTransactionId(Relation rel)
 {
 	ComputeXidHorizonsResult horizons;
-	XidHorizonBlocker blocker;
 
 	/*
 	 * Unlike the hot GlobalVisUpdate() path, VACUUM reaches this once per
-	 * relation, so we can afford to collect blocker diagnostics here.
+	 * relation, so we can afford to collect blocker diagnostics here.  The
+	 * caller initializes the indexes; ComputeXidHorizons() only lowers them.
 	 */
+	XidHorizonBlocker blocker = {.shared_pgprocno = -1,.data_pgprocno = -1};
+
 	ComputeXidHorizons(&horizons, &blocker);
 
 	switch (GlobalVisHorizonKindForRel(rel))
 	{
 		case VISHORIZON_SHARED:
-			LogXidHorizonBlocker("shared", horizons.shared_oldest_nonremovable,
-								 blocker.shared_pgprocno, blocker.shared_by_slot,
-								 blocker.by_known_assigned);
-			return horizons.shared_oldest_nonremovable;
+			{
+				/* the shared horizon can be backed off by either slot xmin */
+				bool		by_slot =
+					(TransactionIdIsValid(horizons.slot_xmin) &&
+					 TransactionIdEquals(horizons.shared_oldest_nonremovable,
+										 horizons.slot_xmin)) ||
+					(TransactionIdIsValid(horizons.slot_catalog_xmin) &&
+					 TransactionIdEquals(horizons.shared_oldest_nonremovable,
+										 horizons.slot_catalog_xmin));
+
+				LogXidHorizonBlocker("shared", horizons.shared_oldest_nonremovable,
+									 blocker.shared_pgprocno, by_slot);
+				return horizons.shared_oldest_nonremovable;
+			}
 		case VISHORIZON_CATALOG:
 			return horizons.catalog_oldest_nonremovable;
 		case VISHORIZON_DATA:
-			LogXidHorizonBlocker("data", horizons.data_oldest_nonremovable,
-								 blocker.data_pgprocno, blocker.data_by_slot,
-								 blocker.by_known_assigned);
-			return horizons.data_oldest_nonremovable;
+			{
+				bool		by_slot =
+					TransactionIdIsValid(horizons.slot_xmin) &&
+					TransactionIdEquals(horizons.data_oldest_nonremovable,
+										horizons.slot_xmin);
+
+				LogXidHorizonBlocker("data", horizons.data_oldest_nonremovable,
+									 blocker.data_pgprocno, by_slot);
+				return horizons.data_oldest_nonremovable;
+			}
 		case VISHORIZON_TEMP:
 			return horizons.temp_oldest_nonremovable;
 	}
