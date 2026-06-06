@@ -500,6 +500,37 @@ commit;
 
 select * from selfconflict;
 
+-- Self-conflict against a pre-existing (already committed) row.  Plain DO
+-- SELECT may return the same row more than once, but the locking variants must
+-- reject affecting the same row a second time, just like the DO SELECT FOR
+-- UPDATE cases above where the conflicting row is inserted in the same command.
+insert into selfconflict values (20, 0);
+
+begin transaction isolation level read committed;
+insert into selfconflict values (20,1), (20,2) on conflict(f1) do select returning *;
+commit;
+
+begin transaction isolation level read committed;
+insert into selfconflict values (20,1), (20,2) on conflict(f1) do select for update returning *;
+commit;
+
+begin transaction isolation level read committed;
+insert into selfconflict values (20,1), (20,2) on conflict(f1) do select for share returning *;
+commit;
+
+-- Distinct conflicting keys in one command must not be rejected, and locking a
+-- row in an earlier command of the same transaction must not be mistaken for a
+-- second-time conflict.
+insert into selfconflict values (21, 0);
+insert into selfconflict values (20,1), (21,1) on conflict(f1) do select for update returning *;
+
+begin transaction isolation level read committed;
+select * from selfconflict where f1 = 20 for update;
+insert into selfconflict values (20,1) on conflict(f1) do select for update returning *;
+commit;
+
+select * from selfconflict;
+
 drop table selfconflict;
 
 -- check ON CONFLICT handling with partitioned tables

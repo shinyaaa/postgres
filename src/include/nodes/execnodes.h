@@ -1508,6 +1508,14 @@ typedef struct ModifyTableState
 	List	   *mt_updateColnosLists;
 	List	   *mt_mergeActionLists;
 	List	   *mt_mergeJoinConditions;
+
+	/*
+	 * Hash table of rows already locked and returned by ON CONFLICT DO SELECT
+	 * FOR UPDATE/SHARE during the current command, used to detect (and reject)
+	 * an attempt to affect the same existing row a second time.  NULL until the
+	 * first such row is locked.  See ExecOnConflictLockRow().
+	 */
+	HTAB	   *mt_oc_lockedTids;
 } ModifyTableState;
 
 /* ----------------

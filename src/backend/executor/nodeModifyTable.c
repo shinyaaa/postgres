@@ -85,6 +85,17 @@ typedef struct MTTargetRelLookup
 } MTTargetRelLookup;
 
 /*
+ * Hash key identifying a row locked by ON CONFLICT DO SELECT FOR UPDATE/SHARE
+ * during the current command.  See mt_oc_lockedTids in ModifyTableState and
+ * ExecOnConflictLockRow().
+ */
+typedef struct OnConflictLockedTid
+{
+	Oid			relid;			/* OID of the (leaf) result relation */
+	ItemPointerData tid;		/* TID of the locked existing row */
+} OnConflictLockedTid;
+
+/*
  * Context struct for a ModifyTable operation, containing basic execution
  * state and some output variables populated by ExecUpdateAct() and
  * ExecDeleteAct() to report the result of their actions to callers.
@@ -3000,6 +3011,59 @@ redo_act:
 }
 
 /*
+ * ExecOnConflictRowLockedTwice --- track rows locked by ON CONFLICT DO SELECT
+ *
+ * Records that we have locked the existing row identified by (relid,
+ * conflictTid) as part of ON CONFLICT DO SELECT FOR UPDATE/SHARE, and reports
+ * whether that same row had already been locked earlier in the current
+ * command.
+ *
+ * Locking (and returning) the same existing row twice within a single command
+ * is disallowed, for the same reason that ON CONFLICT DO UPDATE disallows
+ * updating a row twice: it would mean affecting a row a second time in some
+ * unspecified order.  Unlike DO UPDATE, a row lock doesn't create a new row
+ * version, so the TM_Invisible check in ExecOnConflictLockRow() only catches
+ * the case where the conflicting row was inserted earlier in the same command;
+ * a pre-existing row that is locked repeatedly is not detected that way.  We
+ * therefore track the rows locked so far in a hash table.  The hash table lives
+ * for the duration of one ModifyTable execution, so command boundaries are
+ * respected automatically: rows locked by a previous command in the same
+ * transaction are not in it and won't trigger a false positive.
+ *
+ * (Plain DO SELECT without locking is intentionally permitted to return the
+ * same row more than once, so this only applies to the locking variants.)
+ */
+static bool
+ExecOnConflictRowLockedTwice(ModifyTableState *mtstate, Oid relid,
+							 ItemPointer conflictTid)
+{
+	OnConflictLockedTid key;
+	bool		found;
+
+	if (mtstate->mt_oc_lockedTids == NULL)
+	{
+		HASHCTL		hash_ctl;
+
+		hash_ctl.keysize = sizeof(OnConflictLockedTid);
+		hash_ctl.entrysize = sizeof(OnConflictLockedTid);
+		hash_ctl.hcxt = mtstate->ps.state->es_query_cxt;
+		mtstate->mt_oc_lockedTids =
+			hash_create("ON CONFLICT DO SELECT locked rows",
+						64, &hash_ctl,
+						HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+
+	/* Zero the key, including any padding, for HASH_BLOBS comparisons. */
+	memset(&key, 0, sizeof(key));
+	key.relid = relid;
+	ItemPointerCopy(conflictTid, &key.tid);
+
+	(void) hash_search(mtstate->mt_oc_lockedTids, &key, HASH_ENTER, &found);
+
+	return found;
+}
+
+/*
  * ExecOnConflictLockRow --- lock the row for ON CONFLICT DO SELECT/UPDATE
  *
  * Try to lock tuple for update as part of speculative insertion for ON
@@ -3116,6 +3180,24 @@ ExecOnConflictLockRow(ModifyTableContext *context,
 	}
 
 	/* Success, the tuple is locked. */
+
+	/*
+	 * For ON CONFLICT DO SELECT FOR UPDATE/SHARE, reject an attempt to lock and
+	 * return the same existing row a second time within the current command.
+	 * The TM_Invisible case above only catches conflicts with rows inserted
+	 * earlier in the same command; a pre-existing row that is locked again is
+	 * detected here instead.  (DO UPDATE has no analogous case here because
+	 * updating creates a new row version, which the TM_Invisible path detects.)
+	 */
+	if (!isUpdate &&
+		ExecOnConflictRowLockedTwice(context->mtstate,
+									 RelationGetRelid(relation),
+									 conflictTid))
+		ereport(ERROR,
+				(errcode(ERRCODE_CARDINALITY_VIOLATION),
+				 errmsg("ON CONFLICT DO SELECT command cannot affect row a second time"),
+				 errhint("Ensure that no rows proposed for insertion within the same command have duplicate constrained values.")));
+
 	return true;
 }
 

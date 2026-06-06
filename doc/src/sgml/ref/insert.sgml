@@ -610,12 +610,17 @@ INSERT INTO <replaceable class="parameter">table_name</replaceable> [ AS <replac
 
    <para>
     <command>INSERT</command> with an <literal>ON CONFLICT DO UPDATE</literal>
-    clause is a <quote>deterministic</quote> statement.  This means
-    that the command will not be allowed to affect any single existing
-    row more than once; a cardinality violation error will be raised
-    when this situation arises.  Rows proposed for insertion should
+    clause, or an <literal>ON CONFLICT DO SELECT</literal> clause that
+    requests row-level locking with <literal>FOR UPDATE</literal>,
+    <literal>FOR NO KEY UPDATE</literal>, <literal>FOR SHARE</literal> or
+    <literal>FOR KEY SHARE</literal>, is a <quote>deterministic</quote>
+    statement.  This means that the command will not be allowed to affect any
+    single existing row more than once; a cardinality violation error will be
+    raised when this situation arises.  Rows proposed for insertion should
     not duplicate each other in terms of attributes constrained by an
-    arbiter index or constraint.
+    arbiter index or constraint.  An <literal>ON CONFLICT DO SELECT</literal>
+    clause without row-level locking does not have this restriction, and may
+    return the same existing row more than once.
    </para>
 
    <para>
