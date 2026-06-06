@@ -1,0 +1,671 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ComputeXidHorizons() アニメーション解説</title>
+<style>
+  :root {
+    --bg: #0f1623;
+    --panel: #18233a;
+    --panel2: #1f2d49;
+    --border: #2c3e63;
+    --text: #e6edf7;
+    --muted: #95a6c4;
+    --accent: #4f8cff;
+
+    --c-lc:   #9aa7bd;  /* latest_completed */
+    --c-temp: #ff9f43;  /* temp */
+    --c-sx:   #ff5d5d;  /* slot_xmin */
+    --c-scx:  #c2185b;  /* slot_catalog_xmin */
+    --c-ocr:  #b07cff;  /* oldest_considered_running */
+    --c-shr:  #4f8cff;  /* shared */
+    --c-shrr: #54c7ec;  /* shared_raw */
+    --c-cat:  #1fc8a9;  /* catalog */
+    --c-data: #46d160;  /* data */
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, "Hiragino Kaku Gothic ProN", "Yu Gothic", Meiryo, sans-serif;
+    line-height: 1.6;
+  }
+  header {
+    padding: 20px 28px; border-bottom: 1px solid var(--border);
+    background: linear-gradient(180deg, #16223c, #0f1623);
+  }
+  header h1 { margin: 0 0 4px; font-size: 22px; }
+  header p { margin: 0; color: var(--muted); font-size: 13px; }
+  code, .mono { font-family: "SF Mono", "Consolas", "Menlo", monospace; }
+
+  .wrap { max-width: 1280px; margin: 0 auto; padding: 18px 20px 60px; }
+  .grid {
+    display: grid; grid-template-columns: 1fr 420px; gap: 18px;
+  }
+  @media (max-width: 1080px){ .grid{ grid-template-columns: 1fr; } }
+
+  .card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 12px; padding: 16px;
+  }
+  .card h2 { margin: 0 0 12px; font-size: 14px; color: var(--muted);
+    text-transform: uppercase; letter-spacing: .06em; }
+
+  /* ---- number line ---- */
+  .axis-wrap { position: relative; height: 360px; margin: 10px 6px 0; }
+  .axis {
+    position: absolute; left: 0; right: 0; top: 168px; height: 4px;
+    background: linear-gradient(90deg, #2a3a5c, #44608f);
+    border-radius: 2px;
+  }
+  .axis-label-min, .axis-label-max {
+    position: absolute; top: 178px; font-size: 11px; color: var(--muted);
+  }
+  .axis-label-min { left: 0; }
+  .axis-label-max { right: 0; }
+  .tick {
+    position: absolute; top: 160px; width: 1px; height: 20px;
+    background: #3a4d75; transform: translateX(-50%);
+  }
+  .tick span {
+    position: absolute; top: 22px; left: 50%; transform: translateX(-50%);
+    font-size: 10px; color: var(--muted); white-space: nowrap;
+  }
+  .marker {
+    position: absolute; transform: translateX(-50%);
+    transition: left .7s cubic-bezier(.22,.61,.36,1), opacity .4s;
+    display: flex; flex-direction: column; align-items: center;
+    pointer-events: none;
+  }
+  .marker.hidden { opacity: 0; }
+  .marker .lbl {
+    font-size: 11px; font-weight: 700; padding: 2px 6px; border-radius: 5px;
+    white-space: nowrap; color: #0b1220; line-height: 1.3;
+  }
+  .marker .stem { width: 2px; flex: 0 0 auto; }
+  .marker.changed .lbl { box-shadow: 0 0 0 2px #fff, 0 0 12px 2px currentColor; }
+  .marker.changed { z-index: 30; }
+
+  /* markers above the axis point downward */
+  .marker.up   { justify-content: flex-end; }
+  .marker.down { justify-content: flex-start; }
+
+  /* ---- procs ---- */
+  .procs { display: flex; flex-wrap: wrap; gap: 10px; }
+  .proc {
+    flex: 1 1 150px; min-width: 150px; background: var(--panel2);
+    border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px;
+    transition: box-shadow .25s, border-color .25s, transform .25s; position: relative;
+  }
+  .proc.active { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(79,140,255,.45); transform: translateY(-2px); }
+  .proc.done { opacity: .55; }
+  .proc .pname { font-weight: 700; font-size: 13px; margin-bottom: 2px; }
+  .proc .pdesc { font-size: 11px; color: var(--muted); margin-bottom: 8px; }
+  .proc .prow { display: flex; justify-content: space-between; font-size: 12px; }
+  .proc .prow .k { color: var(--muted); }
+  .proc .flag {
+    display: inline-block; margin-top: 6px; font-size: 10px; padding: 1px 6px;
+    border-radius: 4px; background: #3a2740; color: #ffb1d6; border: 1px solid #5a3a55;
+  }
+  .proc .eff {
+    margin-top: 6px; font-size: 12px; font-weight: 700; color: var(--c-ocr);
+  }
+
+  /* ---- slots / globals ---- */
+  .globals { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+  .chip {
+    background: var(--panel2); border: 1px solid var(--border);
+    border-radius: 8px; padding: 6px 10px; font-size: 12px;
+  }
+  .chip b { font-variant-numeric: tabular-nums; }
+  .chip.lock-on { border-color: #46d160; color: #9affb3; }
+  .chip.lock-off { color: var(--muted); }
+
+  /* ---- step / description ---- */
+  .step-title { font-size: 16px; font-weight: 700; margin: 0 0 6px; color: #fff; }
+  .step-tag {
+    display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 20px;
+    background: #233456; color: var(--accent); margin-bottom: 10px;
+  }
+  .step-desc { font-size: 13.5px; color: var(--text); }
+  .step-desc strong { color: #ffd479; }
+  .step-desc .hz { font-weight: 700; }
+
+  /* ---- code ---- */
+  pre.code {
+    margin: 0; background: #0c121f; border: 1px solid var(--border);
+    border-radius: 10px; padding: 10px 0; font-size: 12px; overflow-x: auto;
+    max-height: 340px;
+  }
+  pre.code .ln {
+    display: block; padding: 0 14px; white-space: pre; color: #c4d0e6;
+    border-left: 3px solid transparent;
+  }
+  pre.code .ln.hl { background: rgba(79,140,255,.16); border-left-color: var(--accent); }
+  pre.code .cmt { color: #6f86ad; }
+  pre.code .kw { color: #ff9f6e; }
+  pre.code .fn { color: #7fd4ff; }
+
+  /* ---- controls ---- */
+  .controls {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    margin: 16px 0; padding: 12px 14px; background: var(--panel);
+    border: 1px solid var(--border); border-radius: 12px;
+  }
+  button {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 8px 14px; font-size: 13px; cursor: pointer;
+    transition: background .15s, border-color .15s;
+  }
+  button:hover { background: #28395c; border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 700; }
+  button.primary:hover { background: #3f7bf0; }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  .progress { flex: 1; min-width: 140px; height: 8px; background: #12203b;
+    border-radius: 4px; overflow: hidden; }
+  .progress > div { height: 100%; width: 0; background: linear-gradient(90deg,#4f8cff,#46d160);
+    transition: width .4s; }
+  .counter { font-size: 12px; color: var(--muted); min-width: 64px; text-align: right; font-variant-numeric: tabular-nums; }
+  label.speed { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+
+  /* ---- legend ---- */
+  .legend { display: flex; flex-wrap: wrap; gap: 8px 14px; margin-top: 12px; font-size: 11px; color: var(--muted); }
+  .legend span { display: flex; align-items: center; gap: 5px; }
+  .legend i { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+
+  /* ---- result table ---- */
+  table.result { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 4px; }
+  table.result th, table.result td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+  table.result th { color: var(--muted); font-weight: 600; }
+  table.result td.val { font-weight: 700; font-variant-numeric: tabular-nums; }
+  .hint { font-size: 11.5px; color: var(--muted); margin-top: 10px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>ComputeXidHorizons() — XID 地平線(ホライズン)計算の可視化</h1>
+  <p>PostgreSQL <code>src/backend/storage/ipc/procarray.c</code> / VACUUM が「どこまで古い不要タプルを削除してよいか」を決める中核処理</p>
+</header>
+
+<div class="wrap">
+
+  <div class="controls">
+    <button id="btnReset">⟲ 最初へ</button>
+    <button id="btnPrev">◀ 前へ</button>
+    <button id="btnPlay" class="primary">▶ 再生</button>
+    <button id="btnNext">次へ ▶</button>
+    <div class="progress"><div id="prog"></div></div>
+    <span class="counter" id="counter">0 / 0</span>
+    <label class="speed">速度
+      <select id="speed">
+        <option value="2600">遅い</option>
+        <option value="1700" selected>標準</option>
+        <option value="1000">速い</option>
+      </select>
+    </label>
+  </div>
+
+  <div class="grid">
+    <!-- 左カラム: 可視化 -->
+    <div>
+      <div class="card">
+        <h2>共有状態 (ProcArray / 複製スロット)</h2>
+        <div class="globals">
+          <div class="chip" id="chipLatest">latestCompletedXid = <b>—</b></div>
+          <div class="chip" id="chipSlotX">slot_xmin = <b>—</b></div>
+          <div class="chip" id="chipSlotC">slot_catalog_xmin = <b>—</b></div>
+          <div class="chip lock-off" id="chipLock">🔓 ProcArrayLock</div>
+        </div>
+        <div class="procs" id="procs"></div>
+      </div>
+
+      <div class="card" style="margin-top:18px;">
+        <h2>XID 数直線とホライズンの移動</h2>
+        <div class="axis-wrap" id="axisWrap">
+          <div class="axis"></div>
+          <div class="axis-label-min">← 古い XID</div>
+          <div class="axis-label-max">新しい XID →</div>
+        </div>
+        <div class="legend" id="legend"></div>
+      </div>
+    </div>
+
+    <!-- 右カラム: 解説 + コード -->
+    <div>
+      <div class="card">
+        <span class="step-tag" id="stepTag">STEP</span>
+        <p class="step-title" id="stepTitle"></p>
+        <div class="step-desc" id="stepDesc"></div>
+      </div>
+
+      <div class="card" style="margin-top:18px;">
+        <h2>対応するソースコード</h2>
+        <pre class="code" id="code"></pre>
+      </div>
+
+      <div class="card" id="resultCard" style="margin-top:18px; display:none;">
+        <h2>最終的な計算結果 (ComputeXidHorizonsResult)</h2>
+        <table class="result" id="resultTable"></table>
+        <div class="hint">これらの値は最後に <code>GlobalVisUpdateApply()</code> で各リレーション種別の
+        近似ホライズン (GlobalVisState) に反映され、HOT プルーニングや VACUUM の判断に使われます。</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+//==================================================================
+// シナリオ定義
+//==================================================================
+const DOMAIN = { min: 77, max: 104 };          // 数直線の範囲
+const TICKS  = [80, 85, 90, 95, 100];
+
+// ホライズン(マーカー)定義: lane が正=軸の下、負=軸の上
+const HZDEF = {
+  lc:   { name: 'latestCompletedXid', short:'latestCompleted', color:'var(--c-lc)',   lane:-1, dir:'up'   },
+  temp: { name: 'temp_oldest_nonremovable', short:'temp', color:'var(--c-temp)',      lane:-2, dir:'up'   },
+  sx:   { name: 'slot_xmin', short:'slot_xmin', color:'var(--c-sx)',                  lane:-3, dir:'up'   },
+  scx:  { name: 'slot_catalog_xmin', short:'slot_catalog_xmin', color:'var(--c-scx)', lane:-4, dir:'up'   },
+  ocr:  { name: 'oldest_considered_running', short:'oldest_considered_running', color:'var(--c-ocr)', lane:1, dir:'down' },
+  shr:  { name: 'shared_oldest_nonremovable', short:'shared', color:'var(--c-shr)',   lane:2, dir:'down' },
+  shrr: { name: 'shared_oldest_nonremovable_raw', short:'shared_raw', color:'var(--c-shrr)', lane:3, dir:'down' },
+  cat:  { name: 'catalog_oldest_nonremovable', short:'catalog', color:'var(--c-cat)', lane:4, dir:'down' },
+  data: { name: 'data_oldest_nonremovable', short:'data', color:'var(--c-data)',      lane:5, dir:'down' },
+};
+
+// ProcArray 内のバックエンド
+const PROCS = [
+  { id:'A', name:'Backend A', desc:'通常クエリ (自DB)',        xid:'—',  xmin:95, db:'自DB(1)', flags:[],                          eff:95 },
+  { id:'B', name:'Backend B', desc:'通常クエリ (自DB)',        xid:98,   xmin:'—', db:'自DB(1)', flags:[],                          eff:98 },
+  { id:'C', name:'Backend C', desc:'VACUUM (自DB)',            xid:'—',  xmin:90, db:'自DB(1)', flags:['PROC_IN_VACUUM'],          eff:90 },
+  { id:'D', name:'Backend D', desc:'通常クエリ (他DB)',        xid:'—',  xmin:92, db:'他DB(2)', flags:[],                          eff:92 },
+  { id:'E', name:'Backend E', desc:'ロジカルデコード (walsender)', xid:'—', xmin:88, db:'—',  flags:['PROC_IN_LOGICAL_DECODING'], eff:88 },
+];
+
+// ソースコード行 (簡略化したが procarray.c に忠実)
+const CODE = [
+/*0*/ ['LWLockAcquire(ProcArrayLock, LW_SHARED);', 0],
+/*1*/ ['h->latest_completed = TransamVariables->latestCompletedXid;', 0],
+/*2*/ ['', 0],
+/*3*/ ['/* latestCompletedXid + 1 を MIN 計算の初期値にする */', 1],
+/*4*/ ['initial = XidFromFullTransactionId(h->latest_completed);', 0],
+/*5*/ ['TransactionIdAdvance(initial);            // = 101', 0],
+/*6*/ ['h->oldest_considered_running = initial;', 0],
+/*7*/ ['h->shared_oldest_nonremovable = initial;', 0],
+/*8*/ ['h->data_oldest_nonremovable   = initial;', 0],
+/*9*/ ['', 0],
+/*10*/['if (TransactionIdIsValid(MyProc->xid))', 0],
+/*11*/['    h->temp_oldest_nonremovable = MyProc->xid;', 0],
+/*12*/['else', 0],
+/*13*/['    h->temp_oldest_nonremovable = initial;', 0],
+/*14*/['', 0],
+/*15*/['h->slot_xmin         = procArray->replication_slot_xmin;', 0],
+/*16*/['h->slot_catalog_xmin = procArray->replication_slot_catalog_xmin;', 0],
+/*17*/['', 0],
+/*18*/['for (index = 0; index < arrayP->numProcs; index++) {', 0],
+/*19*/['    xid  = other_xids[index];', 0],
+/*20*/['    xmin = proc->xmin;', 0],
+/*21*/['    xmin = TransactionIdOlder(xmin, xid);   // 古い方を採用', 0],
+/*22*/['    if (!TransactionIdIsValid(xmin)) continue;', 0],
+/*23*/['    h->oldest_considered_running =', 0],
+/*24*/['        TransactionIdOlder(h->oldest_considered_running, xmin);', 0],
+/*25*/['    if (statusFlags & (PROC_IN_VACUUM | PROC_IN_LOGICAL_DECODING))', 0],
+/*26*/['        continue;                           // VACUUM/論理デコードは除外', 1],
+/*27*/['    h->shared_oldest_nonremovable =', 0],
+/*28*/['        TransactionIdOlder(h->shared_oldest_nonremovable, xmin);', 0],
+/*29*/['    if (proc->databaseId == MyDatabaseId || MyDatabaseId == InvalidOid ||', 0],
+/*30*/['        (statusFlags & PROC_AFFECTS_ALL_HORIZONS) || in_recovery)', 0],
+/*31*/['        h->data_oldest_nonremovable =', 0],
+/*32*/['            TransactionIdOlder(h->data_oldest_nonremovable, xmin);', 0],
+/*33*/['}', 0],
+/*34*/['', 0],
+/*35*/['if (in_recovery) kaxmin = KnownAssignedXidsGetOldestXmin();', 0],
+/*36*/['LWLockRelease(ProcArrayLock);             // ここでロック解放', 0],
+/*37*/['', 0],
+/*38*/['/* 複製スロットの xmin を反映 */', 1],
+/*39*/['h->shared_oldest_nonremovable =', 0],
+/*40*/['    TransactionIdOlder(h->shared_oldest_nonremovable, h->slot_xmin);', 0],
+/*41*/['h->data_oldest_nonremovable =', 0],
+/*42*/['    TransactionIdOlder(h->data_oldest_nonremovable, h->slot_xmin);', 0],
+/*43*/['', 0],
+/*44*/['h->shared_oldest_nonremovable_raw = h->shared_oldest_nonremovable;', 0],
+/*45*/['h->shared_oldest_nonremovable =', 0],
+/*46*/['    TransactionIdOlder(h->shared_oldest_nonremovable, h->slot_catalog_xmin);', 0],
+/*47*/['h->catalog_oldest_nonremovable = h->data_oldest_nonremovable;', 0],
+/*48*/['h->catalog_oldest_nonremovable =', 0],
+/*49*/['    TransactionIdOlder(h->catalog_oldest_nonremovable, h->slot_catalog_xmin);', 0],
+/*50*/['', 0],
+/*51*/['/* ocr は全ホライズン以下になるよう補正 */', 1],
+/*52*/['h->oldest_considered_running =', 0],
+/*53*/['    TransactionIdOlder(h->oldest_considered_running, h->shared_oldest_nonremovable);', 0],
+/*54*/['h->oldest_considered_running =', 0],
+/*55*/['    TransactionIdOlder(h->oldest_considered_running, h->catalog_oldest_nonremovable);', 0],
+/*56*/['h->oldest_considered_running =', 0],
+/*57*/['    TransactionIdOlder(h->oldest_considered_running, h->data_oldest_nonremovable);', 0],
+/*58*/['', 0],
+/*59*/['GlobalVisUpdateApply(h);                   // 近似ホライズンへ反映', 0],
+];
+
+//==================================================================
+// 各ステップの状態
+//==================================================================
+const STEPS = [
+  {
+    tag:'導入', title:'初期状態 — 役者の紹介',
+    desc:`<code>ComputeXidHorizons()</code> は「どの XID より古い不要タプルなら誰の目にも触れず安全に削除できるか」という
+          <strong>地平線(ホライズン)</strong>を求めます。登場するのは ① ProcArray 上の全バックエンド、
+          ② 複製スロットの xmin、③ <span class="mono">latestCompletedXid</span> です。`,
+    code:[], hz:{}, changed:[], proc:null, locked:false, globals:{}
+  },
+  {
+    tag:'STEP 1', title:'ProcArrayLock を取得し latestCompletedXid を読む',
+    desc:`まず <code>LWLockAcquire(ProcArrayLock, LW_SHARED)</code> で共有ロックを取得。
+          完了済みで最も新しいトランザクション ID <span class="hz" style="color:var(--c-lc)">latestCompletedXid = 100</span> を読み取ります。`,
+    code:[0,1], hz:{lc:100}, changed:['lc'], proc:null, locked:true, globals:{latest:100}
+  },
+  {
+    tag:'STEP 2', title:'initial = latestCompletedXid + 1 で初期化',
+    desc:`MIN 計算の下限値 <strong>initial = 100 + 1 = 101</strong> を作り、
+          <span class="hz" style="color:var(--c-ocr)">ocr</span>・
+          <span class="hz" style="color:var(--c-shr)">shared</span>・
+          <span class="hz" style="color:var(--c-data)">data</span> を <strong>101</strong> に初期化します。
+          これは「これから ProcArray に現れうる XID の下限」で、過大評価を防ぐ保険です。`,
+    code:[3,4,5,6,7,8], hz:{lc:100, ocr:101, shr:101, data:101}, changed:['ocr','shr','data'], proc:null, locked:true, globals:{latest:100}
+  },
+  {
+    tag:'STEP 3', title:'temp ホライズンの初期化',
+    desc:`一時テーブルは自分の変更しか影響しません。<code>MyProc->xid</code> が無効なので
+          <span class="hz" style="color:var(--c-temp)">temp = 101</span> (= initial) とします。`,
+    code:[10,11,12,13], hz:{lc:100, ocr:101, shr:101, data:101, temp:101}, changed:['temp'], proc:null, locked:true, globals:{latest:100}
+  },
+  {
+    tag:'STEP 4', title:'複製スロットの xmin を取得',
+    desc:`ロック保持中に複製スロットの値を取得します。
+          <span class="hz" style="color:var(--c-sx)">slot_xmin = 85</span>、
+          <span class="hz" style="color:var(--c-scx)">slot_catalog_xmin = 80</span>。
+          後段でこれらを使ってホライズンを更に古い側へ引き下げます。`,
+    code:[15,16], hz:{lc:100, ocr:101, shr:101, data:101, temp:101, sx:85, scx:80}, changed:['sx','scx'], proc:null, locked:true, globals:{latest:100, sx:85, scx:80}
+  },
+  {
+    tag:'STEP 5 / ループ', title:'Backend A を処理 (通常クエリ・自DB)',
+    desc:`各バックエンドで <code>xmin = min(proc-&gt;xmin, xid)</code> を計算。A は <strong>xmin=95</strong>。
+          通常バックエンドなので全てに影響:
+          <span class="hz" style="color:var(--c-ocr)">ocr 101→95</span>、
+          <span class="hz" style="color:var(--c-shr)">shared 101→95</span>、
+          自DBなので <span class="hz" style="color:var(--c-data)">data 101→95</span>。`,
+    code:[18,19,20,21,22,23,24,27,28,29,30,31,32], hz:{lc:100, ocr:95, shr:95, data:95, temp:101, sx:85, scx:80}, changed:['ocr','shr','data'], proc:0, locked:true, globals:{latest:100, sx:85, scx:80}
+  },
+  {
+    tag:'STEP 6 / ループ', title:'Backend B を処理 (通常クエリ・自DB)',
+    desc:`B は <strong>xmin=98</strong>。既存の各ホライズン(95)より新しいため
+          <code>TransactionIdOlder</code> は <strong>値を変えません</strong>(古い方を残す)。ホライズンは「最も古い XID」を追います。`,
+    code:[18,19,20,21,22,23,24,27,28,29,30,31,32], hz:{lc:100, ocr:95, shr:95, data:95, temp:101, sx:85, scx:80}, changed:[], proc:1, locked:true, globals:{latest:100, sx:85, scx:80}
+  },
+  {
+    tag:'STEP 7 / ループ', title:'Backend C を処理 (VACUUM)',
+    desc:`C は <strong>xmin=90</strong>。VACUUM は古い行が消えても困らないため、
+          <span class="hz" style="color:var(--c-ocr)">ocr 95→90</span> だけ更新し、
+          <code>PROC_IN_VACUUM</code> で <strong>continue</strong>。shared / data には影響しません
+          (ocr は pg_subtrans の切り詰め判断に使うので VACUUM も含める)。`,
+    code:[19,20,21,22,23,24,25,26], hz:{lc:100, ocr:90, shr:95, data:95, temp:101, sx:85, scx:80}, changed:['ocr'], proc:2, locked:true, globals:{latest:100, sx:85, scx:80}
+  },
+  {
+    tag:'STEP 8 / ループ', title:'Backend D を処理 (通常クエリ・他DB)',
+    desc:`D は <strong>xmin=92</strong>。共有テーブルは全DBのバックエンドを考慮するため
+          <span class="hz" style="color:var(--c-shr)">shared 95→92</span> を更新。
+          一方 <span class="hz" style="color:var(--c-data)">data</span> は <strong>他DB</strong>なので更新せず(95 のまま)。
+          ocr は min(90,92)=90 で不変。`,
+    code:[19,20,21,22,23,24,27,28,29,30], hz:{lc:100, ocr:90, shr:92, data:95, temp:101, sx:85, scx:80}, changed:['shr'], proc:3, locked:true, globals:{latest:100, sx:85, scx:80}
+  },
+  {
+    tag:'STEP 9 / ループ', title:'Backend E を処理 (ロジカルデコード)',
+    desc:`E は <strong>xmin=88</strong>。論理デコードは xmin を独自管理するため
+          <span class="hz" style="color:var(--c-ocr)">ocr 90→88</span> だけ更新して
+          <code>PROC_IN_LOGICAL_DECODING</code> で <strong>continue</strong>。ループ終了。`,
+    code:[19,20,21,22,23,24,25,26], hz:{lc:100, ocr:88, shr:92, data:95, temp:101, sx:85, scx:80}, changed:['ocr'], proc:4, locked:true, globals:{latest:100, sx:85, scx:80}
+  },
+  {
+    tag:'STEP 10', title:'リカバリ確認 → ロック解放',
+    desc:`スタンバイ(リカバリ中)なら <code>KnownAssignedXids</code> の最古値も取り込みますが、
+          今回は通常運転なのでスキップ。共有状態の読み取りは完了したので
+          <code>LWLockRelease(ProcArrayLock)</code> で<strong>ロックを解放</strong>します(以降はロック不要)。`,
+    code:[35,36], hz:{lc:100, ocr:88, shr:92, data:95, temp:101, sx:85, scx:80}, changed:[], proc:null, locked:false, globals:{latest:100, sx:85, scx:80}
+  },
+  {
+    tag:'STEP 11', title:'複製スロット slot_xmin を反映',
+    desc:`スロットが要求する <span class="hz" style="color:var(--c-sx)">slot_xmin=85</span> まで
+          <span class="hz" style="color:var(--c-shr)">shared 92→85</span>、
+          <span class="hz" style="color:var(--c-data)">data 95→85</span> を引き下げます。
+          複製先がまだ参照中のデータを消さないための保護です。`,
+    code:[38,39,40,41,42], hz:{lc:100, ocr:88, shr:85, data:85, temp:101, sx:85, scx:80}, changed:['shr','data'], proc:null, locked:false, globals:{latest:100, sx:85, scx:80}
+  },
+  {
+    tag:'STEP 12', title:'shared_raw を保存し catalog 用の xmin を反映',
+    desc:`まず <span class="hz" style="color:var(--c-shrr)">shared_raw = shared = 85</span> を退避
+          (hot_standby_feedback 送信用、catalog_xmin の影響を受けない値)。
+          続いて <span class="hz" style="color:var(--c-scx)">slot_catalog_xmin=80</span> を shared に適用し
+          <span class="hz" style="color:var(--c-shr)">shared 85→80</span>。`,
+    code:[44,45,46], hz:{lc:100, ocr:88, shr:80, shrr:85, data:85, temp:101, sx:85, scx:80}, changed:['shrr','shr'], proc:null, locked:false, globals:{latest:100, sx:85, scx:80}
+  },
+  {
+    tag:'STEP 13', title:'catalog ホライズンを算出',
+    desc:`<span class="hz" style="color:var(--c-cat)">catalog = data = 85</span> から始め、
+          論理デコードがカタログを読めるよう <span class="hz" style="color:var(--c-scx)">slot_catalog_xmin=80</span> を適用し
+          <span class="hz" style="color:var(--c-cat)">catalog 85→80</span>。
+          data と catalog の違いは「catalog_xmin を適用するか」だけです。`,
+    code:[47,48,49], hz:{lc:100, ocr:88, shr:80, shrr:85, cat:80, data:85, temp:101, sx:85, scx:80}, changed:['cat'], proc:null, locked:false, globals:{latest:100, sx:85, scx:80}
+  },
+  {
+    tag:'STEP 14', title:'oldest_considered_running を補正',
+    desc:`スロットによりホライズンが ocr より古くなった可能性があるため、
+          <span class="hz" style="color:var(--c-ocr)">ocr</span> を shared(80)・catalog(80)・data(85) 以下に補正:
+          <span class="hz" style="color:var(--c-ocr)">ocr 88→80</span>。
+          これで <code>ocr ≤ 各ホライズン</code> という不変条件(pg_subtrans アクセス保証)が成立します。`,
+    code:[51,52,53,54,55,56,57], hz:{lc:100, ocr:80, shr:80, shrr:85, cat:80, data:85, temp:101, sx:85, scx:80}, changed:['ocr'], proc:null, locked:false, globals:{latest:100, sx:85, scx:80}
+  },
+  {
+    tag:'STEP 15', title:'GlobalVisUpdateApply() で近似ホライズンに反映',
+    desc:`最後に計算結果を <code>GlobalVisSharedRels / Catalog / Data / TempRels</code> の
+          <code>maybe_needed</code> へ反映します。HOT プルーニングと VACUUM が
+          一貫した(より保守的でない)ホライズンを使えるようにするためで、正しさに必須です。`,
+    code:[59], hz:{lc:100, ocr:80, shr:80, shrr:85, cat:80, data:85, temp:101, sx:85, scx:80}, changed:[], proc:null, locked:false, globals:{latest:100, sx:85, scx:80}
+  },
+  {
+    tag:'完了', title:'計算完了 — 各リレーション種別ごとのホライズン',
+    desc:`各種別に応じて「これより古い不要タプルは安全に削除可能」という境界が確定しました。
+          <strong>共有テーブルほど(全DB・複製を考慮するため)古い側</strong>、
+          <strong>一時テーブルは自分だけなので最も新しい側</strong>になっている点に注目してください。`,
+    code:[], hz:{lc:100, ocr:80, shr:80, shrr:85, cat:80, data:85, temp:101, sx:85, scx:80}, changed:['ocr','shr','shrr','cat','data','temp'], proc:null, locked:false, globals:{latest:100, sx:85, scx:80}, result:true
+  },
+];
+
+//==================================================================
+// 描画
+//==================================================================
+const axisWrap = document.getElementById('axisWrap');
+const AXIS_Y = 168, LANE_H = 30, STEM_PER = 4;
+
+function xPct(v){ return (v - DOMAIN.min) / (DOMAIN.max - DOMAIN.min) * 100; }
+
+// ticks
+TICKS.forEach(t => {
+  const d = document.createElement('div');
+  d.className = 'tick'; d.style.left = xPct(t) + '%';
+  d.innerHTML = `<span>${t}</span>`;
+  axisWrap.appendChild(d);
+});
+
+// markers
+const markerEls = {};
+for (const key in HZDEF){
+  const def = HZDEF[key];
+  const m = document.createElement('div');
+  m.className = 'marker hidden ' + def.dir;
+  m.style.color = def.color;
+  const stemLen = Math.abs(def.lane) * LANE_H;
+  const lbl = `<div class="lbl" style="background:${def.color}">${def.short}=<span class="v"></span></div>`;
+  const stem = `<div class="stem" style="background:${def.color};height:${stemLen}px"></div>`;
+  m.innerHTML = def.dir === 'up' ? (lbl + stem) : (stem + lbl);
+  if (def.dir === 'up'){
+    m.style.top = (AXIS_Y - stemLen - 20) + 'px';
+    m.style.height = (stemLen + 20) + 'px';
+  } else {
+    m.style.top = (AXIS_Y + 4) + 'px';
+    m.style.height = (stemLen + 20) + 'px';
+  }
+  axisWrap.appendChild(m);
+  markerEls[key] = m;
+}
+
+// legend
+const legend = document.getElementById('legend');
+['ocr','shr','shrr','cat','data','temp','sx','scx','lc'].forEach(k=>{
+  const def = HZDEF[k];
+  const s = document.createElement('span');
+  s.innerHTML = `<i style="background:${def.color}"></i>${def.short}`;
+  legend.appendChild(s);
+});
+
+// procs
+const procsEl = document.getElementById('procs');
+const procEls = PROCS.map(p=>{
+  const d = document.createElement('div');
+  d.className = 'proc';
+  d.innerHTML = `
+    <div class="pname">${p.name}</div>
+    <div class="pdesc">${p.desc}</div>
+    <div class="prow"><span class="k">xid</span><span class="mono">${p.xid}</span></div>
+    <div class="prow"><span class="k">xmin</span><span class="mono">${p.xmin}</span></div>
+    <div class="prow"><span class="k">db</span><span class="mono">${p.db}</span></div>
+    ${p.flags.map(f=>`<span class="flag">${f}</span>`).join(' ')}
+    <div class="eff">→ 採用 xmin = ${p.eff}</div>`;
+  procsEl.appendChild(d);
+  return d;
+});
+
+// code
+const codeEl = document.getElementById('code');
+function esc(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function renderCode(highlight){
+  codeEl.innerHTML = CODE.map((row,i)=>{
+    const [txt, isCmt] = row;
+    const cls = 'ln' + (highlight.includes(i) ? ' hl' : '') + (isCmt ? ' cmt' : '');
+    return `<span class="${cls}">${esc(txt) || ' '}</span>`;
+  }).join('');
+  // scroll to first highlighted line
+  if (highlight.length){
+    const first = codeEl.querySelectorAll('.ln')[Math.min(...highlight)];
+    if (first) first.scrollIntoView({block:'nearest'});
+  }
+}
+
+// result table
+function renderResult(hz){
+  const rows = [
+    ['latest_completed', hz.lc, 'var(--c-lc)', '基準: 最新の完了済 XID'],
+    ['oldest_considered_running', hz.ocr, 'var(--c-ocr)', 'pg_subtrans 切り詰め判断 (VACUUM含む)'],
+    ['shared_oldest_nonremovable', hz.shr, 'var(--c-shr)', '共有テーブル (全DB+複製を考慮)'],
+    ['shared_oldest_nonremovable_raw', hz.shrr, 'var(--c-shrr)', 'hot_standby_feedback 送信用'],
+    ['catalog_oldest_nonremovable', hz.cat, 'var(--c-cat)', 'カタログ (論理デコード対応)'],
+    ['data_oldest_nonremovable', hz.data, 'var(--c-data)', '通常ユーザテーブル'],
+    ['temp_oldest_nonremovable', hz.temp, 'var(--c-temp)', '一時テーブル (自分のみ)'],
+  ];
+  document.getElementById('resultTable').innerHTML =
+    `<tr><th>フィールド</th><th>値</th><th>用途</th></tr>` +
+    rows.map(r=>`<tr>
+        <td class="mono" style="color:${r[2]}">${r[0]}</td>
+        <td class="val mono" style="color:${r[2]}">${r[1] ?? '—'}</td>
+        <td>${r[3]}</td></tr>`).join('');
+}
+
+//==================================================================
+// ステップ適用
+//==================================================================
+let cur = 0, playing = false, timer = null;
+
+function applyStep(idx){
+  const st = STEPS[idx];
+
+  document.getElementById('stepTag').textContent = st.tag;
+  document.getElementById('stepTitle').textContent = st.title;
+  document.getElementById('stepDesc').innerHTML = st.desc;
+  renderCode(st.code);
+
+  // globals
+  const g = st.globals || {};
+  document.querySelector('#chipLatest b').textContent = g.latest ?? '—';
+  document.querySelector('#chipSlotX b').textContent  = g.sx ?? '—';
+  document.querySelector('#chipSlotC b').textContent  = g.scx ?? '—';
+  const lockChip = document.getElementById('chipLock');
+  lockChip.className = 'chip ' + (st.locked ? 'lock-on' : 'lock-off');
+  lockChip.textContent = (st.locked ? '🔒 ProcArrayLock 取得中' : '🔓 ProcArrayLock');
+
+  // markers
+  for (const key in HZDEF){
+    const m = markerEls[key];
+    const v = st.hz[key];
+    if (v == null){ m.classList.add('hidden'); m.classList.remove('changed'); }
+    else {
+      m.classList.remove('hidden');
+      m.style.left = xPct(v) + '%';
+      m.querySelector('.v').textContent = v;
+      m.classList.toggle('changed', st.changed.includes(key));
+    }
+  }
+
+  // procs
+  procEls.forEach((el,i)=>{
+    el.classList.toggle('active', st.proc === i);
+    // mark processed procs (loop steps 5..9 -> idx 5..9)
+    const processedUpTo = (idx >= 5 && idx <= 9) ? idx - 5 : (idx > 9 ? 4 : -1);
+    el.classList.toggle('done', i <= processedUpTo && st.proc !== i);
+  });
+
+  // result card
+  const rc = document.getElementById('resultCard');
+  if (st.result){ rc.style.display = ''; renderResult(st.hz); }
+  else rc.style.display = 'none';
+
+  // controls
+  document.getElementById('counter').textContent = `${idx} / ${STEPS.length-1}`;
+  document.getElementById('prog').style.width = (idx/(STEPS.length-1)*100) + '%';
+  document.getElementById('btnPrev').disabled = idx === 0;
+  document.getElementById('btnNext').disabled = idx === STEPS.length-1;
+}
+
+function go(idx){
+  cur = Math.max(0, Math.min(STEPS.length-1, idx));
+  applyStep(cur);
+  if (playing && cur === STEPS.length-1) stop();
+}
+
+function play(){
+  if (cur === STEPS.length-1) go(0);
+  playing = true;
+  document.getElementById('btnPlay').textContent = '⏸ 一時停止';
+  schedule();
+}
+function schedule(){
+  clearTimeout(timer);
+  const sp = +document.getElementById('speed').value;
+  timer = setTimeout(()=>{ if(playing){ go(cur+1); if(playing) schedule(); } }, sp);
+}
+function stop(){
+  playing = false; clearTimeout(timer);
+  document.getElementById('btnPlay').textContent = '▶ 再生';
+}
+
+document.getElementById('btnPlay').onclick = ()=> playing ? stop() : play();
+document.getElementById('btnNext').onclick = ()=>{ stop(); go(cur+1); };
+document.getElementById('btnPrev').onclick = ()=>{ stop(); go(cur-1); };
+document.getElementById('btnReset').onclick = ()=>{ stop(); go(0); };
+document.addEventListener('keydown', e=>{
+  if (e.key === 'ArrowRight'){ stop(); go(cur+1); }
+  else if (e.key === 'ArrowLeft'){ stop(); go(cur-1); }
+  else if (e.key === ' '){ e.preventDefault(); playing ? stop() : play(); }
+});
+
+go(0);
+</script>
+</body>
+</html>
