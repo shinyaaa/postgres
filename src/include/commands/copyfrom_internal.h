@@ -188,6 +188,19 @@ typedef struct CopyFromStateData
 	/* Shorthand for number of unconsumed bytes available in raw_buf */
 #define RAW_BUF_BYTES(cstate) ((cstate)->raw_buf_len - (cstate)->raw_buf_index)
 
+	/*
+	 * Limit on the number of raw bytes to fetch from a COPY_FILE source, or 0
+	 * for no limit.  When the limit is reached, the input is treated as if
+	 * EOF had been seen.  This is used by parallel COPY FROM, where each
+	 * participant reads only its assigned byte range of the input file.
+	 * raw_bytes_read counts the bytes fetched from the source so far.
+	 */
+	int64		raw_bytes_limit;
+	int64		raw_bytes_read;
+
+	/* True if input ended with an end-of-copy marker (\.) */
+	bool		eocm_found;
+
 	uint64		bytes_processed;	/* number of bytes processed so far */
 } CopyFromStateData;
 

@@ -253,6 +253,27 @@ CopyGetData(CopyFromState cstate, void *databuf, int minread, int maxread)
 	switch (cstate->copy_src)
 	{
 		case COPY_FILE:
+
+			/*
+			 * If a read limit is in place (i.e. during parallel COPY FROM,
+			 * where each participant reads only its assigned byte range of
+			 * the input file), never read past it.  Reaching the limit is
+			 * treated like reaching EOF.
+			 */
+			if (cstate->raw_bytes_limit > 0)
+			{
+				int64		remaining;
+
+				remaining = cstate->raw_bytes_limit - cstate->raw_bytes_read;
+				if (remaining <= 0)
+				{
+					cstate->raw_reached_eof = true;
+					break;
+				}
+				if ((int64) maxread > remaining)
+					maxread = (int) remaining;
+			}
+
 			pgstat_report_wait_start(WAIT_EVENT_COPY_FROM_READ);
 			bytesread = fread(databuf, 1, maxread, cstate->copy_file);
 			pgstat_report_wait_end();
@@ -262,6 +283,7 @@ CopyGetData(CopyFromState cstate, void *databuf, int minread, int maxread)
 						 errmsg("could not read from COPY file: %m")));
 			if (bytesread == 0)
 				cstate->raw_reached_eof = true;
+			cstate->raw_bytes_read += bytesread;
 			break;
 		case COPY_FRONTEND:
 			while (maxread > 0 && bytesread < minread && !cstate->raw_reached_eof)
@@ -1768,6 +1790,7 @@ CopyReadLineText(CopyFromState cstate, bool is_csv)
 				 * Discard the \. and newline, then report EOF.
 				 */
 				cstate->input_buf_index = input_buf_ptr;
+				cstate->eocm_found = true;
 				result = true;	/* report EOF */
 				break;
 			}
