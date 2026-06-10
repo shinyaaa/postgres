@@ -48,6 +48,7 @@ COPY { <replaceable class="parameter">table_name</replaceable> [ ( <replaceable 
     REJECT_LIMIT <replaceable class="parameter">maxerror</replaceable>
     ENCODING '<replaceable class="parameter">encoding_name</replaceable>'
     LOG_VERBOSITY <replaceable class="parameter">verbosity</replaceable>
+    PARALLEL <replaceable class="parameter">integer</replaceable>
 </synopsis>
  </refsynopsisdiv>
 
@@ -525,6 +526,48 @@ COPY (SELECT j FROM (VALUES ('null'::json), (NULL::json)) v(j))
       <literal>ON_ERROR</literal> option is set to <literal>ignore</literal>
       or <literal>set_null</literal>.
       </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry id="sql-copy-params-parallel">
+    <term><literal>PARALLEL</literal></term>
+    <listitem>
+     <para>
+      Requests that the data be loaded by up to
+      <replaceable class="parameter">integer</replaceable> parallel workers,
+      which scan and parse separate byte ranges of the input file
+      concurrently and insert the resulting rows into the table.  The value
+      must be between 0 and 1024.  A value of <literal>0</literal>, which is
+      the default, disables parallelism and loads the data serially in the
+      backend running the command.
+      This option is only allowed in <command>COPY FROM</command>.
+     </para>
+     <para>
+      The number of workers actually started is also limited by
+      <xref linkend="guc-max-worker-processes"/> and
+      <xref linkend="guc-max-parallel-workers"/>, and may be reduced for a
+      small input file.  Like a parallel query, the command can run with
+      fewer workers than requested, or with none at all; the backend that
+      issued the command always participates in the load and processes any
+      ranges left unclaimed.
+     </para>
+     <para>
+      Parallel loading is only possible when the input can be split into
+      independent byte ranges and the rows can be inserted by a parallel
+      worker.  In particular it requires <literal>text</literal> format, a
+      server-side regular file (not <literal>STDIN</literal> or
+      <literal>PROGRAM</literal>), an input encoding that matches the
+      database encoding so that no conversion is needed, and at most a single
+      header line; and it requires that the target be an ordinary heap table
+      with no <command>INSERT</command> triggers and only parallel-safe
+      default, generation, constraint and index expressions.  Options with
+      cross-row side effects, namely <literal>FREEZE</literal>,
+      <literal>ON_ERROR</literal> other than <literal>stop</literal>, and a
+      <literal>WHERE</literal> clause, also preclude parallelism.  When any
+      of these conditions is not met, the requested parallelism is silently
+      ignored and the data is loaded serially with an otherwise identical
+      result.
+     </para>
     </listitem>
    </varlistentry>
 
