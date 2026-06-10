@@ -233,6 +233,8 @@ typedef struct SerializedTransactionState
 	FullTransactionId topFullTransactionId;
 	FullTransactionId currentFullTransactionId;
 	CommandId	currentCommandId;
+	bool		currentCommandIdUsed;
+	bool		parallelDMLAllowed;
 	int			nParallelCurrentXids;
 	TransactionId parallelCurrentXids[FLEXIBLE_ARRAY_MEMBER];
 } SerializedTransactionState;
@@ -268,6 +270,20 @@ static TransactionState CurrentTransactionState = &TopTransactionStateData;
 static SubTransactionId currentSubTransactionId;
 static CommandId currentCommandId;
 static bool currentCommandIdUsed;
+
+/*
+ * In a parallel worker, the value that currentCommandIdUsed had in the
+ * leader when the parallel operation started.  If it was already true at
+ * that point, the worker may mark the command ID as used again without
+ * the leader needing to know about it; see GetCurrentCommandId().
+ */
+static bool parallelCommandIdUsed = false;
+
+/*
+ * Whether data modification by parallel workers has been enabled for the
+ * current parallel operation; see EnableParallelDML().
+ */
+static bool parallelDMLAllowed = false;
 
 /*
  * xactStartTimestamp is the value of transaction_timestamp().
@@ -835,11 +851,14 @@ GetCurrentCommandId(bool used)
 	{
 		/*
 		 * Forbid setting currentCommandIdUsed in a parallel worker, because
-		 * we have no provision for communicating this back to the leader.  We
-		 * could relax this restriction when currentCommandIdUsed was already
-		 * true at the start of the parallel operation.
+		 * we have no provision for communicating this back to the leader.
+		 * However, if currentCommandIdUsed was already true at the start of
+		 * the parallel operation, setting it again here tells the leader
+		 * nothing it does not already know, so allow that.  This is required
+		 * by parallel operations that perform vetted data modifications in
+		 * workers, such as parallel COPY FROM.
 		 */
-		if (IsParallelWorker())
+		if (IsParallelWorker() && !parallelCommandIdUsed)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
 					 errmsg("cannot modify data in a parallel worker")));
@@ -1100,6 +1119,48 @@ ExitParallelMode(void)
 		   !ParallelContextActive());
 
 	--s->parallelModeLevel;
+
+	/* The permission to perform parallel DML does not outlive the operation */
+	if (s->parallelModeLevel == 0)
+		parallelDMLAllowed = false;
+}
+
+/*
+ *	EnableParallelDML
+ *
+ * Allow data modification by parallel workers in the current parallel
+ * operation.
+ *
+ * This may only be called by the leader of a parallel operation, after
+ * entering parallel mode but before serializing transaction state for the
+ * workers (i.e. before InitializeParallelDSM).  The caller must have
+ * verified that the data modification the workers will perform is safe to
+ * run in parallel; in particular, that it cannot generate new CommandIds or
+ * XIDs, cannot fire triggers, and that all participants insert with the
+ * same XID and CommandId.  Currently this is used only by parallel COPY
+ * FROM, which inserts tuples into a thoroughly-vetted target relation.
+ *
+ * The permission is withdrawn automatically when parallel mode is exited.
+ */
+void
+EnableParallelDML(void)
+{
+	Assert(IsInParallelMode() && !IsParallelWorker());
+
+	parallelDMLAllowed = true;
+}
+
+/*
+ *	IsParallelDMLEnabled
+ *
+ * Is data modification by parallel workers enabled for the current parallel
+ * operation?  In a worker, this reflects the state that EnableParallelDML()
+ * had established in the leader when the parallel operation started.
+ */
+bool
+IsParallelDMLEnabled(void)
+{
+	return parallelDMLAllowed;
 }
 
 /*
@@ -2183,6 +2244,8 @@ StartTransaction(void)
 	currentSubTransactionId = TopSubTransactionId;
 	currentCommandId = FirstCommandId;
 	currentCommandIdUsed = false;
+	parallelCommandIdUsed = false;
+	parallelDMLAllowed = false;
 
 	/*
 	 * initialize reported xid accounting
@@ -2960,6 +3023,7 @@ AbortTransaction(void)
 	AtEOXact_Parallel(false);
 	s->parallelModeLevel = 0;
 	s->parallelChildXact = false;	/* should be false already */
+	parallelDMLAllowed = false;
 
 	/*
 	 * do abort processing
@@ -5363,6 +5427,7 @@ AbortSubTransaction(void)
 	 */
 	AtEOSubXact_Parallel(false, s->subTransactionId);
 	s->parallelModeLevel = 0;
+	parallelDMLAllowed = false;
 
 	/*
 	 * We can skip all this stuff if the subxact failed before creating a
@@ -5609,6 +5674,8 @@ SerializeTransactionState(Size maxsize, char *start_address)
 	result->currentFullTransactionId =
 		CurrentTransactionState->fullTransactionId;
 	result->currentCommandId = currentCommandId;
+	result->currentCommandIdUsed = currentCommandIdUsed;
+	result->parallelDMLAllowed = parallelDMLAllowed;
 
 	/*
 	 * If we're running in a parallel worker and launching a parallel worker
@@ -5678,6 +5745,8 @@ StartParallelWorkerTransaction(char *tstatespace)
 	CurrentTransactionState->fullTransactionId =
 		tstate->currentFullTransactionId;
 	currentCommandId = tstate->currentCommandId;
+	parallelCommandIdUsed = tstate->currentCommandIdUsed;
+	parallelDMLAllowed = tstate->parallelDMLAllowed;
 	nParallelCurrentXids = tstate->nParallelCurrentXids;
 	ParallelCurrentXids = &tstate->parallelCurrentXids[0];
 

@@ -802,6 +802,30 @@ is_parallel_safe(PlannerInfo *root, Node *node)
 	return !max_parallel_hazard_walker(node, &context);
 }
 
+/*
+ * expr_is_parallel_safe
+ *		Detect whether a standalone expression contains only parallel-safe
+ *		functions
+ *
+ * Unlike is_parallel_safe(), this does not require a PlannerInfo, so it can
+ * be used by utility commands that vet expressions outside the context of
+ * planning a query, e.g. parallel COPY FROM checking the default
+ * expressions, constraints and index expressions of the target table.  The
+ * expression must not contain PARAM_EXEC Params, which cannot appear in
+ * such contexts anyway.
+ */
+bool
+expr_is_parallel_safe(Node *node)
+{
+	max_parallel_hazard_context context;
+
+	context.max_hazard = PROPARALLEL_SAFE;
+	context.max_interesting = PROPARALLEL_RESTRICTED;
+	context.safe_param_ids = NIL;
+
+	return !max_parallel_hazard_walker(node, &context);
+}
+
 /* core logic for all parallel-hazard checks */
 static bool
 max_parallel_hazard_test(char proparallel, max_parallel_hazard_context *context)

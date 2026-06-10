@@ -2207,8 +2207,11 @@ heap_prepare_insert(Relation relation, HeapTuple tup, TransactionId xid,
 	 * performed in workers. We have the infrastructure to allow parallel
 	 * inserts in general except for the cases where inserts generate a new
 	 * CommandId (eg. inserts into a table having a foreign key column).
+	 * Therefore, inserts in a parallel worker are allowed only if the leader
+	 * has vetted the whole operation and called EnableParallelDML(), as
+	 * parallel COPY FROM does.
 	 */
-	if (IsParallelWorker())
+	if (IsParallelWorker() && !IsParallelDMLEnabled())
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
 				 errmsg("cannot insert tuples in a parallel worker")));

@@ -534,5 +534,7 @@ extern void ParsePrepareRecord(uint8 info, xl_xact_prepare *xlrec, xl_xact_parse
 extern void EnterParallelMode(void);
 extern void ExitParallelMode(void);
 extern bool IsInParallelMode(void);
+extern void EnableParallelDML(void);
+extern bool IsParallelDMLEnabled(void);
 
 #endif							/* XACT_H */
