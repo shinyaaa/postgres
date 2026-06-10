@@ -15,6 +15,20 @@
 #define COPYFROM_PARALLEL_H
 
 #include "commands/copyfrom_internal.h"
+#include "nodes/execnodes.h"
+#include "storage/dsm.h"
+#include "storage/shm_toc.h"
+
+/* Leader-side state of a parallel COPY FROM; private to copyfrom_parallel.c */
+typedef struct ParallelCopyFromState ParallelCopyFromState;
+
+/* in copyfrom_parallel.c */
+extern ParallelCopyFromState *BeginParallelCopyFrom(CopyFromState cstate,
+													CopyInsertMethod insertMethod,
+													ResultRelInfo *resultRelInfo);
+extern uint64 EndParallelCopyFrom(CopyFromState cstate,
+								  ParallelCopyFromState *pcstate);
+extern void ParallelCopyFromWorkerMain(dsm_segment *seg, shm_toc *toc);
 
 /* in copyfrom_linescan.c */
 extern EolType ParallelCopyDetectEol(FILE *file, int64 file_size);

@@ -34,6 +34,7 @@
 #include "parser/parse_collate.h"
 #include "parser/parse_expr.h"
 #include "parser/parse_relation.h"
+#include "postmaster/bgworker_internals.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
@@ -590,6 +591,7 @@ ProcessCopyOptions(ParseState *pstate,
 	bool		log_verbosity_specified = false;
 	bool		reject_limit_specified = false;
 	bool		force_array_specified = false;
+	bool		parallel_specified = false;
 	ListCell   *option;
 
 	/* Support external use for option sanity checking */
@@ -773,6 +775,27 @@ ProcessCopyOptions(ParseState *pstate,
 				errorConflictingDefElem(defel, pstate);
 			reject_limit_specified = true;
 			opts_out->reject_limit = defGetCopyRejectLimitOption(defel);
+		}
+		else if (strcmp(defel->defname, "parallel") == 0)
+		{
+			if (parallel_specified)
+				errorConflictingDefElem(defel, pstate);
+			parallel_specified = true;
+			if (!is_from)
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("COPY %s only available using COPY FROM",
+								"PARALLEL"),
+						 parser_errposition(pstate, defel->location)));
+			opts_out->parallel = defGetInt32(defel);
+			if (opts_out->parallel < 0 ||
+				opts_out->parallel > MAX_PARALLEL_WORKER_LIMIT)
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("%s option must be between 0 and %d",
+								"PARALLEL",
+								MAX_PARALLEL_WORKER_LIMIT),
+						 parser_errposition(pstate, defel->location)));
 		}
 		else
 			ereport(ERROR,

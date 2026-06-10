@@ -82,6 +82,17 @@ typedef struct CopyFromStateData
 	bool	   *convert_select_flags;	/* per-column CSV/TEXT CS flags */
 	Node	   *whereClause;	/* WHERE condition (or NULL) */
 
+	/*
+	 * The raw column list and options list as passed to BeginCopyFrom().
+	 * Parallel COPY FROM serializes these so that workers can construct an
+	 * equivalent CopyFromState of their own.
+	 */
+	List	   *raw_attnamelist;
+	List	   *raw_options;
+
+	bool		is_parallel;	/* participant in a parallel COPY FROM (as
+								 * leader or worker)? */
+
 	/* these are just for error messages, see CopyFromErrorCallback */
 	const char *cur_relname;	/* table name for error messages */
 	uint64		cur_lineno;		/* line number for error messages */

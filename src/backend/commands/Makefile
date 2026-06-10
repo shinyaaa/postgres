@@ -25,6 +25,7 @@ OBJS = \
 	copy.o \
 	copyfrom.o \
 	copyfrom_linescan.o \
+	copyfrom_parallel.o \
 	copyfromparse.o \
 	copyto.o \
 	createas.o \

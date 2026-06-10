@@ -31,6 +31,7 @@
 #include "catalog/namespace.h"
 #include "commands/copyapi.h"
 #include "commands/copyfrom_internal.h"
+#include "commands/copyfrom_parallel.h"
 #include "commands/progress.h"
 #include "commands/trigger.h"
 #include "executor/execPartition.h"
@@ -601,8 +602,12 @@ CopyMultiInsertBufferFlush(CopyMultiInsertInfo *miinfo,
 
 		/* Update the row counter and progress of the COPY command */
 		*processed += nused;
-		pgstat_progress_update_param(PROGRESS_COPY_TUPLES_PROCESSED,
-									 *processed);
+		if (cstate->is_parallel)
+			pgstat_progress_parallel_incr_param(PROGRESS_COPY_TUPLES_PROCESSED,
+												nused);
+		else
+			pgstat_progress_update_param(PROGRESS_COPY_TUPLES_PROCESSED,
+										 *processed);
 
 		/* reset cur_lineno and line_buf_valid to what they were */
 		cstate->line_buf_valid = line_buf_valid;
@@ -794,6 +799,7 @@ CopyFrom(CopyFromState cstate)
 	CommandId	mycid = GetCurrentCommandId(true);
 	uint32		ti_options = 0; /* start with default options for insert */
 	BulkInsertState bistate = NULL;
+	ParallelCopyFromState *pcstate = NULL;
 	CopyInsertMethod insertMethod;
 	CopyMultiInsertInfo multiInsertInfo = {0};	/* pacify compiler */
 	int64		processed = 0;
@@ -1102,6 +1108,17 @@ CopyFrom(CopyFromState cstate)
 	 * EACH ROW triggers that we already fire on COPY.
 	 */
 	ExecBSInsertTriggers(estate, resultRelInfo);
+
+	/*
+	 * If a parallel COPY was requested, check whether this operation
+	 * supports it, and if so launch workers, each processing one byte range
+	 * of the input file.  On success, this configures our cstate so that
+	 * the regular loop below processes only the trailing range; the
+	 * workers' contributions are collected afterwards.  On failure (or
+	 * ineligibility), this returns NULL and we proceed serially.
+	 */
+	if (cstate->opts.parallel > 0 && !IsParallelWorker())
+		pcstate = BeginParallelCopyFrom(cstate, insertMethod, resultRelInfo);
 
 	econtext = GetPerTupleExprContext(estate);
 
@@ -1465,6 +1482,10 @@ CopyFrom(CopyFromState cstate)
 	/* Done, clean up */
 	error_context_stack = errcallback.previous;
 
+	/* If this was a parallel COPY, collect the workers' contributions. */
+	if (pcstate != NULL)
+		processed += EndParallelCopyFrom(cstate, pcstate);
+
 	if (cstate->num_errors > 0 &&
 		cstate->opts.log_verbosity >= COPY_LOG_VERBOSITY_DEFAULT)
 	{
@@ -1578,6 +1599,10 @@ BeginCopyFrom(ParseState *pstate,
 
 	/* Extract options from the statement node tree */
 	ProcessCopyOptions(pstate, &cstate->opts, true /* is_from */ , options);
+
+	/* Keep the raw lists; parallel COPY FROM serializes them for workers */
+	cstate->raw_attnamelist = attnamelist;
+	cstate->raw_options = options;
 
 	/* Set the format routine */
 	cstate->routine = CopyFromGetRoutine(&cstate->opts);
@@ -1844,9 +1869,14 @@ BeginCopyFrom(ParseState *pstate,
 
 	cstate->defaults = (bool *) palloc0(tupDesc->natts * sizeof(bool));
 
-	/* initialize progress */
-	pgstat_progress_start_command(PROGRESS_COMMAND_COPY,
-								  cstate->rel ? RelationGetRelid(cstate->rel) : InvalidOid);
+	/*
+	 * Initialize progress.  Workers of a parallel COPY FROM do not register
+	 * a progress command of their own; they feed the leader's counters via
+	 * pgstat_progress_parallel_incr_param() instead.
+	 */
+	if (!IsParallelWorker())
+		pgstat_progress_start_command(PROGRESS_COMMAND_COPY,
+									  cstate->rel ? RelationGetRelid(cstate->rel) : InvalidOid);
 	cstate->bytes_processed = 0;
 
 	/* We keep those variables in cstate. */
@@ -1922,7 +1952,8 @@ BeginCopyFrom(ParseState *pstate,
 		}
 	}
 
-	pgstat_progress_update_multi_param(3, progress_cols, progress_vals);
+	if (!IsParallelWorker())
+		pgstat_progress_update_multi_param(3, progress_cols, progress_vals);
 
 	cstate->routine->CopyFromStart(cstate, tupDesc);
 
@@ -1954,7 +1985,8 @@ EndCopyFrom(CopyFromState cstate)
 							cstate->filename)));
 	}
 
-	pgstat_progress_end_command();
+	if (!IsParallelWorker())
+		pgstat_progress_end_command();
 
 	MemoryContextDelete(cstate->copycontext);
 	pfree(cstate);

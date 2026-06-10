@@ -13,6 +13,7 @@ backend_sources += files(
   'copy.c',
   'copyfrom.c',
   'copyfrom_linescan.c',
+  'copyfrom_parallel.c',
   'copyfromparse.c',
   'copyto.c',
   'createas.c',
