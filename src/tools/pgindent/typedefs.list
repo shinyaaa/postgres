@@ -3546,6 +3546,9 @@ XactLockTableWaitInfo
 XidBoundsViolation
 XidCacheStatus
 XidCommitStatus
+XidHorizonBlocker
+XidHorizonBlockerCandidate
+XidHorizonBlockerType
 XidStatus
 XmlExpr
 XmlExprOp
