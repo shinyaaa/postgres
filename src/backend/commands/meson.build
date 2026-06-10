@@ -12,6 +12,7 @@ backend_sources += files(
   'conversioncmds.c',
   'copy.c',
   'copyfrom.c',
+  'copyfrom_linescan.c',
   'copyfromparse.c',
   'copyto.c',
   'createas.c',

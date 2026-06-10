@@ -24,6 +24,7 @@ OBJS = \
 	conversioncmds.o \
 	copy.o \
 	copyfrom.o \
+	copyfrom_linescan.o \
 	copyfromparse.o \
 	copyto.o \
 	createas.o \
