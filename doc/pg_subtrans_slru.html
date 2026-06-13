@@ -1,0 +1,491 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>pg_subtrans SLRU の仕組みと使われ方</title>
+<style>
+  :root {
+    --bg: #fbfbfa;
+    --fg: #1f2328;
+    --muted: #57606a;
+    --accent: #336791;      /* PostgreSQL blue */
+    --accent2: #2f855a;
+    --border: #d0d7de;
+    --code-bg: #f6f8fa;
+    --page-fill: #e8f0f7;
+    --page-stroke: #336791;
+    --entry-fill: #fff;
+    --hi: #fff3cd;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, "Hiragino Kaku Gothic ProN", "Noto Sans JP",
+                 "Segoe UI", Meiryo, sans-serif;
+    color: var(--fg);
+    background: var(--bg);
+    line-height: 1.75;
+  }
+  .wrap { max-width: 960px; margin: 0 auto; padding: 2.5rem 1.25rem 5rem; }
+  header.title {
+    border-bottom: 3px solid var(--accent);
+    padding-bottom: 1rem;
+    margin-bottom: 2rem;
+  }
+  header.title h1 { margin: 0 0 .3rem; font-size: 1.9rem; color: var(--accent); }
+  header.title p { margin: 0; color: var(--muted); }
+  h2 {
+    margin-top: 2.8rem;
+    padding-left: .6rem;
+    border-left: 6px solid var(--accent);
+    color: var(--accent);
+    font-size: 1.4rem;
+  }
+  h3 { margin-top: 1.8rem; font-size: 1.12rem; color: var(--accent2); }
+  code, pre {
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    font-size: .92em;
+  }
+  code { background: var(--code-bg); padding: .12em .4em; border-radius: 4px; }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1rem 1.1rem;
+    overflow-x: auto;
+    line-height: 1.55;
+  }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .94rem; }
+  th, td { border: 1px solid var(--border); padding: .55rem .7rem; text-align: left; vertical-align: top; }
+  th { background: var(--page-fill); }
+  tr:nth-child(even) td { background: #fafcfe; }
+  .note {
+    background: #eef6ef;
+    border: 1px solid #bcdcc3;
+    border-left: 5px solid var(--accent2);
+    border-radius: 6px;
+    padding: .8rem 1rem;
+    margin: 1.2rem 0;
+  }
+  .note .label { font-weight: 700; color: var(--accent2); }
+  .fig {
+    margin: 1.6rem 0;
+    text-align: center;
+  }
+  .fig svg { max-width: 100%; height: auto; }
+  .fig figcaption {
+    color: var(--muted);
+    font-size: .9rem;
+    margin-top: .5rem;
+  }
+  .toc {
+    background: #fff;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1rem 1.4rem;
+  }
+  .toc ol { margin: .3rem 0; padding-left: 1.4rem; }
+  .toc a { color: var(--accent); text-decoration: none; }
+  .toc a:hover { text-decoration: underline; }
+  .mono { font-family: "SFMono-Regular", Consolas, monospace; }
+  .pill {
+    display: inline-block; background: var(--accent); color: #fff;
+    border-radius: 999px; padding: .05em .7em; font-size: .8rem; font-weight: 600;
+  }
+  footer {
+    margin-top: 4rem; padding-top: 1rem; border-top: 1px solid var(--border);
+    color: var(--muted); font-size: .85rem;
+  }
+  a.src { color: var(--accent); text-decoration: none; }
+  a.src:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="title">
+  <h1>pg_subtrans SLRU の仕組みと使われ方</h1>
+  <p>PostgreSQL のサブトランザクション・ログ（SUBTRANS）と SLRU バッファ管理の概念図つき解説</p>
+</header>
+
+<nav class="toc">
+  <strong>目次</strong>
+  <ol>
+    <li><a href="#overview">pg_subtrans とは何か</a></li>
+    <li><a href="#slru">SLRU（Simple LRU）とは</a></li>
+    <li><a href="#layout">ディスク上・メモリ上のレイアウト</a></li>
+    <li><a href="#mapping">XID からページ・エントリへの対応</a></li>
+    <li><a href="#bank">バッファとバンク（並行性）</a></li>
+    <li><a href="#api">主要 API と使われ方</a></li>
+    <li><a href="#topmost">最上位トランザクションの探索</a></li>
+    <li><a href="#lifecycle">ライフサイクル（起動・拡張・切り詰め）</a></li>
+    <li><a href="#config">関連する設定パラメータ</a></li>
+  </ol>
+</nav>
+
+<h2 id="overview">1. pg_subtrans とは何か</h2>
+<p>
+  <strong>pg_subtrans</strong> は、各トランザクション（XID）に対してその<strong>親トランザクションの XID</strong> を
+  記録する「サブトランザクション・ログ」マネージャです。ネストしたトランザクション
+  （<code>SAVEPOINT</code> や PL/pgSQL の例外ブロックなど）の実装を支える基盤の一つです。
+</p>
+<ul>
+  <li>メイントランザクションの親は <code>InvalidTransactionId</code>（=0）。</li>
+  <li>各サブトランザクションは「直近の親」の XID を持つ。</li>
+  <li>この木は<strong>子→親方向にしか辿れない</strong>（親→子は辿れない）。</li>
+</ul>
+
+<div class="note">
+  <span class="label">重要:</span> pg_subtrans は <code>pg_xact</code>（コミット状態ログ）と違い、
+  <strong>クラッシュをまたいで保存する必要がありません</strong>。現在実行中のトランザクションについてだけ
+  覚えていれば十分なので、<strong>WAL を出力せず</strong>、起動時には現在アクティブなページをゼロで初期化します。
+  ディスク上のファイルは <code class="mono">$PGDATA/pg_subtrans/</code> 以下にあります。
+</div>
+
+<div class="fig">
+<figure>
+<svg viewBox="0 0 760 260" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="サブトランザクションの親子関係">
+  <style>
+    .box{fill:#e8f0f7;stroke:#336791;stroke-width:1.5;rx:8;}
+    .top{fill:#d6ead9;stroke:#2f855a;stroke-width:2;}
+    .lbl{font:14px monospace;fill:#1f2328;}
+    .cap{font:12px sans-serif;fill:#57606a;}
+    .edge{stroke:#336791;stroke-width:1.6;marker-end:url(#arrow);fill:none;}
+  </style>
+  <defs>
+    <marker id="arrow" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#336791"/>
+    </marker>
+  </defs>
+
+  <!-- top -->
+  <rect class="box top" x="300" y="20" width="170" height="46" rx="8"/>
+  <text class="lbl" x="312" y="40">xid=100 (top)</text>
+  <text class="cap" x="312" y="58">parent = Invalid(0)</text>
+
+  <!-- sub level 1 -->
+  <rect class="box" x="120" y="120" width="180" height="46" rx="8"/>
+  <text class="lbl" x="132" y="140">xid=101 (SAVEPOINT)</text>
+  <text class="cap" x="132" y="158">parent = 100</text>
+
+  <rect class="box" x="470" y="120" width="180" height="46" rx="8"/>
+  <text class="lbl" x="482" y="140">xid=102 (SAVEPOINT)</text>
+  <text class="cap" x="482" y="158">parent = 100</text>
+
+  <!-- sub level 2 -->
+  <rect class="box" x="120" y="210" width="180" height="42" rx="8"/>
+  <text class="lbl" x="132" y="230">xid=103</text>
+  <text class="cap" x="132" y="247">parent = 101</text>
+
+  <!-- edges: child -> parent -->
+  <path class="edge" d="M210,120 L360,66"/>
+  <path class="edge" d="M560,120 L420,66"/>
+  <path class="edge" d="M210,210 L210,166"/>
+</svg>
+<figcaption>図1: 子から親への一方向リンク。pg_subtrans は各 XID の「parent」だけを保持する。</figcaption>
+</figure>
+</div>
+
+<h2 id="slru">2. SLRU（Simple LRU）とは</h2>
+<p>
+  pg_subtrans のような「XID をキーにした固定長エントリの巨大な配列」を、ディスク上のファイル群と
+  共有メモリ上の少数のページバッファとで橋渡しするのが <strong>SLRU（Simple Least-Recently-Used）</strong>
+  バッファ管理機構です（<code class="mono">src/backend/access/transam/slru.c</code>）。
+  pg_xact・pg_subtrans・pg_multixact・pg_commit_ts・pg_serial・pg_notify などが同じ SLRU 基盤を共有します。
+</p>
+<p>SLRU の特徴:</p>
+<ul>
+  <li>論理的に巨大な配列を <strong>BLCKSZ（既定 8KB）単位のページ</strong>に分割。</li>
+  <li>共有メモリには少数の<strong>ページスロット</strong>だけを置き、LRU で入れ替える。</li>
+  <li>ページが満杯（書き込みやアクセスで全スロット使用中）なら、最も古いスロットを追い出して再利用。</li>
+  <li>各 SLRU は <code class="mono">pageno % nbanks</code> で<strong>バンク</strong>に分割され、バンクごとの LWLock で並行アクセスを許容。</li>
+</ul>
+
+<div class="fig">
+<figure>
+<svg viewBox="0 0 760 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="SLRUの全体像">
+  <style>
+    .grp{font:13px sans-serif;fill:#336791;font-weight:bold;}
+    .seg{fill:#fff;stroke:#336791;stroke-width:1.4;}
+    .slot{fill:#e8f0f7;stroke:#336791;stroke-width:1.3;}
+    .slotv{fill:#d6ead9;stroke:#2f855a;stroke-width:1.6;}
+    .t{font:11px monospace;fill:#1f2328;}
+    .c{font:11px sans-serif;fill:#57606a;}
+    .ar{stroke:#57606a;stroke-width:1.5;fill:none;marker-end:url(#a2);}
+  </style>
+  <defs>
+    <marker id="a2" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#57606a"/>
+    </marker>
+  </defs>
+
+  <!-- Disk -->
+  <text class="grp" x="30" y="30">ディスク: $PGDATA/pg_subtrans/</text>
+  <g>
+    <rect class="seg" x="30" y="45" width="90" height="50"/>
+    <text class="t" x="48" y="68">0000</text><text class="c" x="40" y="84">segment</text>
+    <rect class="seg" x="130" y="45" width="90" height="50"/>
+    <text class="t" x="148" y="68">0001</text><text class="c" x="140" y="84">segment</text>
+    <rect class="seg" x="230" y="45" width="90" height="50"/>
+    <text class="t" x="248" y="68">0002</text><text class="c" x="240" y="84">segment</text>
+    <text class="c" x="330" y="76">…  1 セグメント = 32 ページ = 256KB = 65,536 XID</text>
+  </g>
+
+  <!-- arrows up/down -->
+  <path class="ar" d="M175,150 L175,100"/>
+  <path class="ar" d="M205,100 L205,150"/>
+  <text class="c" x="215" y="128">read / write（ページ単位 I/O）</text>
+
+  <!-- Shared memory buffers -->
+  <text class="grp" x="30" y="175">共有メモリ: ページスロット（LRU で入替）</text>
+  <g>
+    <rect class="slotv" x="30" y="190" width="70" height="46"/>
+    <text class="t" x="42" y="210">slot0</text><text class="c" x="40" y="226">VALID</text>
+    <rect class="slot" x="105" y="190" width="70" height="46"/>
+    <text class="t" x="117" y="210">slot1</text><text class="c" x="115" y="226">EMPTY</text>
+    <rect class="slotv" x="180" y="190" width="70" height="46"/>
+    <text class="t" x="192" y="210">slot2</text><text class="c" x="186" y="226">DIRTY</text>
+    <rect class="slot" x="255" y="190" width="70" height="46"/>
+    <text class="t" x="267" y="210">slot3</text><text class="c" x="265" y="226">EMPTY</text>
+    <text class="c" x="335" y="218">… subtransaction_buffers 個</text>
+  </g>
+
+  <!-- bank grouping -->
+  <rect x="22" y="182" width="236" height="62" fill="none" stroke="#2f855a" stroke-dasharray="5 4" stroke-width="1.4"/>
+  <text class="c" x="24" y="262" fill="#2f855a">bank 0（bank_lock で保護） — 16 スロット/バンク</text>
+
+  <!-- backend access -->
+  <text class="grp" x="30" y="300">バックエンド: SubTransGetParent(xid) / SubTransSetParent(xid, parent)</text>
+</svg>
+<figcaption>図2: SLRU はディスク上のセグメントファイルと共有メモリ上の少数ページスロットを仲介する。</figcaption>
+</figure>
+</div>
+
+<h2 id="layout">3. ディスク上・メモリ上のレイアウト</h2>
+<p>pg_subtrans の各エントリは <strong>4 バイト</strong>（親の <code>TransactionId</code>）です。各サイズは次のとおり。</p>
+<table>
+  <thead>
+    <tr><th>単位</th><th>サイズ / 個数</th><th>由来（ソース）</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>1 エントリ</td><td>4 バイト（親 XID）</td><td><code>sizeof(TransactionId)</code></td></tr>
+    <tr><td>1 ページ</td><td>BLCKSZ = 8192 バイト → <strong>2,048 エントリ</strong></td><td><code>SUBTRANS_XACTS_PER_PAGE = BLCKSZ / 4</code></td></tr>
+    <tr><td>1 セグメント（ファイル）</td><td>32 ページ = 256 KB → <strong>65,536 XID</strong></td><td><code>SLRU_PAGES_PER_SEGMENT = 32</code></td></tr>
+    <tr><td>1 バンク</td><td>16 ページスロット</td><td><code>SLRU_BANK_SIZE = 1 &lt;&lt; 4</code></td></tr>
+  </tbody>
+</table>
+
+<div class="fig">
+<figure>
+<svg viewBox="0 0 760 200" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="ページ内のエントリ配列">
+  <style>
+    .e{fill:#fff;stroke:#336791;stroke-width:1.2;}
+    .eh{fill:#fff3cd;stroke:#b8860b;stroke-width:1.6;}
+    .et{font:11px monospace;fill:#1f2328;text-anchor:middle;}
+    .ec{font:11px sans-serif;fill:#57606a;}
+    .pl{font:13px sans-serif;fill:#336791;font-weight:bold;}
+  </style>
+  <text class="pl" x="30" y="28">1 ページ = 2,048 エントリ（各 4 バイト）</text>
+  <g>
+    <rect class="e"  x="30"  y="45" width="70" height="44"/><text class="et" x="65"  y="72">[0]</text>
+    <rect class="e"  x="100" y="45" width="70" height="44"/><text class="et" x="135" y="72">[1]</text>
+    <rect class="e"  x="170" y="45" width="70" height="44"/><text class="et" x="205" y="72">[2]</text>
+    <rect class="eh" x="240" y="45" width="90" height="44"/><text class="et" x="285" y="68">[entryno]</text><text class="et" x="285" y="83">= 親 XID</text>
+    <rect class="e"  x="330" y="45" width="70" height="44"/><text class="et" x="365" y="72">…</text>
+    <rect class="e"  x="400" y="45" width="90" height="44"/><text class="et" x="445" y="72">[2047]</text>
+  </g>
+  <text class="ec" x="240" y="112">entryno = xid % 2048</text>
+
+  <line x1="30" y1="135" x2="490" y2="135" stroke="#d0d7de"/>
+  <text class="pl" x="30" y="170">エントリ値 = その XID の親トランザクション ID（0 = Invalid = トップレベル）</text>
+</svg>
+<figcaption>図3: ページは固定長エントリの配列。entryno 番目に「その XID の親」が入る。</figcaption>
+</figure>
+</div>
+
+<h2 id="mapping">4. XID からページ・エントリへの対応</h2>
+<p>XID は次の単純な割り算でページ番号とページ内オフセットに変換されます。</p>
+<pre><code>pageno  = xid / SUBTRANS_XACTS_PER_PAGE;   /* = xid / 2048 */
+entryno = xid % SUBTRANS_XACTS_PER_PAGE;   /* = xid % 2048 */</code></pre>
+<p>
+  XID は 32 ビットで <code>0xFFFFFFFF</code> でラップアラウンドするため、ページ番号も
+  <code>0xFFFFFFFF / 2048</code> で、セグメント番号も <code>0xFFFFFFFF / 2048 / 32</code> でラップします。
+  古さの比較には<strong>モジュラ演算</strong>（<code>SubTransPagePrecedes()</code>）を使い、ラップに対応します。
+</p>
+
+<h2 id="bank">5. バッファとバンク（並行性）</h2>
+<p>
+  共有メモリのページスロットは <code>SLRU_BANK_SIZE</code>（=16）スロットごとに<strong>バンク</strong>へ
+  まとめられます。あるページがどのバンクに属するかは:
+</p>
+<pre><code>bankno = pageno % ctl-&gt;nbanks;
+lock   = &amp;shared-&gt;bank_locks[bankno].lock;   /* SimpleLruGetBankLock() */</code></pre>
+<p>
+  バンク単位で LWLock を分けることで、別ページへの同時アクセスがロック競合しにくくなります。
+  追い出し（victim 選択）も<strong>バンク内</strong>で LRU カウンタが最大のスロットを選びます。
+</p>
+
+<h2 id="api">6. 主要 API と使われ方</h2>
+<table>
+  <thead><tr><th>関数</th><th>役割</th><th>主な呼び出し元</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><code>SubTransSetParent(xid, parent)</code></td>
+      <td>サブトランザクションの親を記録（書き込み）。同じ値の再設定は許容、別の有効値への変更は禁止。</td>
+      <td><code>AssignTransactionId()</code>(xact.c)、リカバリ時の <code>RecordKnownAssignedTransactionIds</code> 系(procarray.c)、2相コミット復元(twophase.c)</td>
+    </tr>
+    <tr>
+      <td><code>SubTransGetParent(xid)</code></td>
+      <td>その XID の親を 1 段だけ取得（読み取り専用）。</td>
+      <td><code>SubTransGetTopmostTransaction()</code> 内部</td>
+    </tr>
+    <tr>
+      <td><code>SubTransGetTopmostTransaction(xid)</code></td>
+      <td>親を辿って最上位（トップレベル）XID を返す。</td>
+      <td>スナップショット可視性判定(snapmgr.c)、実行中判定(procarray.c)、ロック待ち(lmgr.c)、heapam.c など</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>書き込みパス: <code>SubTransSetParent</code></h3>
+<pre><code>pageno  = TransactionIdToPage(xid);
+entryno = TransactionIdToEntry(xid);
+
+lock = SimpleLruGetBankLock(SubTransCtl, pageno);
+LWLockAcquire(lock, LW_EXCLUSIVE);
+
+slotno = SimpleLruReadPage(SubTransCtl, pageno, true, &amp;xid);   /* ページを確保 */
+ptr = (TransactionId *) shared-&gt;page_buffer[slotno] + entryno;
+
+if (*ptr != parent) {
+    Assert(*ptr == InvalidTransactionId);
+    *ptr = parent;                       /* 親を書き込む */
+    shared-&gt;page_dirty[slotno] = true;   /* dirty に */
+}
+LWLockRelease(lock);</code></pre>
+
+<p>
+  サブトランザクションが XID を割り当てられる瞬間（<code>AssignTransactionId</code>）に、
+  親が <code>SubTransSetParent</code> で記録されます。
+</p>
+
+<div class="note">
+  <span class="label">なぜ「最上位」を引くのか:</span> スナップショットには各バックエンドのサブ XID も
+  載りますが、その数には上限があり「あふれた（overflowed / suboverflowed）」場合はサブ XID リストが
+  省略されます。その状態であるタプルの XID が可視かを判定するには、pg_subtrans で<strong>トップレベル
+  XID まで辿り直して</strong>判定する必要があります。これが pg_subtrans の最大の利用目的です。
+</div>
+
+<h2 id="topmost">7. 最上位トランザクションの探索</h2>
+<p>
+  <code>SubTransGetTopmostTransaction</code> は親リンクを辿りますが、<code>TransactionXmin</code> より
+  前は辿りません（それ以前の情報は切り詰められている可能性があるため）。途中で打ち切っても
+  「実行中かどうか」の判定には十分、というのが設計上のポイントです。
+</p>
+<pre><code>parentXid = previousXid = xid;
+while (TransactionIdIsValid(parentXid)) {
+    previousXid = parentXid;
+    if (TransactionIdPrecedes(parentXid, TransactionXmin))
+        break;                                   /* これ以上は辿らない */
+    parentXid = SubTransGetParent(parentXid);
+
+    /* 親は必ず子より前。そうでなければ破損 → 無限ループ防止のため ERROR */
+    if (!TransactionIdPrecedes(parentXid, previousXid))
+        elog(ERROR, "pg_subtrans contains invalid entry ...");
+}
+return previousXid;</code></pre>
+
+<div class="fig">
+<figure>
+<svg viewBox="0 0 760 170" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="親リンクを辿る">
+  <style>
+    .n{fill:#e8f0f7;stroke:#336791;stroke-width:1.5;}
+    .ntop{fill:#d6ead9;stroke:#2f855a;stroke-width:2;}
+    .nt{font:12px monospace;fill:#1f2328;text-anchor:middle;}
+    .e2{stroke:#336791;stroke-width:1.8;fill:none;marker-end:url(#a3);}
+    .cap2{font:11px sans-serif;fill:#57606a;}
+  </style>
+  <defs>
+    <marker id="a3" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#336791"/>
+    </marker>
+  </defs>
+  <rect class="n" x="40"  y="60" width="120" height="44" rx="8"/><text class="nt" x="100" y="86">xid=103</text>
+  <rect class="n" x="240" y="60" width="120" height="44" rx="8"/><text class="nt" x="300" y="86">xid=101</text>
+  <rect class="ntop" x="440" y="60" width="160" height="44" rx="8"/><text class="nt" x="520" y="80">xid=100</text><text class="nt" x="520" y="96">(topmost)</text>
+  <path class="e2" d="M160,82 L238,82"/>
+  <path class="e2" d="M360,82 L438,82"/>
+  <text class="cap2" x="165" y="48">SubTransGetParent</text>
+  <text class="cap2" x="365" y="48">SubTransGetParent</text>
+  <text class="cap2" x="40" y="135">入力 xid から親を辿り、Invalid(0) に達したら直前の XID（=トップレベル）を返す</text>
+</svg>
+<figcaption>図4: 親リンクを辿って最上位 XID を求める。</figcaption>
+</figure>
+</div>
+
+<h2 id="lifecycle">8. ライフサイクル（起動・拡張・切り詰め）</h2>
+<table>
+  <thead><tr><th>関数</th><th>タイミング</th><th>内容</th></tr></thead>
+  <tbody>
+    <tr><td><code>BootStrapSUBTRANS()</code></td><td>initdb 時に 1 回</td><td>最初のページ（page 0）をゼロ化して書き出し。</td></tr>
+    <tr><td><code>StartupSUBTRANS()</code></td><td>起動時（StartupXLOG 後）</td><td>現在アクティブなページ群をゼロで初期化。<strong>クラッシュをまたいだ復元はしない</strong>。</td></tr>
+    <tr><td><code>ExtendSUBTRANS()</code></td><td>XID 採番時（XidGenLock 保持中）</td><td>新しいページの先頭 XID に達したら、そのページをゼロ化して領域を確保。</td></tr>
+    <tr><td><code>CheckPointSUBTRANS()</code></td><td>チェックポイント / シャットダウン</td><td>dirty ページをディスクへ書き出し（正しさのためではなく、書き出し負荷をチェックポインタに寄せるため）。</td></tr>
+    <tr><td><code>TruncateSUBTRANS(oldestXact)</code></td><td>チェックポイント時</td><td><code>oldestXact</code> を含むセグメントより古いセグメントを削除し、ディスクを回収。</td></tr>
+  </tbody>
+</table>
+
+<div class="fig">
+<figure>
+<svg viewBox="0 0 760 150" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="切り詰めと拡張">
+  <style>
+    .seg2{fill:#fff;stroke:#336791;stroke-width:1.3;}
+    .old{fill:#f1d6d6;stroke:#b03a3a;stroke-width:1.4;}
+    .cur{fill:#d6ead9;stroke:#2f855a;stroke-width:1.8;}
+    .tt{font:11px monospace;fill:#1f2328;text-anchor:middle;}
+    .cc{font:11px sans-serif;fill:#57606a;}
+  </style>
+  <rect class="old"  x="30"  y="50" width="100" height="46"/><text class="tt" x="80"  y="78">seg N-1</text>
+  <rect class="old"  x="135" y="50" width="100" height="46"/><text class="tt" x="185" y="78">seg N</text>
+  <rect class="seg2" x="240" y="50" width="100" height="46"/><text class="tt" x="290" y="78">seg N+1</text>
+  <rect class="cur"  x="345" y="50" width="100" height="46"/><text class="tt" x="395" y="72">seg N+2</text><text class="tt" x="395" y="88">(current)</text>
+  <line x1="240" y1="38" x2="240" y2="108" stroke="#b03a3a" stroke-width="2" stroke-dasharray="4 3"/>
+  <text class="cc" x="150" y="125" fill="#b03a3a">TruncateSUBTRANS: oldestXact より前を削除</text>
+  <text class="cc" x="350" y="125" fill="#2f855a">ExtendSUBTRANS: 新ページをゼロ化して前進</text>
+</svg>
+<figcaption>図5: 古いセグメントは切り詰め、先端は採番に合わせて拡張される。</figcaption>
+</figure>
+</div>
+
+<h2 id="config">9. 関連する設定パラメータ</h2>
+<table>
+  <thead><tr><th>パラメータ</th><th>意味</th><th>既定 / 挙動</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><code>subtransaction_buffers</code></td>
+      <td>pg_subtrans 用の共有バッファ（ページスロット）数。</td>
+      <td><code>0</code> で自動調整: <code>shared_buffers</code> 1GB あたり 2MB、最大 8MB 相当。明示指定時は 16 〜 <code>SLRU_MAX_ALLOWED_BUFFERS</code> にクランプ。</td>
+    </tr>
+  </tbody>
+</table>
+<p>
+  バッファ数は <code>SUBTRANSShmemBuffers()</code> が決定し、<code>SimpleLruAutotuneBuffers(512, 1024)</code> を
+  用いて自動調整します。スロット数は必ず <code>SLRU_BANK_SIZE</code>（16）の倍数に丸められます。
+</p>
+
+<footer>
+  <p>
+    出典（このリポジトリ内のソース）:
+    <a class="src" href="../src/backend/access/transam/subtrans.c"><code>src/backend/access/transam/subtrans.c</code></a>,
+    <a class="src" href="../src/backend/access/transam/slru.c"><code>src/backend/access/transam/slru.c</code></a>,
+    <a class="src" href="../src/include/access/slru.h"><code>src/include/access/slru.h</code></a>,
+    <a class="src" href="../src/include/pg_config_manual.h"><code>src/include/pg_config_manual.h</code></a>。
+  </p>
+  <p>PostgreSQL Global Development Group. 解説用ドキュメント。</p>
+</footer>
+
+</div>
+</body>
+</html>
