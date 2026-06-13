@@ -535,41 +535,44 @@ is( $psql_out,
 	"Check expected t_009_tbl2 data on standby");
 
 
-# Exercise the 2PC recovery code in StartupSUBTRANS, which is concerned with
-# ensuring that enough pg_subtrans pages exist on disk to cover the range of
-# prepared transactions at server start time.  There's not much we can verify
-# directly, but let's at least get the code to run.
+# Exercise the subtransaction recovery code by leaving a prepared transaction
+# open across a server restart, with a wide range of visible XIDs.  The
+# subxid->parent mapping lives only in shared memory and is rebuilt during
+# recovery, so there's not much we can verify directly; let's at least get the
+# code to run and confirm the prepared transaction survives the restart.
 $cur_standby->stop();
 configure_and_reload($cur_primary, "synchronous_standby_names = ''");
 
 $cur_primary->safe_psql('postgres', "CHECKPOINT");
 
-my $start_lsn =
-  $cur_primary->safe_psql('postgres', 'select pg_current_wal_insert_lsn()');
 $cur_primary->safe_psql('postgres',
 	"CREATE TABLE test(); BEGIN; CREATE TABLE test1(); PREPARE TRANSACTION 'foo';"
-);
-my $osubtrans = $cur_primary->safe_psql('postgres',
-	"select 'pg_subtrans/'||f, s.size from pg_ls_dir('pg_subtrans') f, pg_stat_file('pg_subtrans/'||f) s"
 );
 $cur_primary->pgbench(
 	'--no-vacuum --client=5 --transactions=1000',
 	0,
 	[],
 	[],
-	'pgbench run to cause pg_subtrans traffic',
+	'pgbench run to cause subtransaction traffic',
 	{
 		'009_twophase.pgb' => 'insert into test default values'
 	});
-# StartupSUBTRANS is exercised with a wide range of visible XIDs in this
-# stop/start sequence, because we left a prepared transaction open above.
-# Also, setting subtransaction_buffers to 32 above causes to switch SLRU
-# bank, for additional code coverage.
+# StartupSUBTRANS and the 2PC recovery path are exercised with a wide range of
+# visible XIDs in this stop/start sequence, because we left a prepared
+# transaction open above.
 $cur_primary->stop;
 $cur_primary->start;
-my $nsubtrans = $cur_primary->safe_psql('postgres',
-	"select 'pg_subtrans/'||f, s.size from pg_ls_dir('pg_subtrans') f, pg_stat_file('pg_subtrans/'||f) s"
-);
-isnt($osubtrans, $nsubtrans, "contents of pg_subtrans/ have changed");
+
+# The prepared transaction must still be present after recovery.
+my $prepared = $cur_primary->safe_psql('postgres',
+	"select gid from pg_prepared_xacts");
+is($prepared, 'foo', "prepared transaction survived restart");
+
+# And it must still be committable, which relies on the subtransaction parent
+# information being available again after recovery.
+$cur_primary->safe_psql('postgres', "COMMIT PREPARED 'foo'");
+my $test1 = $cur_primary->safe_psql('postgres',
+	"select count(*) from pg_class where relname = 'test1'");
+is($test1, '1', "table created in recovered prepared transaction is visible");
 
 done_testing();
