@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>第1章 サブトランザクションと親子関係 | PostgreSQL pg_subtrans 詳解</title>
+  <link rel="stylesheet" href="css/style.css">
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+    mermaid.initialize({ startOnLoad: true, theme: 'neutral', flowchart: { htmlLabels: true } });
+  </script>
+</head>
+<body>
+  <header class="site-header">
+    <a href="index.html" class="site-title">PostgreSQL pg_subtrans 詳解</a>
+  </header>
+  <div class="layout">
+    <nav class="sidebar">
+      <ol>
+        <li class="current">
+          <a class="chap-title" href="ch01.html">第1章 サブトランザクションと親子関係</a>
+          <ol class="sect">
+            <li><a href="ch01.html#sec-1-1">1.1 サブトランザクションとは</a></li>
+            <li><a href="ch01.html#sec-1-2">1.2 SAVEPOINT による入れ子の例</a></li>
+            <li><a href="ch01.html#sec-1-3">1.3 親子関係を記録する理由</a></li>
+          </ol>
+        </li>
+        <li>
+          <a class="chap-title" href="ch02.html">第2章 pg_subtrans の全体像と SLRU 基盤</a>
+          <ol class="sect">
+            <li><a href="ch02.html#sec-2-1">2.1 SLRU マネージャの役割</a></li>
+            <li><a href="ch02.html#sec-2-2">2.2 ディスク上の pg_subtrans ディレクトリ</a></li>
+            <li><a href="ch02.html#sec-2-3">2.3 クラッシュをまたがない設計</a></li>
+          </ol>
+        </li>
+        <li>
+          <a class="chap-title" href="ch03.html">第3章 データ構造とページレイアウト</a>
+          <ol class="sect">
+            <li><a href="ch03.html#sec-3-1">3.1 エントリとページ</a></li>
+            <li><a href="ch03.html#sec-3-2">3.2 XID からページ・エントリへの写像</a></li>
+            <li><a href="ch03.html#sec-3-3">3.3 バンクとロック、バッファ数</a></li>
+          </ol>
+        </li>
+        <li>
+          <a class="chap-title" href="ch04.html">第4章 親の記録と最上位XIDの解決</a>
+          <ol class="sect">
+            <li><a href="ch04.html#sec-4-1">4.1 SubTransSetParent — 親の記録</a></li>
+            <li><a href="ch04.html#sec-4-2">4.2 SubTransGetParent — 親の参照</a></li>
+            <li><a href="ch04.html#sec-4-3">4.3 SubTransGetTopmostTransaction — 最上位の解決</a></li>
+            <li><a href="ch04.html#sec-4-4">4.4 xact.c との連携</a></li>
+          </ol>
+        </li>
+        <li>
+          <a class="chap-title" href="ch05.html">第5章 ライフサイクル管理</a>
+          <ol class="sect">
+            <li><a href="ch05.html#sec-5-1">5.1 初期化と起動（BootStrap / Startup）</a></li>
+            <li><a href="ch05.html#sec-5-2">5.2 ページ拡張（Extend）</a></li>
+            <li><a href="ch05.html#sec-5-3">5.3 チェックポイントと切り詰め（Checkpoint / Truncate）</a></li>
+            <li><a href="ch05.html#sec-5-4">5.4 XID ラップアラウンドの扱い</a></li>
+          </ol>
+        </li>
+        <li>
+          <a class="chap-title" href="ch06.html">第6章 スナップショット・可視性での利用と運用</a>
+          <ol class="sect">
+            <li><a href="ch06.html#sec-6-1">6.1 subxid キャッシュの溢れ（オーバーフロー）</a></li>
+            <li><a href="ch06.html#sec-6-2">6.2 可視性判定での参照</a></li>
+            <li><a href="ch06.html#sec-6-3">6.3 性能と運用上の注意</a></li>
+          </ol>
+        </li>
+      </ol>
+    </nav>
+    <main class="content">
+      <article>
+        <h1>第1章　サブトランザクションと親子関係</h1>
+        <p>PostgreSQL のトランザクションは入れ子（ネスト）にできる。トップレベルのトランザクションの内部に
+<strong>サブトランザクション（subtransaction）</strong>を作り、その一部だけを個別に取り消せる。本章では
+サブトランザクションの概念と、PostgreSQL がなぜ各トランザクションの<strong>親</strong>を記録する必要があるのか
+を整理し、<code>pg_subtrans</code> が解決する問題を明らかにする。</p>
+
+<h2 id="sec-1-1">1.1　サブトランザクションとは</h2>
+<p>サブトランザクションは <code>SAVEPOINT</code> コマンドや PL/pgSQL の <code>BEGIN ... EXCEPTION ... END</code>
+ブロックによって生成される、トップレベルトランザクション内部の入れ子トランザクションである。書き込みを行った
+サブトランザクションには、トップレベルと同様に独自のトランザクションID（XID）が割り当てられる。</p>
+<p>各トランザクションは「親」を1つ持つ。トップレベルトランザクションの親は無効値
+<code>InvalidTransactionId</code> であり、各サブトランザクションの親は<strong>直近の親トランザクション</strong>の
+XID である。図 1.1 に示すように、この親子関係は木構造をなす。子から親へは容易にたどれるが、逆方向（親から子）には
+たどれない点が後の設計に効いてくる。</p>
+
+<figure>
+  <pre class="mermaid">
+flowchart TB
+    T["トップ<br/>XID 100<br/>親 = Invalid"]
+    S1["サブ1<br/>XID 101<br/>親 = 100"]
+    S2["サブ2<br/>XID 103<br/>親 = 100"]
+    S1A["サブ1a<br/>XID 102<br/>親 = 101"]
+    T --> S1
+    T --> S2
+    S1 --> S1A
+  </pre>
+  <figcaption>図 1.1: サブトランザクションがつくる親子の木（子→親にのみたどれる）</figcaption>
+</figure>
+
+<p><code>subtrans.c</code> 冒頭のコメントが、この役割を端的に述べている。すなわち <code>pg_subtrans</code> は
+「各トランザクションについて親トランザクションIDを保存する、<code>pg_xact</code> 風のマネージャであり、入れ子
+トランザクション実装の根幹をなす」ものである。</p>
+
+<h2 id="sec-1-2">1.2　SAVEPOINT による入れ子の例</h2>
+<p>具体的に、セーブポイントでサブトランザクションが生まれる様子を見る。次の例では、各 <code>SAVEPOINT</code>
+以降の書き込みがそれぞれ別のサブトランザクションに属する。</p>
+
+<div class="example">
+  <span class="example-label">SQL</span>
+  <pre><code>BEGIN;
+INSERT INTO accounts VALUES (1, 100);   -- トップレベルのXIDが割り当てられる
+SAVEPOINT s1;
+INSERT INTO accounts VALUES (2, 200);   -- サブトランザクション s1
+SAVEPOINT s2;
+INSERT INTO accounts VALUES (3, 300);   -- サブトランザクション s2
+ROLLBACK TO SAVEPOINT s1;               -- s1 以降（s2 含む）を取り消す
+INSERT INTO accounts VALUES (4, 400);   -- s1 を巻き戻した後の新たなサブトランザクション
+COMMIT;</code></pre>
+</div>
+
+<p><code>ROLLBACK TO SAVEPOINT s1</code> は、s1 を設定した時点以降の変更だけを取り消し、トップレベルや
+それ以前の変更は保持する。サブトランザクションごとに XID を分けて管理することで、このような部分的な巻き戻しが
+可能になる。</p>
+
+<div class="info"><strong>関連</strong>PL/pgSQL の <code>EXCEPTION</code> 句を持つブロックも、内部的には
+サブトランザクションを開始する。例外ハンドラで処理を継続できるのは、ブロック内の変更をサブトランザクション
+単位で巻き戻せるからである。この点は<a href="ch06.html#sec-6-3">第6章</a>の性能の議論につながる。</div>
+
+<h2 id="sec-1-3">1.3　親子関係を記録する理由</h2>
+<p>では、なぜ親子関係を共有領域に記録する必要があるのか。鍵となるのは<strong>他のバックエンドからの可視性判定</strong>
+である。あるバックエンドがタプルに刻まれた XID（それがサブトランザクションのものかもしれない）を見たとき、
+「この XID の<strong>最上位の親</strong>は誰か」「その親はまだ実行中か」を判定できなければならない。サブ
+トランザクションの可視性は、その最上位の親トランザクションの状態に従うからである。</p>
+<p>各バックエンドは自分のサブXIDを共有メモリ上の <code>PGPROC</code> に最大
+<code>PGPROC_MAX_CACHED_SUBXIDS</code>（= 64、<code>src/include/storage/proc.h</code>）個までキャッシュ
+する。しかしサブトランザクションが 64 を超えるとキャッシュは<strong>溢れ（overflow）</strong>、個々のサブXIDは
+共有スナップショットからは見えなくなる。この溢れたケースで、子XID→親XIDの写像を全バックエンドへ提供するのが
+<code>pg_subtrans</code> である（詳細は<a href="ch06.html#sec-6-1">6.1節</a>）。</p>
+
+<div class="note"><strong>メモ</strong><code>pg_subtrans</code> が必要なのは<strong>現在実行中</strong>の
+トランザクションについてだけである。<code>subtrans.c</code> のコメントが明言するとおり、堅牢性要件は
+<code>pg_xact</code>（CLOG）とは全く異なり、データをクラッシュ・再起動をまたいで保存する必要はない。この
+割り切りが、次章で見る軽量な設計を可能にしている。</div>
+      </article>
+      <nav class="pager">
+        <a class="next" href="ch02.html"><span class="dir">次の章 →</span><span class="ttl">第2章 pg_subtrans の全体像と SLRU 基盤</span></a>
+      </nav>
+    </main>
+  </div>
+  <footer class="site-footer">PostgreSQL 19beta1 のソースコードに基づく解説 ・ db-internals-docs スキルで生成</footer>
+</body>
+</html>

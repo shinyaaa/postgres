@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>第6章 スナップショット・可視性での利用と運用 | PostgreSQL pg_subtrans 詳解</title>
+  <link rel="stylesheet" href="css/style.css">
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+    mermaid.initialize({ startOnLoad: true, theme: 'neutral', flowchart: { htmlLabels: true } });
+  </script>
+</head>
+<body>
+  <header class="site-header">
+    <a href="index.html" class="site-title">PostgreSQL pg_subtrans 詳解</a>
+  </header>
+  <div class="layout">
+    <nav class="sidebar">
+      <ol>
+        <li>
+          <a class="chap-title" href="ch01.html">第1章 サブトランザクションと親子関係</a>
+          <ol class="sect">
+            <li><a href="ch01.html#sec-1-1">1.1 サブトランザクションとは</a></li>
+            <li><a href="ch01.html#sec-1-2">1.2 SAVEPOINT による入れ子の例</a></li>
+            <li><a href="ch01.html#sec-1-3">1.3 親子関係を記録する理由</a></li>
+          </ol>
+        </li>
+        <li>
+          <a class="chap-title" href="ch02.html">第2章 pg_subtrans の全体像と SLRU 基盤</a>
+          <ol class="sect">
+            <li><a href="ch02.html#sec-2-1">2.1 SLRU マネージャの役割</a></li>
+            <li><a href="ch02.html#sec-2-2">2.2 ディスク上の pg_subtrans ディレクトリ</a></li>
+            <li><a href="ch02.html#sec-2-3">2.3 クラッシュをまたがない設計</a></li>
+          </ol>
+        </li>
+        <li>
+          <a class="chap-title" href="ch03.html">第3章 データ構造とページレイアウト</a>
+          <ol class="sect">
+            <li><a href="ch03.html#sec-3-1">3.1 エントリとページ</a></li>
+            <li><a href="ch03.html#sec-3-2">3.2 XID からページ・エントリへの写像</a></li>
+            <li><a href="ch03.html#sec-3-3">3.3 バンクとロック、バッファ数</a></li>
+          </ol>
+        </li>
+        <li>
+          <a class="chap-title" href="ch04.html">第4章 親の記録と最上位XIDの解決</a>
+          <ol class="sect">
+            <li><a href="ch04.html#sec-4-1">4.1 SubTransSetParent — 親の記録</a></li>
+            <li><a href="ch04.html#sec-4-2">4.2 SubTransGetParent — 親の参照</a></li>
+            <li><a href="ch04.html#sec-4-3">4.3 SubTransGetTopmostTransaction — 最上位の解決</a></li>
+            <li><a href="ch04.html#sec-4-4">4.4 xact.c との連携</a></li>
+          </ol>
+        </li>
+        <li>
+          <a class="chap-title" href="ch05.html">第5章 ライフサイクル管理</a>
+          <ol class="sect">
+            <li><a href="ch05.html#sec-5-1">5.1 初期化と起動（BootStrap / Startup）</a></li>
+            <li><a href="ch05.html#sec-5-2">5.2 ページ拡張（Extend）</a></li>
+            <li><a href="ch05.html#sec-5-3">5.3 チェックポイントと切り詰め（Checkpoint / Truncate）</a></li>
+            <li><a href="ch05.html#sec-5-4">5.4 XID ラップアラウンドの扱い</a></li>
+          </ol>
+        </li>
+        <li class="current">
+          <a class="chap-title" href="ch06.html">第6章 スナップショット・可視性での利用と運用</a>
+          <ol class="sect">
+            <li><a href="ch06.html#sec-6-1">6.1 subxid キャッシュの溢れ（オーバーフロー）</a></li>
+            <li><a href="ch06.html#sec-6-2">6.2 可視性判定での参照</a></li>
+            <li><a href="ch06.html#sec-6-3">6.3 性能と運用上の注意</a></li>
+          </ol>
+        </li>
+      </ol>
+    </nav>
+    <main class="content">
+      <article>
+        <h1>第6章　スナップショット・可視性での利用と運用</h1>
+        <p>最終章では、<code>pg_subtrans</code> が実運用でいつ・どのように参照されるかを、サブXIDキャッシュの
+オーバーフローを起点に追い、可視性判定での利用と、性能・運用上の注意点をまとめる。</p>
+
+<h2 id="sec-6-1">6.1　subxid キャッシュの溢れ（オーバーフロー）</h2>
+<p><a href="ch01.html#sec-1-3">1.3節</a>で触れたとおり、各バックエンドは自分のサブXIDを共有メモリ上の
+<code>PGPROC</code> に最大 <code>PGPROC_MAX_CACHED_SUBXIDS</code>（= 64）個までキャッシュする
+（<code>subxidStatus</code>: <code>nxids</code> と <code>overflowed</code>）。図 6.1 のように、65 個目以降は
+<code>overflowed = true</code> となり、個々のサブXIDは共有スナップショットに載らなくなる。</p>
+
+<figure>
+  <pre class="mermaid">
+flowchart TB
+    New["サブトランザクションに XID を割り当て"] --> Q{"キャッシュ済み subxid 数 &lt; 64?"}
+    Q -- はい --> Cache["PGPROC-&gt;subxidStatus.xids[] に追加"]
+    Q -- いいえ --> Over["subxidStatus.overflowed = true"]
+    Over --> Sub["以後の参照は pg_subtrans 経由で<br/>最上位XIDを解決する"]
+  </pre>
+  <figcaption>図 6.1: サブXIDキャッシュが 64 を超えるとオーバーフローし、pg_subtrans が使われる</figcaption>
+</figure>
+
+<p>このとき、他バックエンドがそのサブXIDの状態を知る唯一の手段が <code>pg_subtrans</code> である。
+<a href="ch04.html#sec-4-4">4.4節</a>で見たように、<code>AssignTransactionId()</code> が XID を共有領域に出す前に
+必ず親を記録しておくのは、まさにこのオーバーフロー時の参照に備えるためである。</p>
+
+<h2 id="sec-6-2">6.2　可視性判定での参照</h2>
+<p>スナップショット取得時（<code>GetSnapshotData()</code>）に、いずれかのバックエンドがオーバーフローして
+いれば、スナップショットに <code>suboverflowed</code> 印が付く。以後、その印が付いたスナップショットで
+サブXIDの可視性を判定する <code>XidInMVCCSnapshot()</code>（<code>src/backend/utils/time/snapmgr.c</code>）は、
+図 6.2 のように <code>SubTransGetTopmostTransaction()</code> で最上位XIDを求め、それをスナップショットの
+実行中リストと照合する。</p>
+
+<figure>
+  <pre class="mermaid">
+sequenceDiagram
+    participant R as 読み取り側バックエンド
+    participant SN as snapmgr (XidInMVCCSnapshot)
+    participant ST as pg_subtrans
+    R->>SN: タプルの xmin(subxid) は可視か?
+    SN->>SN: スナップショットは suboverflowed?
+    SN->>ST: SubTransGetTopmostTransaction(subxid)
+    ST-->>SN: 最上位XID
+    SN->>SN: 最上位XID をスナップショットの実行中リストと照合
+    SN-->>R: 可視 / 不可視
+  </pre>
+  <figcaption>図 6.2: オーバーフロー時の可視性判定での pg_subtrans 参照</figcaption>
+</figure>
+
+<p>同様に、トランザクション完了を待つロック機構 <code>XactLockTableWait()</code>
+（<code>src/backend/storage/lmgr/lmgr.c</code>）や、ヒープの可視性・待機処理
+（<code>src/backend/access/heap/heapam.c</code>）も、サブXIDをいったん最上位XIDへ写してから扱う。いずれも
+「サブトランザクションの状態は最上位の親に従う」という原則の現れである。</p>
+
+<h2 id="sec-6-3">6.3　性能と運用上の注意</h2>
+<p><code>pg_subtrans</code> は普段は静かだが、次の条件が重なると性能問題の原因になりうる。</p>
+<ul>
+  <li>1 トランザクションあたりのサブトランザクションが 64 を超える（深い／多数の <code>SAVEPOINT</code>、
+      PL/pgSQL の <code>EXCEPTION</code> ブロックの多用）。</li>
+  <li>同時に<strong>長時間トランザクション</strong>が存在し、<code>TransactionXmin</code> が進まない。</li>
+</ul>
+<p>これらが重なると、読み取り側が頻繁に <code>pg_subtrans</code> を引き、SLRU のバンクロック競合やディスク I/O
+（待機イベント <code>SubtransSLRU</code> / <code>SubtransBuffer</code>）が顕在化する。次の PL/pgSQL は、
+<code>EXCEPTION</code> ブロックが 1 つのサブトランザクションを生むことを利用して、意図的にオーバーフロー
+（&gt; 64 サブトランザクション）を起こす例である。</p>
+
+<div class="example">
+  <span class="example-label">SQL</span>
+  <pre><code>CREATE TABLE t (id int);
+BEGIN;
+DO $$
+BEGIN
+  FOR i IN 1..100 LOOP
+    BEGIN
+      INSERT INTO t VALUES (i);      -- EXCEPTION 句を持つブロック = サブトランザクション
+    EXCEPTION WHEN others THEN NULL;
+    END;
+  END LOOP;
+END $$;
+-- この時点でこのバックエンドの subxid キャッシュはオーバーフローしている。
+-- 別セッションから t を読むと、可視性判定で pg_subtrans が参照され blks_read が増える。
+COMMIT;</code></pre>
+</div>
+
+<p>影響は <code>pg_stat_slru</code> と <code>pg_stat_activity</code> で観察・診断できる。</p>
+<div class="example">
+  <span class="example-label">SQL</span>
+  <pre><code>-- SLRU の読み込み・ヒット状況（subtransaction 行に注目）
+SELECT name, blks_zeroed, blks_hit, blks_read FROM pg_stat_slru
+WHERE name = 'subtransaction';
+
+-- どのセッションが Subtrans 系の待機をしているか
+SELECT pid, wait_event_type, wait_event, state
+FROM pg_stat_activity
+WHERE wait_event LIKE 'Subtrans%';</code></pre>
+</div>
+
+<p>緩和策としては、(1) <code>subtransaction_buffers</code> を増やして SLRU のバッファを拡張する、
+(2) 長時間トランザクションを避けて <code>TransactionXmin</code> を進める、(3) 1 トランザクション内の
+サブトランザクション数を 64 以下に抑える（不要な <code>SAVEPOINT</code> や <code>EXCEPTION</code> の濫用を避ける）、
+が挙げられる。</p>
+
+<div class="note"><strong>まとめ</strong><code>pg_subtrans</code> は、サブトランザクションの親子関係を SLRU 上に
+記録する軽量・非永続のマネージャである。普段は <code>PGPROC</code> のサブXIDキャッシュで足りるが、
+キャッシュが溢れたときに「子XID→最上位の親XID」を全バックエンドへ提供する最後の拠り所として働く。クラッシュを
+またいで保存しないという割り切りが、WAL 連携を持たない簡潔な設計を可能にしている。</div>
+      </article>
+      <nav class="pager">
+        <a class="prev" href="ch05.html"><span class="dir">← 前の章</span><span class="ttl">第5章 ライフサイクル管理</span></a>
+      </nav>
+    </main>
+  </div>
+  <footer class="site-footer">PostgreSQL 19beta1 のソースコードに基づく解説 ・ db-internals-docs スキルで生成</footer>
+</body>
+</html>

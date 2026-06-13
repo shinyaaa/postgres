@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>第5章 ライフサイクル管理 | PostgreSQL pg_subtrans 詳解</title>
+  <link rel="stylesheet" href="css/style.css">
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+    mermaid.initialize({ startOnLoad: true, theme: 'neutral', flowchart: { htmlLabels: true } });
+  </script>
+</head>
+<body>
+  <header class="site-header">
+    <a href="index.html" class="site-title">PostgreSQL pg_subtrans 詳解</a>
+  </header>
+  <div class="layout">
+    <nav class="sidebar">
+      <ol>
+        <li>
+          <a class="chap-title" href="ch01.html">第1章 サブトランザクションと親子関係</a>
+          <ol class="sect">
+            <li><a href="ch01.html#sec-1-1">1.1 サブトランザクションとは</a></li>
+            <li><a href="ch01.html#sec-1-2">1.2 SAVEPOINT による入れ子の例</a></li>
+            <li><a href="ch01.html#sec-1-3">1.3 親子関係を記録する理由</a></li>
+          </ol>
+        </li>
+        <li>
+          <a class="chap-title" href="ch02.html">第2章 pg_subtrans の全体像と SLRU 基盤</a>
+          <ol class="sect">
+            <li><a href="ch02.html#sec-2-1">2.1 SLRU マネージャの役割</a></li>
+            <li><a href="ch02.html#sec-2-2">2.2 ディスク上の pg_subtrans ディレクトリ</a></li>
+            <li><a href="ch02.html#sec-2-3">2.3 クラッシュをまたがない設計</a></li>
+          </ol>
+        </li>
+        <li>
+          <a class="chap-title" href="ch03.html">第3章 データ構造とページレイアウト</a>
+          <ol class="sect">
+            <li><a href="ch03.html#sec-3-1">3.1 エントリとページ</a></li>
+            <li><a href="ch03.html#sec-3-2">3.2 XID からページ・エントリへの写像</a></li>
+            <li><a href="ch03.html#sec-3-3">3.3 バンクとロック、バッファ数</a></li>
+          </ol>
+        </li>
+        <li>
+          <a class="chap-title" href="ch04.html">第4章 親の記録と最上位XIDの解決</a>
+          <ol class="sect">
+            <li><a href="ch04.html#sec-4-1">4.1 SubTransSetParent — 親の記録</a></li>
+            <li><a href="ch04.html#sec-4-2">4.2 SubTransGetParent — 親の参照</a></li>
+            <li><a href="ch04.html#sec-4-3">4.3 SubTransGetTopmostTransaction — 最上位の解決</a></li>
+            <li><a href="ch04.html#sec-4-4">4.4 xact.c との連携</a></li>
+          </ol>
+        </li>
+        <li class="current">
+          <a class="chap-title" href="ch05.html">第5章 ライフサイクル管理</a>
+          <ol class="sect">
+            <li><a href="ch05.html#sec-5-1">5.1 初期化と起動（BootStrap / Startup）</a></li>
+            <li><a href="ch05.html#sec-5-2">5.2 ページ拡張（Extend）</a></li>
+            <li><a href="ch05.html#sec-5-3">5.3 チェックポイントと切り詰め（Checkpoint / Truncate）</a></li>
+            <li><a href="ch05.html#sec-5-4">5.4 XID ラップアラウンドの扱い</a></li>
+          </ol>
+        </li>
+        <li>
+          <a class="chap-title" href="ch06.html">第6章 スナップショット・可視性での利用と運用</a>
+          <ol class="sect">
+            <li><a href="ch06.html#sec-6-1">6.1 subxid キャッシュの溢れ（オーバーフロー）</a></li>
+            <li><a href="ch06.html#sec-6-2">6.2 可視性判定での参照</a></li>
+            <li><a href="ch06.html#sec-6-3">6.3 性能と運用上の注意</a></li>
+          </ol>
+        </li>
+      </ol>
+    </nav>
+    <main class="content">
+      <article>
+        <h1>第5章　ライフサイクル管理</h1>
+        <p>本章では <code>pg_subtrans</code> の一生 — 初期化、起動、ページ拡張、チェックポイント、切り詰め — を順に
+たどり、最後に XID ラップアラウンドの扱いを見る。これらはすべて <code>subtrans.c</code> に実装される。</p>
+
+<figure>
+  <pre class="mermaid">
+stateDiagram-v2
+    [*] --> BootStrap: initdb
+    BootStrap --> Startup: サーバ起動
+    Startup --> Running
+    Running --> Running: SetParent / GetParent / Extend
+    Running --> CheckPoint: チェックポイント
+    CheckPoint --> Truncate: 古いセグメント削除
+    Truncate --> Running
+    note right of BootStrap : BootStrapSUBTRANS()
+    note right of Startup : StartupSUBTRANS()
+    note right of Running : ExtendSUBTRANS()
+    note right of CheckPoint : CheckPointSUBTRANS()
+    note right of Truncate : TruncateSUBTRANS()
+  </pre>
+  <figcaption>図 5.1: pg_subtrans のライフサイクルと対応関数</figcaption>
+</figure>
+
+<h2 id="sec-5-1">5.1　初期化と起動（BootStrap / Startup）</h2>
+<p><code>BootStrapSUBTRANS()</code> は <code>initdb</code> 時に一度だけ呼ばれ、最初のページ（ページ 0）をゼロ初期化
+してディスクへ書き出す（<code>SimpleLruZeroAndWritePage()</code>）。ディレクトリ自体は initdb のシェル処理が
+作成済みである。</p>
+<p><code>StartupSUBTRANS(oldestActiveXID)</code> はサーバ起動時（<code>StartupXLOG</code> が
+<code>nextXid</code> を初期化した後）に一度呼ばれる。<a href="ch02.html#sec-2-3">2.3節</a>で述べた非永続性のため、
+現在アクティブになりうるページ範囲 — <code>oldestActiveXID</code> のページから <code>nextXid</code> のページまで —
+をすべてゼロで初期化する。ラップアラウンドを考慮してページ番号が最大値を超えたら 0 へ巻き戻し、バンクロックは
+ページが属するバンクが変わるたびに取り直す。</p>
+
+<h2 id="sec-5-2">5.2　ページ拡張（Extend）</h2>
+<p>新しい XID が新しいページにまたがるとき、そのページを使う前にゼロ初期化しておく必要がある。これを担うのが
+<code>ExtendSUBTRANS(newestXact)</code> である。XID 採番の途中（<code>XidGenLock</code> 保持下）で呼ばれるため、
+できるだけ高速であることが求められる。図 5.2 のように、ページ先頭の XID（エントリ番号が 0、またはラップ直後の
+<code>FirstNormalTransactionId</code>）でないときは即座に戻り、何の I/O も発生させない。</p>
+
+<figure>
+  <pre class="mermaid">
+flowchart TB
+    In["ExtendSUBTRANS(newestXact)"] --> Q{"entryno == 0 か<br/>FirstNormalTransactionId?"}
+    Q -- いいえ --> Ret["何もせず戻る（高速パス）"]
+    Q -- はい --> Lock["バンクロックを排他取得"]
+    Lock --> Zero["SimpleLruZeroPage(pageno)"]
+    Zero --> Unlock["ロック解放"]
+  </pre>
+  <figcaption>図 5.2: ExtendSUBTRANS はページの先頭XIDでのみ新ページをゼロ化する</figcaption>
+</figure>
+
+<h2 id="sec-5-3">5.3　チェックポイントと切り詰め（Checkpoint / Truncate）</h2>
+<p><code>CheckPointSUBTRANS()</code> はダーティページをすべて書き出す（<code>SimpleLruWriteAll()</code>）。
+<a href="ch02.html#sec-2-3">2.3節</a>のとおり、これは正当性のためではなく、書き込みをバックエンドから
+チェックポインタへ移すための最適化である。</p>
+<p><code>TruncateSUBTRANS(oldestXact)</code> はチェックポイント時にだけ呼ばれ、もはや参照されない古いセグメントを
+削除する。<code>oldestXact</code> は実行中トランザクションの最古の <code>TransactionXmin</code> である。これを 1
+だけ戻してからそのページを切り詰めの基準（<code>cutoffPage</code>）として <code>SimpleLruTruncate()</code> に
+渡す。1 を引くのは、<code>oldestXact</code> がページ先頭かつ次XIDと一致する稀なケースで、まだ作られていない
+ページを基準に渡して SLRU のラップアラウンド検知を誤作動させないためである。</p>
+
+<h2 id="sec-5-4">5.4　XID ラップアラウンドの扱い</h2>
+<p>XID は 32 ビットで循環するため、ページ番号やセグメント番号も <code>0xFFFFFFFF / 2048</code> 付近で巻き戻る。
+切り詰めの際に「どちらのページが古いか」を正しく判定するのが <code>SubTransPagePrecedes()</code> で、
+<code>CLOGPagePrecedes()</code> と同様の発想で、ページ先頭XIDに <code>FirstNormalTransactionId + 1</code> の
+オフセットを足してから <code>TransactionIdPrecedes()</code> で循環順序を比較する。</p>
+<div class="note"><strong>メモ</strong>ラップアラウンドの境界条件は誤りやすいため、起動時の
+<code>SUBTRANSShmemInit()</code> から <code>SlruPagePrecedesUnitTests()</code> が呼ばれ、
+<code>SubTransPagePrecedes()</code> の整合性を単体テストで検証している。</div>
+      </article>
+      <nav class="pager">
+        <a class="prev" href="ch04.html"><span class="dir">← 前の章</span><span class="ttl">第4章 親の記録と最上位XIDの解決</span></a>
+        <a class="next" href="ch06.html"><span class="dir">次の章 →</span><span class="ttl">第6章 スナップショット・可視性での利用と運用</span></a>
+      </nav>
+    </main>
+  </div>
+  <footer class="site-footer">PostgreSQL 19beta1 のソースコードに基づく解説 ・ db-internals-docs スキルで生成</footer>
+</body>
+</html>

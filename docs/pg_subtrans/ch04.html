@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>第4章 親の記録と最上位XIDの解決 | PostgreSQL pg_subtrans 詳解</title>
+  <link rel="stylesheet" href="css/style.css">
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+    mermaid.initialize({ startOnLoad: true, theme: 'neutral', flowchart: { htmlLabels: true } });
+  </script>
+</head>
+<body>
+  <header class="site-header">
+    <a href="index.html" class="site-title">PostgreSQL pg_subtrans 詳解</a>
+  </header>
+  <div class="layout">
+    <nav class="sidebar">
+      <ol>
+        <li>
+          <a class="chap-title" href="ch01.html">第1章 サブトランザクションと親子関係</a>
+          <ol class="sect">
+            <li><a href="ch01.html#sec-1-1">1.1 サブトランザクションとは</a></li>
+            <li><a href="ch01.html#sec-1-2">1.2 SAVEPOINT による入れ子の例</a></li>
+            <li><a href="ch01.html#sec-1-3">1.3 親子関係を記録する理由</a></li>
+          </ol>
+        </li>
+        <li>
+          <a class="chap-title" href="ch02.html">第2章 pg_subtrans の全体像と SLRU 基盤</a>
+          <ol class="sect">
+            <li><a href="ch02.html#sec-2-1">2.1 SLRU マネージャの役割</a></li>
+            <li><a href="ch02.html#sec-2-2">2.2 ディスク上の pg_subtrans ディレクトリ</a></li>
+            <li><a href="ch02.html#sec-2-3">2.3 クラッシュをまたがない設計</a></li>
+          </ol>
+        </li>
+        <li>
+          <a class="chap-title" href="ch03.html">第3章 データ構造とページレイアウト</a>
+          <ol class="sect">
+            <li><a href="ch03.html#sec-3-1">3.1 エントリとページ</a></li>
+            <li><a href="ch03.html#sec-3-2">3.2 XID からページ・エントリへの写像</a></li>
+            <li><a href="ch03.html#sec-3-3">3.3 バンクとロック、バッファ数</a></li>
+          </ol>
+        </li>
+        <li class="current">
+          <a class="chap-title" href="ch04.html">第4章 親の記録と最上位XIDの解決</a>
+          <ol class="sect">
+            <li><a href="ch04.html#sec-4-1">4.1 SubTransSetParent — 親の記録</a></li>
+            <li><a href="ch04.html#sec-4-2">4.2 SubTransGetParent — 親の参照</a></li>
+            <li><a href="ch04.html#sec-4-3">4.3 SubTransGetTopmostTransaction — 最上位の解決</a></li>
+            <li><a href="ch04.html#sec-4-4">4.4 xact.c との連携</a></li>
+          </ol>
+        </li>
+        <li>
+          <a class="chap-title" href="ch05.html">第5章 ライフサイクル管理</a>
+          <ol class="sect">
+            <li><a href="ch05.html#sec-5-1">5.1 初期化と起動（BootStrap / Startup）</a></li>
+            <li><a href="ch05.html#sec-5-2">5.2 ページ拡張（Extend）</a></li>
+            <li><a href="ch05.html#sec-5-3">5.3 チェックポイントと切り詰め（Checkpoint / Truncate）</a></li>
+            <li><a href="ch05.html#sec-5-4">5.4 XID ラップアラウンドの扱い</a></li>
+          </ol>
+        </li>
+        <li>
+          <a class="chap-title" href="ch06.html">第6章 スナップショット・可視性での利用と運用</a>
+          <ol class="sect">
+            <li><a href="ch06.html#sec-6-1">6.1 subxid キャッシュの溢れ（オーバーフロー）</a></li>
+            <li><a href="ch06.html#sec-6-2">6.2 可視性判定での参照</a></li>
+            <li><a href="ch06.html#sec-6-3">6.3 性能と運用上の注意</a></li>
+          </ol>
+        </li>
+      </ol>
+    </nav>
+    <main class="content">
+      <article>
+        <h1>第4章　親の記録と最上位XIDの解決</h1>
+        <p>本章は <code>pg_subtrans</code> の中心となる 3 つの関数 — 親を記録する <code>SubTransSetParent()</code>、親を
+引く <code>SubTransGetParent()</code>、最上位の親までさかのぼる <code>SubTransGetTopmostTransaction()</code> — を
+コードに即して読み解き、最後に呼び出し元である <code>xact.c</code> との連携を見る。</p>
+
+<h2 id="sec-4-1">4.1　SubTransSetParent — 親の記録</h2>
+<p>サブトランザクションの XID とその親 XID を受け取り、対応するエントリへ親を書き込む。図 4.1 の手順で、
+バンクロックを排他取得し、ページを読み込み、エントリへ親を書いてダーティに印を付ける。</p>
+
+<figure>
+  <pre class="mermaid">
+sequenceDiagram
+    participant C as 呼び出し元
+    participant L as バンクロック
+    participant S as SubTransCtl (SLRU)
+    C->>L: LWLockAcquire(LW_EXCLUSIVE)
+    C->>S: SimpleLruReadPage(pageno) → slotno
+    C->>S: ptr = page_buffer[slotno] + entryno
+    Note over C,S: *ptr != parent のときだけ書き込む（冪等）
+    C->>S: *ptr = parent ; page_dirty[slotno] = true
+    C->>L: LWLockRelease
+  </pre>
+  <figcaption>図 4.1: SubTransSetParent の処理の流れ</figcaption>
+</figure>
+
+<p>書き込みは冪等になっている。すでに同じ親が入っていれば何もしない。コメントが警告するとおり、ある有効な親
+XID から別の有効な親 XID へ<strong>書き換える</strong>ことは決して起きてはならない（起きればデータ構造の破損
+である）。そのため書き込み前のエントリは <code>InvalidTransactionId</code> であることがアサートされる。</p>
+<div class="example">
+  <span class="example-label">subtrans.c（抜粋）</span>
+  <pre><code>if (*ptr != parent)
+{
+    Assert(*ptr == InvalidTransactionId);
+    *ptr = parent;
+    SubTransCtl-&gt;shared-&gt;page_dirty[slotno] = true;
+}</code></pre>
+</div>
+
+<h2 id="sec-4-2">4.2　SubTransGetParent — 親の参照</h2>
+<p>ある XID の親を 1 段だけ引く。ブートストラップXIDや凍結XIDなど「通常でない」XID には親がないので
+<code>InvalidTransactionId</code> を返す。読み取りは <code>SimpleLruReadPage_ReadOnly()</code> を使い、これが
+バンクロックの取得まで面倒を見る。読み終えたらバンクロックを解放する。</p>
+<p>先頭にある <code>Assert(TransactionIdFollowsOrEquals(xid, TransactionXmin))</code> が重要である。
+<code>TransactionXmin</code> より古い XID については、すでにセグメントが切り詰められている可能性があるため、
+そもそも問い合わせてはならない（切り詰めは<a href="ch05.html#sec-5-3">5.3節</a>）。</p>
+
+<h2 id="sec-4-3">4.3　SubTransGetTopmostTransaction — 最上位の解決</h2>
+<p>可視性判定で実際に使われるのはこの関数である。親チェーンを子から親へたどり、親が無効になるか、
+あるいは <code>TransactionXmin</code> より前に達した時点で止め、その直前の有効な XID を「最上位」として返す。
+図 4.2 にループの構造を示す。</p>
+
+<figure>
+  <pre class="mermaid">
+flowchart TB
+    Start["parentXid = previousXid = xid"] --> Chk{"parentXid は有効?"}
+    Chk -- いいえ --> Ret["previousXid を返す"]
+    Chk -- はい --> Old{"parentXid &lt; TransactionXmin?"}
+    Old -- はい --> Ret
+    Old -- いいえ --> Get["previousXid = parentXid<br/>parentXid = SubTransGetParent(parentXid)"]
+    Get --> Corr{"parentXid &lt; previousXid?"}
+    Corr -- いいえ --> Err["elog(ERROR): pg_subtrans 破損検出"]
+    Corr -- はい --> Chk
+  </pre>
+  <figcaption>図 4.2: SubTransGetTopmostTransaction の親チェーン探索</figcaption>
+</figure>
+
+<p>2 つの設計上の工夫がある。第一に、<code>TransactionXmin</code> より前で打ち切るため、真の最上位ではなく
+<strong>途中のサブXID</strong>を返す（“嘘をつく”）ことがある。だがコメントが述べるとおり、関心があるのは
+「最上位が今も実行中か、現在のスナップショットの実行中リストに含まれるか」だけなので、
+<code>TransactionXmin</code> より前の XID はどれも同じく「十分に古い」とみなせて問題にならない。第二に、
+慣例として親は子より先に割り当てられる（親XID &lt; 子XID）。これが崩れていれば無限ループに陥る破損なので、
+<code>elog(ERROR, "pg_subtrans contains invalid entry ...")</code> で即座に打ち切る。</p>
+
+<h2 id="sec-4-4">4.4　xact.c との連携</h2>
+<p>親子関係を実際に書き込む主な呼び出し元は、トランザクションへ XID を割り当てる
+<code>AssignTransactionId()</code>（<code>src/backend/access/transam/xact.c</code>）である。新しい
+<code>FullTransactionId</code> を採番した直後、サブトランザクションであれば <code>SubTransSetParent()</code> を
+呼ぶ。</p>
+<div class="example">
+  <span class="example-label">xact.c（抜粋）</span>
+  <pre><code>s-&gt;fullTransactionId = GetNewTransactionId(isSubXact);
+...
+if (isSubXact)
+    SubTransSetParent(XidFromFullTransactionId(s-&gt;fullTransactionId),
+                      XidFromFullTransactionId(s-&gt;parent-&gt;fullTransactionId));</code></pre>
+</div>
+<p>この順序には理由がある。コメントいわく「subtrans エントリは、その XID が <code>PGPROC</code> 以外の共有領域に
+現れる<strong>前に</strong>作らねばならない。なぜなら <code>PGPROC</code> に空きがない（オーバーフロー）場合、
+他のバックエンドがその XID を『実行中』と認識するために subtrans エントリが必要だからである」。つまり
+<code>pg_subtrans</code> は、PGPROC のサブXIDキャッシュが溢れたときの<strong>バックアップ経路</strong>として
+機能する（<a href="ch06.html#sec-6-1">6.1節</a>）。</p>
+<div class="info"><strong>関連</strong>リカバリ中は、プライマリの「XID 割り当てレコード」を
+<code>ProcArrayApplyXidAssignment()</code>（<code>procarray.c</code>）が適用し、各サブXIDについて
+<code>SubTransSetParent()</code> を呼んで親子関係を再構築する。2相コミット（<code>twophase.c</code>）でも、
+準備済みトランザクションの復元時に同様の設定を行う。</div>
+      </article>
+      <nav class="pager">
+        <a class="prev" href="ch03.html"><span class="dir">← 前の章</span><span class="ttl">第3章 データ構造とページレイアウト</span></a>
+        <a class="next" href="ch05.html"><span class="dir">次の章 →</span><span class="ttl">第5章 ライフサイクル管理</span></a>
+      </nav>
+    </main>
+  </div>
+  <footer class="site-footer">PostgreSQL 19beta1 のソースコードに基づく解説 ・ db-internals-docs スキルで生成</footer>
+</body>
+</html>

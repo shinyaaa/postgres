@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>第3章 データ構造とページレイアウト | PostgreSQL pg_subtrans 詳解</title>
+  <link rel="stylesheet" href="css/style.css">
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+    mermaid.initialize({ startOnLoad: true, theme: 'neutral', flowchart: { htmlLabels: true } });
+  </script>
+</head>
+<body>
+  <header class="site-header">
+    <a href="index.html" class="site-title">PostgreSQL pg_subtrans 詳解</a>
+  </header>
+  <div class="layout">
+    <nav class="sidebar">
+      <ol>
+        <li>
+          <a class="chap-title" href="ch01.html">第1章 サブトランザクションと親子関係</a>
+          <ol class="sect">
+            <li><a href="ch01.html#sec-1-1">1.1 サブトランザクションとは</a></li>
+            <li><a href="ch01.html#sec-1-2">1.2 SAVEPOINT による入れ子の例</a></li>
+            <li><a href="ch01.html#sec-1-3">1.3 親子関係を記録する理由</a></li>
+          </ol>
+        </li>
+        <li>
+          <a class="chap-title" href="ch02.html">第2章 pg_subtrans の全体像と SLRU 基盤</a>
+          <ol class="sect">
+            <li><a href="ch02.html#sec-2-1">2.1 SLRU マネージャの役割</a></li>
+            <li><a href="ch02.html#sec-2-2">2.2 ディスク上の pg_subtrans ディレクトリ</a></li>
+            <li><a href="ch02.html#sec-2-3">2.3 クラッシュをまたがない設計</a></li>
+          </ol>
+        </li>
+        <li class="current">
+          <a class="chap-title" href="ch03.html">第3章 データ構造とページレイアウト</a>
+          <ol class="sect">
+            <li><a href="ch03.html#sec-3-1">3.1 エントリとページ</a></li>
+            <li><a href="ch03.html#sec-3-2">3.2 XID からページ・エントリへの写像</a></li>
+            <li><a href="ch03.html#sec-3-3">3.3 バンクとロック、バッファ数</a></li>
+          </ol>
+        </li>
+        <li>
+          <a class="chap-title" href="ch04.html">第4章 親の記録と最上位XIDの解決</a>
+          <ol class="sect">
+            <li><a href="ch04.html#sec-4-1">4.1 SubTransSetParent — 親の記録</a></li>
+            <li><a href="ch04.html#sec-4-2">4.2 SubTransGetParent — 親の参照</a></li>
+            <li><a href="ch04.html#sec-4-3">4.3 SubTransGetTopmostTransaction — 最上位の解決</a></li>
+            <li><a href="ch04.html#sec-4-4">4.4 xact.c との連携</a></li>
+          </ol>
+        </li>
+        <li>
+          <a class="chap-title" href="ch05.html">第5章 ライフサイクル管理</a>
+          <ol class="sect">
+            <li><a href="ch05.html#sec-5-1">5.1 初期化と起動（BootStrap / Startup）</a></li>
+            <li><a href="ch05.html#sec-5-2">5.2 ページ拡張（Extend）</a></li>
+            <li><a href="ch05.html#sec-5-3">5.3 チェックポイントと切り詰め（Checkpoint / Truncate）</a></li>
+            <li><a href="ch05.html#sec-5-4">5.4 XID ラップアラウンドの扱い</a></li>
+          </ol>
+        </li>
+        <li>
+          <a class="chap-title" href="ch06.html">第6章 スナップショット・可視性での利用と運用</a>
+          <ol class="sect">
+            <li><a href="ch06.html#sec-6-1">6.1 subxid キャッシュの溢れ（オーバーフロー）</a></li>
+            <li><a href="ch06.html#sec-6-2">6.2 可視性判定での参照</a></li>
+            <li><a href="ch06.html#sec-6-3">6.3 性能と運用上の注意</a></li>
+          </ol>
+        </li>
+      </ol>
+    </nav>
+    <main class="content">
+      <article>
+        <h1>第3章　データ構造とページレイアウト</h1>
+        <p>本章では <code>pg_subtrans</code> のデータ構造を、ページレイアウトと XID からの写像、そして並行アクセスを
+保護するロックの観点から詳しく見る。値はすべて <code>src/backend/access/transam/subtrans.c</code> の定義に基づく。</p>
+
+<h2 id="sec-3-1">3.1　エントリとページ</h2>
+<p><code>pg_subtrans</code> の 1 エントリは <code>TransactionId</code>（4 バイト）で、ある XID の<strong>親XID</strong>を
+表す。XID をそのまま配列の添字とみなし、エントリ番号 <var>i</var> の中身が「XID <var>i</var> の親」になる、と
+考えればよい。図 3.1 にページの内部を示す。</p>
+
+<figure>
+  <pre class="mermaid">
+flowchart LR
+    subgraph Page["1 ページ = BLCKSZ (8KB) = 2048 エントリ"]
+      direction TB
+      E0["entry 0 : XID n の親"]
+      E1["entry 1 : XID n+1 の親"]
+      Ed["…"]
+      E2["entry 2047 : XID n+2047 の親"]
+    end
+    E0 --> E1 --> Ed --> E2
+  </pre>
+  <figcaption>図 3.1: ヒープページと同じ 8KB を 2048 個の親XIDエントリで埋める（n はページ先頭XID）</figcaption>
+</figure>
+
+<p>関連する定義は次のとおりである。</p>
+<table>
+  <tr><th>定義</th><th>値</th><th>意味</th></tr>
+  <tr><td><code>SUBTRANS_XACTS_PER_PAGE</code></td><td><code>BLCKSZ / sizeof(TransactionId)</code> = 8192 / 4 = <strong>2048</strong></td><td>1 ページあたりのエントリ数</td></tr>
+  <tr><td><code>SLRU_PAGES_PER_SEGMENT</code></td><td><strong>32</strong></td><td>1 セグメントのページ数</td></tr>
+  <tr><td>1 セグメントのエントリ数</td><td>2048 × 32 = <strong>65,536</strong></td><td>1 セグメントファイルがカバーする XID 数</td></tr>
+</table>
+
+<h2 id="sec-3-2">3.2　XID からページ・エントリへの写像</h2>
+<p>ある XID のエントリがどのページのどの位置にあるかは、単純な除算と剰余で求まる
+（<code>TransactionIdToPage()</code> と <code>TransactionIdToEntry()</code>）。</p>
+
+<div class="example">
+  <span class="example-label">subtrans.c</span>
+  <pre><code>#define SUBTRANS_XACTS_PER_PAGE (BLCKSZ / sizeof(TransactionId))
+
+/* ページ番号 = xid / 2048 */
+static inline int64
+TransactionIdToPage(TransactionId xid)
+{
+    return xid / (int64) SUBTRANS_XACTS_PER_PAGE;
+}
+
+/* エントリ番号 = xid % 2048 */
+#define TransactionIdToEntry(xid) ((xid) % (TransactionId) SUBTRANS_XACTS_PER_PAGE)</code></pre>
+</div>
+
+<p>図 3.2 に、XID = 5000 を例にとった写像を示す。ページ番号は <code>5000 / 2048 = 2</code>、エントリ番号は
+<code>5000 % 2048 = 904</code> となる。XID は 32 ビットで <code>0xFFFFFFFF</code> を超えると 0 へ回り込むため、
+ページ番号も <code>0xFFFFFFFF / 2048</code> でラップする（<a href="ch05.html#sec-5-4">5.4節</a>）。</p>
+
+<figure>
+  <pre class="mermaid">
+flowchart LR
+    X["XID = 5000"] --> P["pageno = 5000 / 2048 = 2"]
+    X --> En["entryno = 5000 % 2048 = 904"]
+    P --> Read["SimpleLruReadPage(SubTransCtl, 2)"]
+    Read --> Slot["page_buffer[slotno]"]
+    En --> Cell["+ 904 → 親XIDが入るセル"]
+    Slot --> Cell
+  </pre>
+  <figcaption>図 3.2: XID からページ番号・エントリ番号を経てバッファ内のセルへ到達する</figcaption>
+</figure>
+
+<h2 id="sec-3-3">3.3　バンクとロック、バッファ数</h2>
+<p>共有メモリ上のページバッファは複数の<strong>バンク（bank）</strong>に分割され、各バンクは専用の
+<code>LWLock</code> で保護される。あるページを操作する際は、<code>SimpleLruGetBankLock(SubTransCtl, pageno)</code>
+でそのページが属するバンクのロックを取得する。書き込み系（<code>SubTransSetParent</code>）は
+<code>LW_EXCLUSIVE</code> で明示的に取得し、読み取り系は <code>SimpleLruReadPage_ReadOnly()</code> が内部で
+ロックを取得・解放する（<a href="ch04.html">第4章</a>）。</p>
+<p>バッファ（スロット）数は GUC <code>subtransaction_buffers</code> で決まる。<code>0</code> なら自動チューニングで、
+共有バッファ 1 GB あたり 2 MB、上限 8 MB を割り当てる（<code>SimpleLruAutotuneBuffers(512, 1024)</code>）。明示
+指定時は <code>[16, SLRU_MAX_ALLOWED_BUFFERS]</code> の範囲にクランプされる。</p>
+
+<div class="example">
+  <span class="example-label">SQL</span>
+  <pre><code>SHOW subtransaction_buffers;
+SELECT name, blks_zeroed, blks_hit, blks_read, blks_written
+FROM pg_stat_slru WHERE name = 'subtransaction';</code></pre>
+</div>
+<div class="example">
+  <span class="example-label">実行結果（例）</span>
+  <pre><code> subtransaction_buffers
+------------------------
+ 0
+
+      name      | blks_zeroed | blks_hit | blks_read | blks_written
+----------------+-------------+----------+-----------+--------------
+ subtransaction |           1 |        0 |         0 |            0</code></pre>
+</div>
+
+<p><code>blks_read</code>（ディスクから読み込んだページ数）は、サブトランザクションのオーバーフローが起きて
+<code>pg_subtrans</code> が実際に参照されると増えていく。この観察は<a href="ch06.html#sec-6-3">6.3節</a>で運用上の
+指標として再登場する。</p>
+      </article>
+      <nav class="pager">
+        <a class="prev" href="ch02.html"><span class="dir">← 前の章</span><span class="ttl">第2章 pg_subtrans の全体像と SLRU 基盤</span></a>
+        <a class="next" href="ch04.html"><span class="dir">次の章 →</span><span class="ttl">第4章 親の記録と最上位XIDの解決</span></a>
+      </nav>
+    </main>
+  </div>
+  <footer class="site-footer">PostgreSQL 19beta1 のソースコードに基づく解説 ・ db-internals-docs スキルで生成</footer>
+</body>
+</html>

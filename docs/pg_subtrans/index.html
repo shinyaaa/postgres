@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PostgreSQL pg_subtrans 詳解</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="index.html" class="site-title">PostgreSQL pg_subtrans 詳解</a>
+  </header>
+  <div class="layout">
+    <nav class="sidebar">
+      <ol>
+        <li>
+          <a class="chap-title" href="ch01.html">第1章 サブトランザクションと親子関係</a>
+          <ol class="sect">
+            <li><a href="ch01.html#sec-1-1">1.1 サブトランザクションとは</a></li>
+            <li><a href="ch01.html#sec-1-2">1.2 SAVEPOINT による入れ子の例</a></li>
+            <li><a href="ch01.html#sec-1-3">1.3 親子関係を記録する理由</a></li>
+          </ol>
+        </li>
+        <li>
+          <a class="chap-title" href="ch02.html">第2章 pg_subtrans の全体像と SLRU 基盤</a>
+          <ol class="sect">
+            <li><a href="ch02.html#sec-2-1">2.1 SLRU マネージャの役割</a></li>
+            <li><a href="ch02.html#sec-2-2">2.2 ディスク上の pg_subtrans ディレクトリ</a></li>
+            <li><a href="ch02.html#sec-2-3">2.3 クラッシュをまたがない設計</a></li>
+          </ol>
+        </li>
+        <li>
+          <a class="chap-title" href="ch03.html">第3章 データ構造とページレイアウト</a>
+          <ol class="sect">
+            <li><a href="ch03.html#sec-3-1">3.1 エントリとページ</a></li>
+            <li><a href="ch03.html#sec-3-2">3.2 XID からページ・エントリへの写像</a></li>
+            <li><a href="ch03.html#sec-3-3">3.3 バンクとロック、バッファ数</a></li>
+          </ol>
+        </li>
+        <li>
+          <a class="chap-title" href="ch04.html">第4章 親の記録と最上位XIDの解決</a>
+          <ol class="sect">
+            <li><a href="ch04.html#sec-4-1">4.1 SubTransSetParent — 親の記録</a></li>
+            <li><a href="ch04.html#sec-4-2">4.2 SubTransGetParent — 親の参照</a></li>
+            <li><a href="ch04.html#sec-4-3">4.3 SubTransGetTopmostTransaction — 最上位の解決</a></li>
+            <li><a href="ch04.html#sec-4-4">4.4 xact.c との連携</a></li>
+          </ol>
+        </li>
+        <li>
+          <a class="chap-title" href="ch05.html">第5章 ライフサイクル管理</a>
+          <ol class="sect">
+            <li><a href="ch05.html#sec-5-1">5.1 初期化と起動（BootStrap / Startup）</a></li>
+            <li><a href="ch05.html#sec-5-2">5.2 ページ拡張（Extend）</a></li>
+            <li><a href="ch05.html#sec-5-3">5.3 チェックポイントと切り詰め（Checkpoint / Truncate）</a></li>
+            <li><a href="ch05.html#sec-5-4">5.4 XID ラップアラウンドの扱い</a></li>
+          </ol>
+        </li>
+        <li>
+          <a class="chap-title" href="ch06.html">第6章 スナップショット・可視性での利用と運用</a>
+          <ol class="sect">
+            <li><a href="ch06.html#sec-6-1">6.1 subxid キャッシュの溢れ（オーバーフロー）</a></li>
+            <li><a href="ch06.html#sec-6-2">6.2 可視性判定での参照</a></li>
+            <li><a href="ch06.html#sec-6-3">6.3 性能と運用上の注意</a></li>
+          </ol>
+        </li>
+      </ol>
+    </nav>
+    <main class="content">
+      <div class="toc-hero">
+        <h1>PostgreSQL pg_subtrans 詳解</h1>
+        <p class="lead">サブトランザクションログマネージャ <code>pg_subtrans</code> の内部構造を、PostgreSQL 19beta1 のソースコード（<code>src/backend/access/transam/subtrans.c</code> ほか）に基づいて図と実例で解説する。対象読者は PostgreSQL のトランザクション機構やストレージ内部に関心のあるエンジニア。</p>
+      </div>
+      <div class="toc-grid">
+        <a class="toc-card" href="ch01.html"><span class="num">第1章</span><span class="title">サブトランザクションと親子関係</span><span class="desc">ネストしたトランザクションの仕組みと、各サブトランザクションの親XIDを記録する必要性。</span></a>
+        <a class="toc-card" href="ch02.html"><span class="num">第2章</span><span class="title">pg_subtrans の全体像と SLRU 基盤</span><span class="desc">SLRU の上に載る構造、ディスク上の pg_subtrans ディレクトリ、クラッシュ非永続性。</span></a>
+        <a class="toc-card" href="ch03.html"><span class="num">第3章</span><span class="title">データ構造とページレイアウト</span><span class="desc">1エントリ=親XID(4バイト)、ページ/エントリへの写像、バンク単位のロック。</span></a>
+        <a class="toc-card" href="ch04.html"><span class="num">第4章</span><span class="title">親の記録と最上位XIDの解決</span><span class="desc">SubTransSetParent / GetParent / GetTopmostTransaction と xact.c との連携。</span></a>
+        <a class="toc-card" href="ch05.html"><span class="num">第5章</span><span class="title">ライフサイクル管理</span><span class="desc">BootStrap / Startup / Extend / Checkpoint / Truncate と XID ラップアラウンド。</span></a>
+        <a class="toc-card" href="ch06.html"><span class="num">第6章</span><span class="title">スナップショット・可視性での利用と運用</span><span class="desc">subxidキャッシュの溢れ、可視性判定での参照、性能と運用上の注意。</span></a>
+      </div>
+    </main>
+  </div>
+  <footer class="site-footer">PostgreSQL 19beta1 のソースコードに基づく解説 ・ db-internals-docs スキルで生成</footer>
+</body>
+</html>

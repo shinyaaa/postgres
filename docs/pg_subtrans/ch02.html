@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>第2章 pg_subtrans の全体像と SLRU 基盤 | PostgreSQL pg_subtrans 詳解</title>
+  <link rel="stylesheet" href="css/style.css">
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+    mermaid.initialize({ startOnLoad: true, theme: 'neutral', flowchart: { htmlLabels: true } });
+  </script>
+</head>
+<body>
+  <header class="site-header">
+    <a href="index.html" class="site-title">PostgreSQL pg_subtrans 詳解</a>
+  </header>
+  <div class="layout">
+    <nav class="sidebar">
+      <ol>
+        <li>
+          <a class="chap-title" href="ch01.html">第1章 サブトランザクションと親子関係</a>
+          <ol class="sect">
+            <li><a href="ch01.html#sec-1-1">1.1 サブトランザクションとは</a></li>
+            <li><a href="ch01.html#sec-1-2">1.2 SAVEPOINT による入れ子の例</a></li>
+            <li><a href="ch01.html#sec-1-3">1.3 親子関係を記録する理由</a></li>
+          </ol>
+        </li>
+        <li class="current">
+          <a class="chap-title" href="ch02.html">第2章 pg_subtrans の全体像と SLRU 基盤</a>
+          <ol class="sect">
+            <li><a href="ch02.html#sec-2-1">2.1 SLRU マネージャの役割</a></li>
+            <li><a href="ch02.html#sec-2-2">2.2 ディスク上の pg_subtrans ディレクトリ</a></li>
+            <li><a href="ch02.html#sec-2-3">2.3 クラッシュをまたがない設計</a></li>
+          </ol>
+        </li>
+        <li>
+          <a class="chap-title" href="ch03.html">第3章 データ構造とページレイアウト</a>
+          <ol class="sect">
+            <li><a href="ch03.html#sec-3-1">3.1 エントリとページ</a></li>
+            <li><a href="ch03.html#sec-3-2">3.2 XID からページ・エントリへの写像</a></li>
+            <li><a href="ch03.html#sec-3-3">3.3 バンクとロック、バッファ数</a></li>
+          </ol>
+        </li>
+        <li>
+          <a class="chap-title" href="ch04.html">第4章 親の記録と最上位XIDの解決</a>
+          <ol class="sect">
+            <li><a href="ch04.html#sec-4-1">4.1 SubTransSetParent — 親の記録</a></li>
+            <li><a href="ch04.html#sec-4-2">4.2 SubTransGetParent — 親の参照</a></li>
+            <li><a href="ch04.html#sec-4-3">4.3 SubTransGetTopmostTransaction — 最上位の解決</a></li>
+            <li><a href="ch04.html#sec-4-4">4.4 xact.c との連携</a></li>
+          </ol>
+        </li>
+        <li>
+          <a class="chap-title" href="ch05.html">第5章 ライフサイクル管理</a>
+          <ol class="sect">
+            <li><a href="ch05.html#sec-5-1">5.1 初期化と起動（BootStrap / Startup）</a></li>
+            <li><a href="ch05.html#sec-5-2">5.2 ページ拡張（Extend）</a></li>
+            <li><a href="ch05.html#sec-5-3">5.3 チェックポイントと切り詰め（Checkpoint / Truncate）</a></li>
+            <li><a href="ch05.html#sec-5-4">5.4 XID ラップアラウンドの扱い</a></li>
+          </ol>
+        </li>
+        <li>
+          <a class="chap-title" href="ch06.html">第6章 スナップショット・可視性での利用と運用</a>
+          <ol class="sect">
+            <li><a href="ch06.html#sec-6-1">6.1 subxid キャッシュの溢れ（オーバーフロー）</a></li>
+            <li><a href="ch06.html#sec-6-2">6.2 可視性判定での参照</a></li>
+            <li><a href="ch06.html#sec-6-3">6.3 性能と運用上の注意</a></li>
+          </ol>
+        </li>
+      </ol>
+    </nav>
+    <main class="content">
+      <article>
+        <h1>第2章　pg_subtrans の全体像と SLRU 基盤</h1>
+        <p>本章では <code>pg_subtrans</code> がどのような基盤の上に構築され、ディスクとメモリにどう配置されるかを
+概観する。<code>pg_subtrans</code> は <strong>SLRU（Simple LRU）</strong>と呼ばれる汎用機構の上に載る、薄い
+マネージャである。</p>
+
+<h2 id="sec-2-1">2.1　SLRU マネージャの役割</h2>
+<p>SLRU は、固定長スロットからなる共有メモリ上のページバッファと、ディスク上のセグメントファイルを管理する
+汎用機構で、<code>src/backend/access/transam/slru.c</code> に実装される。<code>pg_xact</code>（コミット状態）、
+<code>pg_multixact</code>、<code>pg_commit_ts</code> なども同じ SLRU を土台にしている。</p>
+<p>図 2.1 に示すように、<code>subtrans.c</code> は SLRU の API を呼び出すだけの薄い層であり、ページの読み書き・
+キャッシュ・ディスク入出力はすべて SLRU 側が担う。<code>subtrans.c</code> は xact.c をベースにして書かれているが、
+コメントが述べるとおり堅牢性の要件はまったく異なる。</p>
+
+<figure>
+  <pre class="mermaid">
+flowchart TB
+    Caller["xact.c / procarray.c / snapmgr.c など"]
+    Sub["subtrans.c<br/>(SubTransSetParent / GetParent / GetTopmost)"]
+    Slru["slru.c (SLRU マネージャ)"]
+    Buf["共有メモリ: ページバッファ群<br/>(subtransaction_buffers 個のスロット)"]
+    Disk["ディスク: PGDATA/pg_subtrans/ セグメント"]
+    Caller --> Sub --> Slru
+    Slru --> Buf
+    Slru --> Disk
+  </pre>
+  <figcaption>図 2.1: pg_subtrans は SLRU の上に載る薄いマネージャである</figcaption>
+</figure>
+
+<p>SLRU への登録は <code>SUBTRANSShmemRequest()</code> 内の <code>SimpleLruRequest()</code> で行われる。主な
+パラメータは次のとおりである。</p>
+<ul>
+  <li><code>.name = "subtransaction"</code> … 統計ビュー <code>pg_stat_slru</code> 等で使われる名前。</li>
+  <li><code>.Dir = "pg_subtrans"</code> … ディスク上のディレクトリ名。</li>
+  <li><code>.long_segment_names = false</code> … セグメントファイル名は短い形式（4桁16進）。</li>
+  <li><code>.sync_handler = SYNC_HANDLER_NONE</code> … チェックポイント時の fsync 管理対象外。</li>
+  <li><code>.PagePrecedes = SubTransPagePrecedes</code> … 切り詰め時のページ順序判定（<a href="ch05.html#sec-5-4">5.4節</a>）。</li>
+</ul>
+
+<h2 id="sec-2-2">2.2　ディスク上の pg_subtrans ディレクトリ</h2>
+<p>実体は <code>$PGDATA/pg_subtrans/</code> 以下のセグメントファイルである。1 エントリは 4 バイト、1 ページは
+<code>BLCKSZ</code>（既定 8 KB）なので 1 ページに 2,048 エントリ、1 セグメントは
+<code>SLRU_PAGES_PER_SEGMENT</code>（= 32）ページ＝ 65,536 エントリを収める（数え方は<a href="ch03.html">第3章</a>）。
+ディレクトリの中身は次のように観察できる。</p>
+
+<div class="example">
+  <span class="example-label">SQL</span>
+  <pre><code>SELECT * FROM pg_ls_dir('pg_subtrans') ORDER BY 1;</code></pre>
+</div>
+<div class="example">
+  <span class="example-label">実行結果（例）</span>
+  <pre><code> pg_ls_dir
+-----------
+ 0000
+(1 row)</code></pre>
+</div>
+
+<p>稼働初期はセグメント <code>0000</code> だけだが、XID が進むにつれて新しいセグメントが追加され、不要になった
+古いセグメントはチェックポイント時に削除される（<a href="ch05.html#sec-5-3">5.3節</a>）。</p>
+
+<h2 id="sec-2-3">2.3　クラッシュをまたがない設計</h2>
+<p><code>pg_subtrans</code> の最大の特徴は、<strong>クラッシュ耐性を持たない</strong>ことである。
+<code>subtrans.c</code> のコメントが明記するとおり、XLOG（WAL）との連携は一切ない。サーバ起動時には、現在
+アクティブなページを単純にゼロで初期化する（<code>StartupSUBTRANS()</code>、<a href="ch05.html#sec-5-1">5.1節</a>）。</p>
+<p>これは「<code>pg_subtrans</code> が必要なのは現在実行中のトランザクションについてだけ」という性質
+（<a href="ch01.html#sec-1-3">1.3節</a>）から導かれる。クラッシュ後に再起動すれば、それ以前に実行中だった
+トランザクションはもう存在しないため、古い内容を保存する意味がない。チェックポイントでダーティページを書き出す
+<code>CheckPointSUBTRANS()</code> も、正当性のためではなく、書き込み負荷をバックエンドからチェックポイント
+プロセスへ移すための最適化にすぎない。</p>
+
+<div class="warn"><strong>注意</strong>この非永続性ゆえ、ベースバックアップやリカバリで <code>pg_subtrans</code> の
+内容が引き継がれることはない。ストリーミングレプリケーションのスタンバイでは、プライマリから受け取った
+「XID 割り当てレコード」を適用して <code>SubTransSetParent()</code> を呼び、必要な親子関係を再構築する
+（<a href="ch04.html#sec-4-4">4.4節</a>）。</div>
+      </article>
+      <nav class="pager">
+        <a class="prev" href="ch01.html"><span class="dir">← 前の章</span><span class="ttl">第1章 サブトランザクションと親子関係</span></a>
+        <a class="next" href="ch03.html"><span class="dir">次の章 →</span><span class="ttl">第3章 データ構造とページレイアウト</span></a>
+      </nav>
+    </main>
+  </div>
+  <footer class="site-footer">PostgreSQL 19beta1 のソースコードに基づく解説 ・ db-internals-docs スキルで生成</footer>
+</body>
+</html>
