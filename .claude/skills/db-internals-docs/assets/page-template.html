@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<!--
+  章ページ用テンプレート。{{...}} を実際の内容に置換して chNN.html として保存する。
+  - {{SITE_TITLE}}     : サイト名（全ページ共通）
+  - {{PAGE_TITLE}}     : この章のタイトル（<title> 用）
+  - {{SIDEBAR_TOC}}    : サイドバー TOC（全ページ共通の <ol>...</ol>。現在章/節に class="current" を付与）
+  - {{CHAPTER_NUMBER}} : 例 "第1章"
+  - {{CHAPTER_TITLE}}  : 例 "データベースクラスタ"
+  - {{CHAPTER_BODY}}   : 本文 HTML（<h2>, <p>, <figure>, .example など）
+  - {{PAGER}}          : 前後ナビ（<a class="prev">…</a><a class="next">…</a>）
+  - {{FOOTER}}         : フッター文言
+-->
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{PAGE_TITLE}} | {{SITE_TITLE}}</title>
+  <link rel="stylesheet" href="css/style.css">
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+    mermaid.initialize({ startOnLoad: true, theme: 'neutral', flowchart: { htmlLabels: true } });
+  </script>
+</head>
+<body>
+  <header class="site-header">
+    <a href="index.html" class="site-title">{{SITE_TITLE}}</a>
+  </header>
+  <div class="layout">
+    <nav class="sidebar">
+      {{SIDEBAR_TOC}}
+    </nav>
+    <main class="content">
+      <article>
+        <h1>{{CHAPTER_NUMBER}}　{{CHAPTER_TITLE}}</h1>
+        {{CHAPTER_BODY}}
+      </article>
+      <nav class="pager">
+        {{PAGER}}
+      </nav>
+    </main>
+  </div>
+  <footer class="site-footer">{{FOOTER}}</footer>
+</body>
+</html>

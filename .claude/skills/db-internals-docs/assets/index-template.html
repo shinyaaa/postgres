@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<!--
+  トップページ（目次）用テンプレート。
+  - {{SITE_TITLE}} : サイト名
+  - {{LEAD}}       : リード文（このドキュメントの概要・対象読者・前提バージョン等）
+  - {{SIDEBAR_TOC}}: サイドバー TOC（章ページと共通）
+  - {{TOC_CARDS}}  : 章カード一覧。各章 <a class="toc-card" href="chNN.html"> … </a>
+  - {{FOOTER}}     : フッター文言
+-->
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{SITE_TITLE}}</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="index.html" class="site-title">{{SITE_TITLE}}</a>
+  </header>
+  <div class="layout">
+    <nav class="sidebar">
+      {{SIDEBAR_TOC}}
+    </nav>
+    <main class="content">
+      <div class="toc-hero">
+        <h1>{{SITE_TITLE}}</h1>
+        <p class="lead">{{LEAD}}</p>
+      </div>
+      <div class="toc-grid">
+        {{TOC_CARDS}}
+      </div>
+    </main>
+  </div>
+  <footer class="site-footer">{{FOOTER}}</footer>
+</body>
+</html>
