@@ -27,6 +27,7 @@ CREATE POLICY <replaceable class="parameter">name</replaceable> ON <replaceable 
     [ TO { <replaceable class="parameter">role_name</replaceable> | PUBLIC | CURRENT_ROLE | CURRENT_USER | SESSION_USER } [, ...] ]
     [ USING ( <replaceable class="parameter">using_expression</replaceable> ) ]
     [ WITH CHECK ( <replaceable class="parameter">check_expression</replaceable> ) ]
+    [ WITH MASK ( <replaceable class="parameter">column_name</replaceable> = <replaceable class="parameter">mask_expression</replaceable> [, ...] ) ]
 </synopsis>
  </refsynopsisdiv>
 
@@ -218,6 +219,50 @@ CREATE POLICY <replaceable class="parameter">name</replaceable> ON <replaceable 
       the <replaceable class="parameter">check_expression</replaceable> is
       evaluated against the proposed new contents of the row, not the
       original contents.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term><replaceable class="parameter">mask_expression</replaceable></term>
+    <listitem>
+     <para>
+      A <literal>WITH MASK</literal> clause pairs one or more columns of
+      the table with expressions that will be substituted for the stored
+      values whenever the policy applies.  The mask is applied by
+      rewriting references to the column throughout the query, so
+      <literal>WHERE</literal> predicates, joins, aggregates and the
+      output list all see the masked value; it is not merely a display
+      transformation.
+     </para>
+     <para>
+      Each <replaceable class="parameter">mask_expression</replaceable>
+      must be assignment-compatible with the type of the referenced
+      column and must not contain volatile or aggregate functions.  It
+      may reference the masked column itself; the substitution is
+      single-pass so the reference is not re-masked.  If the mask
+      expression contains functions that are not marked
+      <literal>LEAKPROOF</literal>, a warning is emitted at
+      <command>CREATE POLICY</command> time because those functions can
+      indirectly reveal the underlying value through error messages.
+     </para>
+     <para>
+      <literal>WITH MASK</literal> is only valid for policies whose
+      command is <literal>SELECT</literal> or <literal>ALL</literal>.
+      For a modifying statement the mask is applied only to the
+      <literal>RETURNING</literal> list; the <literal>WHERE</literal>,
+      <literal>SET</literal>, and <literal>ON CONFLICT</literal> clauses
+      continue to see the raw stored values so that the intended row is
+      identified and updated correctly.  At most one applicable policy
+      may declare a mask for any given column; a conflict is reported
+      at <command>CREATE POLICY</command> time rather than at query
+      execution time.
+     </para>
+     <para>
+      Users with the <literal>BYPASSRLS</literal> attribute, and the
+      owner of the table (unless <literal>FORCE ROW LEVEL
+      SECURITY</literal> is enabled), see the underlying values with no
+      mask applied, as with any other policy.
      </para>
     </listitem>
    </varlistentry>

@@ -4239,6 +4239,7 @@ getPolicies(Archive *fout, TableInfo tblinfo[], int numTables)
 	int			i_polroles;
 	int			i_polqual;
 	int			i_polwithcheck;
+	int			i_polmask;
 	int			i,
 				j,
 				ntups;
@@ -4302,6 +4303,7 @@ getPolicies(Archive *fout, TableInfo tblinfo[], int numTables)
 			polinfo->polroles = NULL;
 			polinfo->polqual = NULL;
 			polinfo->polwithcheck = NULL;
+			polinfo->polmask = NULL;
 		}
 	}
 	appendPQExpBufferChar(tbloids, '}');
@@ -4324,7 +4326,13 @@ getPolicies(Archive *fout, TableInfo tblinfo[], int numTables)
 					  "CASE WHEN pol.polroles = '{0}' THEN NULL ELSE "
 					  "   pg_catalog.array_to_string(ARRAY(SELECT pg_catalog.quote_ident(rolname) from pg_catalog.pg_roles WHERE oid = ANY(pol.polroles)), ', ') END AS polroles, "
 					  "pg_catalog.pg_get_expr(pol.polqual, pol.polrelid) AS polqual, "
-					  "pg_catalog.pg_get_expr(pol.polwithcheck, pol.polrelid) AS polwithcheck "
+					  "pg_catalog.pg_get_expr(pol.polwithcheck, pol.polrelid) AS polwithcheck, ");
+	if (fout->remoteVersion >= 190000)
+		appendPQExpBufferStr(query,
+							 "pg_catalog.pg_get_policy_mask(pol.oid) AS polmask ");
+	else
+		appendPQExpBufferStr(query, "NULL AS polmask ");
+	appendPQExpBuffer(query,
 					  "FROM unnest('%s'::pg_catalog.oid[]) AS src(tbloid)\n"
 					  "JOIN pg_catalog.pg_policy pol ON (src.tbloid = pol.polrelid)",
 					  tbloids->data);
@@ -4343,6 +4351,7 @@ getPolicies(Archive *fout, TableInfo tblinfo[], int numTables)
 		i_polroles = PQfnumber(res, "polroles");
 		i_polqual = PQfnumber(res, "polqual");
 		i_polwithcheck = PQfnumber(res, "polwithcheck");
+		i_polmask = PQfnumber(res, "polmask");
 
 		polinfo = pg_malloc_array(PolicyInfo, ntups);
 
@@ -4381,6 +4390,11 @@ getPolicies(Archive *fout, TableInfo tblinfo[], int numTables)
 			else
 				polinfo[j].polwithcheck
 					= pg_strdup(PQgetvalue(res, j, i_polwithcheck));
+
+			if (PQgetisnull(res, j, i_polmask))
+				polinfo[j].polmask = NULL;
+			else
+				polinfo[j].polmask = pg_strdup(PQgetvalue(res, j, i_polmask));
 		}
 	}
 
@@ -4475,6 +4489,9 @@ dumpPolicy(Archive *fout, const PolicyInfo *polinfo)
 
 	if (polinfo->polwithcheck != NULL)
 		appendPQExpBuffer(query, " WITH CHECK (%s)", polinfo->polwithcheck);
+
+	if (polinfo->polmask != NULL)
+		appendPQExpBuffer(query, " WITH MASK (%s)", polinfo->polmask);
 
 	appendPQExpBufferStr(query, ";\n");
 

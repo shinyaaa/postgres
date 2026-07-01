@@ -74,6 +74,11 @@ static void add_with_check_options(Relation rel,
 
 static bool check_role_for_policy(ArrayType *policy_roles, Oid user_id);
 
+static void apply_column_masks(Query *root, int rt_index,
+							   List *permissive_policies,
+							   List *restrictive_policies,
+							   bool *hasSubLinks);
+
 /*
  * hooks to allow extensions to add their own security policies
  *
@@ -228,6 +233,18 @@ get_row_security_policies(Query *root, RangeTblEntry *rte, int rt_index,
 						   hasSubLinks);
 
 	/*
+	 * Apply column masks from any applicable SELECT/ALL policies.  For a
+	 * plain SELECT this uses the same policies we just gathered.  For
+	 * UPDATE/DELETE we rely on the follow-up block that collects
+	 * SELECT policies (see below) to reach apply_column_masks via
+	 * root-scope walking, so we only mask when acting as a source relation.
+	 */
+	if (commandType == CMD_SELECT)
+		apply_column_masks(root, rt_index,
+						   permissive_policies, restrictive_policies,
+						   hasSubLinks);
+
+	/*
 	 * Similar to above, during an UPDATE, DELETE, or MERGE, if SELECT rights
 	 * are also required (eg: when a RETURNING clause exists, or the user has
 	 * provided a WHERE clause which involves columns from the relation), we
@@ -252,6 +269,17 @@ get_row_security_policies(Query *root, RangeTblEntry *rte, int rt_index,
 						   select_permissive_policies,
 						   select_restrictive_policies,
 						   securityQuals,
+						   hasSubLinks);
+
+		/*
+		 * Apply column masking from the SELECT/ALL policies as well.  This
+		 * mutates the Query in place; when rt_index is the result relation,
+		 * apply_column_masks restricts the mutation to returningList to
+		 * avoid rewriting WHERE / SET / USING expressions.
+		 */
+		apply_column_masks(root, rt_index,
+						   select_permissive_policies,
+						   select_restrictive_policies,
 						   hasSubLinks);
 	}
 
@@ -944,4 +972,206 @@ check_role_for_policy(ArrayType *policy_roles, Oid user_id)
 	}
 
 	return false;
+}
+
+/*
+ * Column masking support.
+ *
+ * The mask context stores the target rt_index (matched via
+ * replace_rte_variables's target_varno mechanism) and a fully-materialised
+ * (AttrNumber -> Expr *) list.  It is walked once per call to
+ * apply_column_masks; the callback returns a deep copy of the mask
+ * expression when a Var references a masked column and returns the Var
+ * unchanged otherwise.  Because replace_rte_variables_mutator does not
+ * recurse into the callback's return value, a mask expression that itself
+ * references the masked column (e.g. right(ssn, 4)) does not re-enter the
+ * mask; recursion is prevented structurally.
+ */
+typedef struct MaskVarContext
+{
+	List	   *masks;			/* list of PolicyColumnMaskItem */
+} MaskVarContext;
+
+static Node *
+mask_var_callback(const Var *var, replace_rte_variables_context *context)
+{
+	MaskVarContext *mcxt = (MaskVarContext *) context->callback_arg;
+	ListCell   *lc;
+
+	/*
+	 * OLD/NEW returning references are handled by the caller (see
+	 * apply_column_masks): NEW pointers to a masked column are left alone
+	 * because they refer to the row being written, not the current stored
+	 * value.  For the general path we only mask OLD/DEFAULT references.
+	 */
+	if (var->varreturningtype == VAR_RETURNING_NEW)
+		return (Node *) copyObject(var);
+
+	foreach(lc, mcxt->masks)
+	{
+		PolicyColumnMaskItem *m = lfirst_node(PolicyColumnMaskItem, lc);
+		Node	   *newnode;
+
+		if (m->attnum != var->varattno)
+			continue;
+
+		newnode = (Node *) copyObject(m->expr);
+
+		/*
+		 * The mask expression as stored has varlevelsup = 0 for references
+		 * to the target relation.  If we are substituting inside a
+		 * subquery, we need to lift those references to the appropriate
+		 * outer nesting depth so that they still resolve to the same RTE.
+		 */
+		if (context->sublevels_up > 0)
+			IncrementVarSublevelsUp(newnode, context->sublevels_up, 0);
+
+		return newnode;
+	}
+
+	/* Not a masked column: keep the Var as-is. */
+	return (Node *) copyObject(var);
+}
+
+/*
+ * Merge column masks from all applicable policies into a single list.
+ *
+ * The DDL-time conflict check in commands/policy.c guarantees that no two
+ * applicable policies mask the same column, but we perform a defensive
+ * scan anyway and raise an error if we somehow encounter a conflict here
+ * (e.g. after concurrent policy changes that pre-check missed).
+ */
+static List *
+collect_mask_quals(List *permissive_policies, List *restrictive_policies)
+{
+	List	   *result = NIL;
+	Bitmapset  *seen = NULL;
+	ListCell   *lc;
+	List	   *all_policies;
+
+	all_policies = list_concat_copy(permissive_policies, restrictive_policies);
+
+	foreach(lc, all_policies)
+	{
+		RowSecurityPolicy *policy = (RowSecurityPolicy *) lfirst(lc);
+		ListCell   *lc2;
+
+		if (policy->mask_quals == NIL)
+			continue;
+
+		foreach(lc2, policy->mask_quals)
+		{
+			PolicyColumnMaskItem *m = lfirst_node(PolicyColumnMaskItem, lc2);
+
+			if (bms_is_member(m->attnum, seen))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+						 errmsg("column with attnum %d is masked by more than one applicable policy",
+								m->attnum),
+						 errhint("Reconcile the WITH MASK clauses of the affected policies.")));
+
+			seen = bms_add_member(seen, m->attnum);
+			result = lappend(result, m);
+		}
+	}
+
+	list_free(all_policies);
+	bms_free(seen);
+	return result;
+}
+
+/*
+ * apply_column_masks
+ *		Substitute masked column references throughout the query.
+ *
+ * We use replace_rte_variables so that Vars inside subqueries and sublinks
+ * are handled with correct varlevelsup tracking.  When the target RTE is
+ * also the result relation of a modifying command, we only mask the
+ * RETURNING list; masking the WHERE clause or SET expressions of an
+ * UPDATE would silently corrupt the semantics of the modification and
+ * could disclose the underlying value indirectly.
+ */
+/*
+ * Substitute Vars belonging to (rt_index, sublevels_up=0) in-place inside
+ * the parts of a Query that should carry mask output.  We modify each
+ * top-level Query sub-list individually and assign the mutated tree back
+ * so that the caller's Query pointer stays valid.
+ */
+static void
+mask_query_expr_lists(Query *root, int rt_index,
+					  MaskVarContext *mcxt, bool for_returning_only,
+					  bool *inserted_sublink)
+{
+	root->returningList = (List *)
+		replace_rte_variables((Node *) root->returningList, rt_index, 0,
+							  mask_var_callback, mcxt, inserted_sublink);
+
+	if (for_returning_only)
+		return;
+
+	root->targetList = (List *)
+		replace_rte_variables((Node *) root->targetList, rt_index, 0,
+							  mask_var_callback, mcxt, inserted_sublink);
+	root->jointree = (FromExpr *)
+		replace_rte_variables((Node *) root->jointree, rt_index, 0,
+							  mask_var_callback, mcxt, inserted_sublink);
+	root->havingQual = (Node *)
+		replace_rte_variables(root->havingQual, rt_index, 0,
+							  mask_var_callback, mcxt, inserted_sublink);
+	root->setOperations = (Node *)
+		replace_rte_variables(root->setOperations, rt_index, 0,
+							  mask_var_callback, mcxt, inserted_sublink);
+	root->limitOffset = (Node *)
+		replace_rte_variables(root->limitOffset, rt_index, 0,
+							  mask_var_callback, mcxt, inserted_sublink);
+	root->limitCount = (Node *)
+		replace_rte_variables(root->limitCount, rt_index, 0,
+							  mask_var_callback, mcxt, inserted_sublink);
+}
+
+static void
+apply_column_masks(Query *root, int rt_index,
+				   List *permissive_policies,
+				   List *restrictive_policies,
+				   bool *hasSubLinks)
+{
+	List	   *masks;
+	MaskVarContext mcxt;
+	bool		inserted_sublink = false;
+
+	masks = collect_mask_quals(permissive_policies, restrictive_policies);
+	if (masks == NIL)
+		return;
+
+	/* Nothing to do for a delete-only path (no output columns are read). */
+
+	mcxt.masks = masks;
+
+	if (root->resultRelation == rt_index)
+	{
+		/*
+		 * Result relation of a modifying statement: only rewrite the
+		 * RETURNING list.  jointree quals, targetList SET expressions, ON
+		 * CONFLICT expressions and MERGE actions all keep the real values
+		 * so that the DML semantics remain intact.
+		 */
+		mask_query_expr_lists(root, rt_index, &mcxt, true, &inserted_sublink);
+	}
+	else
+	{
+		/*
+		 * Source relation: mask each Query sub-list.  We update each field
+		 * separately (rather than mutating the whole Query in one shot)
+		 * because replace_rte_variables copies the outer Query when starting
+		 * from a Query node; here we want to keep root's pointer valid.
+		 */
+		mask_query_expr_lists(root, rt_index, &mcxt, false, &inserted_sublink);
+	}
+
+	if (inserted_sublink)
+	{
+		root->hasSubLinks = true;
+		if (hasSubLinks)
+			*hasSubLinks = true;
+	}
 }

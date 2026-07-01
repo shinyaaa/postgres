@@ -42,6 +42,8 @@ CATALOG(pg_policy,3256,PolicyRelationId)
 	Oid			polroles[1] BKI_LOOKUP_OPT(pg_authid) BKI_FORCE_NOT_NULL;
 	pg_node_tree polqual;		/* Policy quals. */
 	pg_node_tree polwithcheck;	/* WITH CHECK quals. */
+	pg_node_tree polmask;		/* Column mask list (List of
+								 * PolicyColumnMaskItem), or NULL. */
 #endif
 } FormData_pg_policy;
 

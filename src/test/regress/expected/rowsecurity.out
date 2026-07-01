@@ -5195,6 +5195,146 @@ reset rls_test.blah;
 drop function rls_f(text);
 drop table rls_t, test_t;
 --
+--
+-- WITH MASK: column-level masking
+--
+RESET SESSION AUTHORIZATION;
+SET client_min_messages TO 'warning';
+DROP SCHEMA IF EXISTS regress_rls_mask CASCADE;
+RESET client_min_messages;
+CREATE SCHEMA regress_rls_mask;
+GRANT ALL ON SCHEMA regress_rls_mask TO public;
+SET search_path = regress_rls_mask;
+SET SESSION AUTHORIZATION regress_rls_alice;
+CREATE TABLE rls_mask (id int PRIMARY KEY, name text, salary numeric, ssn text);
+INSERT INTO rls_mask VALUES (1, 'Alice', 100000, '123-45-6789'),
+                            (2, 'Bob',    80000, '987-65-4321');
+GRANT SELECT, UPDATE ON rls_mask TO regress_rls_bob;
+GRANT SELECT ON rls_mask TO regress_rls_exempt_user;
+ALTER TABLE rls_mask ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p_alice ON rls_mask FOR ALL TO regress_rls_alice USING (true);
+CREATE POLICY p_bob_mask ON rls_mask FOR SELECT TO regress_rls_bob
+    USING (true)
+    WITH MASK (ssn = '***-**-' || right(ssn, 4), salary = NULL::numeric);
+WARNING:  mask expression for column "ssn" is not leakproof
+DETAIL:  Non-leakproof functions may reveal information about the masked value through error messages.
+CREATE POLICY p_bob_upd ON rls_mask FOR UPDATE TO regress_rls_bob
+    USING (true);
+-- Alice: unmasked (owner + own permissive policy)
+SELECT * FROM rls_mask ORDER BY id;
+ id | name  | salary |     ssn     
+----+-------+--------+-------------
+  1 | Alice | 100000 | 123-45-6789
+  2 | Bob   |  80000 | 987-65-4321
+(2 rows)
+
+-- Bob: masked columns replaced uniformly through the query
+SET SESSION AUTHORIZATION regress_rls_bob;
+SELECT * FROM rls_mask ORDER BY id;
+ id | name  | salary |     ssn     
+----+-------+--------+-------------
+  1 | Alice |        | ***-**-6789
+  2 | Bob   |        | ***-**-4321
+(2 rows)
+
+SELECT id, ssn FROM rls_mask WHERE ssn LIKE '***-**-%' ORDER BY id;
+ id |     ssn     
+----+-------------
+  1 | ***-**-6789
+  2 | ***-**-4321
+(2 rows)
+
+SELECT sum(salary) IS NULL AS salary_all_masked FROM rls_mask;
+ salary_all_masked 
+-------------------
+ t
+(1 row)
+
+-- WHERE on result relation uses the raw value; RETURNING shows the mask
+UPDATE rls_mask SET name = 'B' WHERE ssn = '987-65-4321' RETURNING id, ssn;
+ id |     ssn     
+----+-------------
+  2 | ***-**-4321
+(1 row)
+
+UPDATE rls_mask SET name = 'Bob' WHERE id = 2;  -- restore
+-- Bypass role sees raw
+RESET SESSION AUTHORIZATION;
+SET SESSION AUTHORIZATION regress_rls_exempt_user;
+SELECT * FROM rls_mask ORDER BY id;
+ id | name  | salary |     ssn     
+----+-------+--------+-------------
+  1 | Alice | 100000 | 123-45-6789
+  2 | Bob   |  80000 | 987-65-4321
+(2 rows)
+
+-- Conflict detection: another policy trying to mask the same column
+SET SESSION AUTHORIZATION regress_rls_alice;
+CREATE POLICY p_bob_mask2 ON rls_mask FOR SELECT TO regress_rls_bob
+    USING (true) WITH MASK (ssn = 'xxx');    -- ERROR: conflict with p_bob_mask
+ERROR:  column "ssn" of relation "rls_mask" is already masked by policy "p_bob_mask"
+HINT:  Each column may be masked by at most one applicable policy.
+-- Semantic validation
+CREATE POLICY p_bad_ins ON rls_mask FOR INSERT TO regress_rls_bob
+    WITH CHECK (true) WITH MASK (ssn = 'x');  -- ERROR: mask needs SELECT/ALL
+ERROR:  WITH MASK can only be used with FOR SELECT or FOR ALL policies
+CREATE POLICY p_bad_dup ON rls_mask FOR SELECT TO regress_rls_bob
+    USING (true) WITH MASK (ssn = 'a', ssn = 'b');  -- ERROR: dup column
+ERROR:  column "ssn" specified more than once in WITH MASK
+CREATE POLICY p_bad_col ON rls_mask FOR SELECT TO regress_rls_bob
+    USING (true) WITH MASK (nope = 'x');      -- ERROR: unknown column
+ERROR:  column "nope" of relation "rls_mask" does not exist
+-- Non-leakproof warning (still creates the policy)
+CREATE POLICY p_warn ON rls_mask AS RESTRICTIVE FOR SELECT TO regress_rls_carol
+    USING (true) WITH MASK (name = upper(name));
+WARNING:  mask expression for column "name" is not leakproof
+DETAIL:  Non-leakproof functions may reveal information about the masked value through error messages.
+DROP POLICY p_warn ON rls_mask;
+-- pg_get_policy_mask deparse round-trip
+SELECT polname, pg_get_policy_mask(oid)
+FROM pg_policy
+WHERE polname LIKE 'p_bob_%' ORDER BY polname;
+  polname   |                         pg_get_policy_mask                         
+------------+--------------------------------------------------------------------
+ p_bob_mask | ssn = ('***-**-'::text || "right"(ssn, 4)), salary = NULL::numeric
+ p_bob_upd  | 
+(2 rows)
+
+-- ALTER POLICY replaces mask; RESET MASK clears it
+ALTER POLICY p_bob_mask ON rls_mask WITH MASK (ssn = 'HIDDEN', salary = 0);
+SET SESSION AUTHORIZATION regress_rls_bob;
+SELECT * FROM rls_mask ORDER BY id;
+ id | name  | salary |  ssn   
+----+-------+--------+--------
+  1 | Alice |      0 | HIDDEN
+  2 | Bob   |      0 | HIDDEN
+(2 rows)
+
+SET SESSION AUTHORIZATION regress_rls_alice;
+ALTER POLICY p_bob_mask ON rls_mask RESET MASK;
+SET SESSION AUTHORIZATION regress_rls_bob;
+SELECT * FROM rls_mask ORDER BY id;
+ id | name  | salary |     ssn     
+----+-------+--------+-------------
+  1 | Alice | 100000 | 123-45-6789
+  2 | Bob   |  80000 | 987-65-4321
+(2 rows)
+
+-- DROP COLUMN CASCADEs to the policy when the mask references it
+SET SESSION AUTHORIZATION regress_rls_alice;
+ALTER POLICY p_bob_mask ON rls_mask WITH MASK (salary = 0);
+ALTER TABLE rls_mask DROP COLUMN salary CASCADE;
+NOTICE:  drop cascades to policy p_bob_mask on table rls_mask
+SELECT polname FROM pg_policy WHERE polname = 'p_bob_mask';
+ polname 
+---------
+(0 rows)
+
+RESET SESSION AUTHORIZATION;
+DROP SCHEMA regress_rls_mask CASCADE;
+NOTICE:  drop cascades to table rls_mask
+RESET search_path;
+--
 -- Clean up objects
 --
 RESET SESSION AUTHORIZATION;

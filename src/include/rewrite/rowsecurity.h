@@ -25,7 +25,9 @@ typedef struct RowSecurityPolicy
 	bool		permissive;		/* restrictive or permissive policy */
 	Expr	   *qual;			/* Expression to filter rows */
 	Expr	   *with_check_qual;	/* Expression to limit rows allowed */
-	bool		hassublinks;	/* If either expression has sublinks */
+	List	   *mask_quals;		/* List of PolicyColumnMaskItem substituted
+								 * for user-visible column values, or NIL */
+	bool		hassublinks;	/* If either qual expression has sublinks */
 } RowSecurityPolicy;
 
 typedef struct RowSecurityDesc

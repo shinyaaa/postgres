@@ -27,6 +27,7 @@ ALTER POLICY <replaceable class="parameter">name</replaceable> ON <replaceable c
     [ TO { <replaceable class="parameter">role_name</replaceable> | PUBLIC | CURRENT_ROLE | CURRENT_USER | SESSION_USER } [, ...] ]
     [ USING ( <replaceable class="parameter">using_expression</replaceable> ) ]
     [ WITH CHECK ( <replaceable class="parameter">check_expression</replaceable> ) ]
+    [ WITH MASK ( <replaceable class="parameter">column_name</replaceable> = <replaceable class="parameter">mask_expression</replaceable> [, ...] ) | RESET MASK ]
 </synopsis>
  </refsynopsisdiv>
 
@@ -50,10 +51,13 @@ ALTER POLICY <replaceable class="parameter">name</replaceable> ON <replaceable c
 
   <para>
    In the second form of <command>ALTER POLICY</command>, the role list,
-   <replaceable class="parameter">using_expression</replaceable>, and
-   <replaceable class="parameter">check_expression</replaceable> are replaced
-   independently if specified.  When one of those clauses is omitted, the
-   corresponding part of the policy is unchanged.
+   <replaceable class="parameter">using_expression</replaceable>,
+   <replaceable class="parameter">check_expression</replaceable>, and column
+   mask list are replaced independently if specified.  When one of those
+   clauses is omitted, the corresponding part of the policy is unchanged.
+   Use <literal>WITH MASK (...)</literal> to install or replace the column
+   mask, or <literal>RESET MASK</literal> to remove any existing mask
+   without touching the other clauses.
   </para>
  </refsect1>
 

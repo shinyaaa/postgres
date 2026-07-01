@@ -2843,7 +2843,13 @@ describeOneTableDetails(const char *schemaname,
 							  "    WHEN 'a' THEN 'INSERT'\n"
 							  "    WHEN 'w' THEN 'UPDATE'\n"
 							  "    WHEN 'd' THEN 'DELETE'\n"
-							  "    END AS cmd\n"
+							  "    END AS cmd,\n");
+			if (pset.sversion >= 190000)
+				appendPQExpBufferStr(&buf,
+									 "  pg_catalog.pg_get_policy_mask(pol.oid)\n");
+			else
+				appendPQExpBufferStr(&buf, "  NULL::text\n");
+			appendPQExpBuffer(&buf,
 							  "FROM pg_catalog.pg_policy pol\n"
 							  "WHERE pol.polrelid = '%s' ORDER BY 1;",
 							  oid);
@@ -2900,6 +2906,10 @@ describeOneTableDetails(const char *schemaname,
 				if (!PQgetisnull(result, i, 4))
 					appendPQExpBuffer(&buf, "\n      WITH CHECK (%s)",
 									  PQgetvalue(result, i, 4));
+
+				if (!PQgetisnull(result, i, 6))
+					appendPQExpBuffer(&buf, "\n      WITH MASK (%s)",
+									  PQgetvalue(result, i, 6));
 
 				printTableAddFooter(&cont, buf.data);
 			}

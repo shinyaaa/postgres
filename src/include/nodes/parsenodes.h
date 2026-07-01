@@ -3164,6 +3164,26 @@ typedef struct ImportForeignSchemaStmt
 } ImportForeignSchemaStmt;
 
 /*----------------------
+ *		Column mask specification for RLS policies.
+ *
+ * A CREATE POLICY / ALTER POLICY statement may include a WITH MASK clause
+ * naming one or more columns and the expression that should replace their
+ * value when the policy applies.  Each entry is stored as a
+ * PolicyColumnMaskItem.  In the raw parse tree colname is set and attnum
+ * is 0; after parse analysis attnum holds the resolved AttrNumber and
+ * colname is kept only for error reporting / decompilation.
+ *----------------------
+ */
+typedef struct PolicyColumnMaskItem
+{
+	NodeTag		type;
+	char	   *colname;		/* column name (raw) */
+	AttrNumber	attnum;			/* resolved attnum, 0 in raw tree */
+	Node	   *expr;			/* masking expression */
+	ParseLoc	location;		/* token location, or -1 if unknown */
+} PolicyColumnMaskItem;
+
+/*----------------------
  *		Create POLICY Statement
  *----------------------
  */
@@ -3177,6 +3197,7 @@ typedef struct CreatePolicyStmt
 	List	   *roles;			/* the roles associated with the policy */
 	Node	   *qual;			/* the policy's condition */
 	Node	   *with_check;		/* the policy's WITH CHECK condition. */
+	List	   *with_mask;		/* list of PolicyColumnMaskItem */
 } CreatePolicyStmt;
 
 /*----------------------
@@ -3191,6 +3212,8 @@ typedef struct AlterPolicyStmt
 	List	   *roles;			/* the roles associated with the policy */
 	Node	   *qual;			/* the policy's condition */
 	Node	   *with_check;		/* the policy's WITH CHECK condition. */
+	List	   *with_mask;		/* list of PolicyColumnMaskItem, or NIL */
+	bool		reset_mask;		/* true if RESET MASK requested */
 } AlterPolicyStmt;
 
 /*----------------------

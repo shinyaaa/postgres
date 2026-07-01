@@ -661,6 +661,7 @@ typedef struct _policyInfo
 	char	   *polroles;
 	char	   *polqual;
 	char	   *polwithcheck;
+	char	   *polmask;
 } PolicyInfo;
 
 /*

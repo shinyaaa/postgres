@@ -33,6 +33,7 @@
 #include "catalog/pg_opclass.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_partitioned_table.h"
+#include "catalog/pg_policy.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_propgraph_element.h"
 #include "catalog/pg_propgraph_element_label.h"
@@ -3141,6 +3142,96 @@ pg_get_expr_worker(text *expr, Oid relid, int prettyFlags)
 		relation_close(rel, AccessShareLock);
 
 	return string_to_text(str);
+}
+
+
+/* ----------
+ * pg_get_policy_mask		- Deparse the WITH MASK clause of a policy
+ *
+ * Given a policy OID, look up pg_policy.polmask and format it back into the
+ * comma-separated "colname = expr" form used in CREATE POLICY.  Returns
+ * NULL if the policy has no mask defined.
+ * ----------
+ */
+Datum
+pg_get_policy_mask(PG_FUNCTION_ARGS)
+{
+	Oid			polid = PG_GETARG_OID(0);
+	Relation	polrel;
+	SysScanDesc sscan;
+	ScanKeyData skey;
+	HeapTuple	tup;
+	Datum		datum;
+	bool		isnull;
+	Oid			polrelid;
+	List	   *mask_list;
+	StringInfoData buf;
+	ListCell   *lc;
+	bool		first = true;
+	List	   *context;
+	Relation	target_rel;
+	char	   *nodestr;
+
+	polrel = table_open(PolicyRelationId, AccessShareLock);
+
+	ScanKeyInit(&skey,
+				Anum_pg_policy_oid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(polid));
+
+	sscan = systable_beginscan(polrel, PolicyOidIndexId, true, NULL, 1, &skey);
+	tup = systable_getnext(sscan);
+	if (!HeapTupleIsValid(tup))
+	{
+		systable_endscan(sscan);
+		table_close(polrel, AccessShareLock);
+		PG_RETURN_NULL();
+	}
+
+	datum = heap_getattr(tup, Anum_pg_policy_polmask,
+						 RelationGetDescr(polrel), &isnull);
+	if (isnull)
+	{
+		systable_endscan(sscan);
+		table_close(polrel, AccessShareLock);
+		PG_RETURN_NULL();
+	}
+
+	nodestr = TextDatumGetCString(datum);
+	mask_list = (List *) stringToNode(nodestr);
+	pfree(nodestr);
+
+	polrelid = ((Form_pg_policy) GETSTRUCT(tup))->polrelid;
+	systable_endscan(sscan);
+	table_close(polrel, AccessShareLock);
+
+	target_rel = try_relation_open(polrelid, AccessShareLock);
+	if (target_rel == NULL)
+		PG_RETURN_NULL();
+
+	context = deparse_context_for(RelationGetRelationName(target_rel), polrelid);
+
+	initStringInfo(&buf);
+
+	foreach(lc, mask_list)
+	{
+		PolicyColumnMaskItem *item = lfirst_node(PolicyColumnMaskItem, lc);
+		char	   *expr_str;
+
+		if (!first)
+			appendStringInfoString(&buf, ", ");
+		first = false;
+
+		appendStringInfoString(&buf, quote_identifier(item->colname));
+		appendStringInfoString(&buf, " = ");
+		expr_str = deparse_expression_pretty((Node *) item->expr, context,
+											 false, false, PRETTYFLAG_INDENT, 0);
+		appendStringInfoString(&buf, expr_str);
+	}
+
+	relation_close(target_rel, AccessShareLock);
+
+	PG_RETURN_TEXT_P(cstring_to_text_with_len(buf.data, buf.len));
 }
 
 

@@ -29,10 +29,14 @@
 #include "commands/policy.h"
 #include "miscadmin.h"
 #include "nodes/pg_list.h"
+#include "optimizer/optimizer.h"
 #include "parser/parse_clause.h"
+#include "parser/parse_coerce.h"
 #include "parser/parse_collate.h"
+#include "parser/parse_expr.h"
 #include "parser/parse_node.h"
 #include "parser/parse_relation.h"
+#include "parser/parse_target.h"
 #include "rewrite/rewriteManip.h"
 #include "rewrite/rowsecurity.h"
 #include "utils/acl.h"
@@ -49,6 +53,17 @@ static void RangeVarCallbackForPolicy(const RangeVar *rv,
 									  Oid relid, Oid oldrelid, void *arg);
 static char parse_policy_command(const char *cmd_name);
 static Datum *policy_role_list_to_array(List *roles, int *num_roles);
+static List *transform_policy_mask_list(ParseState *pstate,
+										Relation target_table,
+										List *raw_mask_list);
+static void check_mask_conflicts(Relation pg_policy_rel,
+								 Relation target_table,
+								 Oid excluded_policy_oid,
+								 char polcmd, ArrayType *role_ids,
+								 List *mask_quals);
+static void record_mask_dependencies(ObjectAddress *myself,
+									 Oid target_relid,
+									 List *rtable, List *mask_quals);
 
 /*
  * Callback to RangeVarGetRelidExtended().
@@ -183,6 +198,291 @@ policy_role_list_to_array(List *roles, int *num_roles)
 }
 
 /*
+ * transform_policy_mask_list
+ *		Parse-analyze the WITH MASK column list for a CREATE/ALTER POLICY.
+ *
+ * pstate must already have the target relation set up as its single RTE
+ * (see caller sites in CreatePolicy/AlterPolicy).  raw_mask_list is a list of
+ * PolicyColumnMaskItem nodes with colname set and expr in raw form.
+ *
+ * Returns a fully-resolved List of PolicyColumnMaskItem nodes suitable for
+ * serialization into pg_policy.polmask.
+ *
+ * Errors on: missing/duplicate columns, system columns, generated columns,
+ * type mismatches that cannot be coerced, and non-leakproof expressions.
+ */
+static List *
+transform_policy_mask_list(ParseState *pstate,
+						   Relation target_table,
+						   List *raw_mask_list)
+{
+	List	   *result = NIL;
+	Bitmapset  *seen = NULL;
+	ListCell   *lc;
+	Oid			relid = RelationGetRelid(target_table);
+
+	foreach(lc, raw_mask_list)
+	{
+		PolicyColumnMaskItem *raw = lfirst_node(PolicyColumnMaskItem, lc);
+		PolicyColumnMaskItem *resolved;
+		AttrNumber	attnum;
+		Oid			atttypid;
+		int32		atttypmod;
+		Oid			attcollation;
+		Node	   *expr;
+		Oid			exprtype;
+
+		attnum = get_attnum(relid, raw->colname);
+		if (attnum == InvalidAttrNumber)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_COLUMN),
+					 errmsg("column \"%s\" of relation \"%s\" does not exist",
+							raw->colname,
+							RelationGetRelationName(target_table)),
+					 parser_errposition(pstate, raw->location)));
+
+		if (attnum <= 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cannot mask system column \"%s\"",
+							raw->colname),
+					 parser_errposition(pstate, raw->location)));
+
+		if (get_attgenerated(relid, attnum) != '\0')
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cannot mask generated column \"%s\"",
+							raw->colname),
+					 parser_errposition(pstate, raw->location)));
+
+		if (bms_is_member(attnum, seen))
+			ereport(ERROR,
+					(errcode(ERRCODE_DUPLICATE_COLUMN),
+					 errmsg("column \"%s\" specified more than once in WITH MASK",
+							raw->colname),
+					 parser_errposition(pstate, raw->location)));
+		seen = bms_add_member(seen, attnum);
+
+		get_atttypetypmodcoll(relid, attnum, &atttypid, &atttypmod, &attcollation);
+
+		expr = transformExpr(pstate, raw->expr, EXPR_KIND_POLICY);
+		exprtype = exprType(expr);
+
+		expr = coerce_to_target_type(pstate, expr, exprtype,
+									 atttypid, atttypmod,
+									 COERCION_ASSIGNMENT,
+									 COERCE_IMPLICIT_CAST,
+									 -1);
+		if (expr == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATATYPE_MISMATCH),
+					 errmsg("mask expression for column \"%s\" is of type %s"
+							" but column has type %s",
+							raw->colname,
+							format_type_be(exprtype),
+							format_type_be(atttypid)),
+					 errhint("You will need to rewrite or cast the expression."),
+					 parser_errposition(pstate, exprLocation(raw->expr))));
+
+		assign_expr_collations(pstate, expr);
+
+		if (contain_mutable_functions(expr))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+					 errmsg("mask expression for column \"%s\" must not contain mutable functions",
+							raw->colname),
+					 parser_errposition(pstate, exprLocation(raw->expr))));
+
+		/*
+		 * Non-leakproof functions may leak information about the real value
+		 * through error messages if the mask expression references the masked
+		 * column.  This is the same trade-off Snowflake and Oracle accept, so
+		 * we emit a WARNING rather than a hard error and let the DBA decide.
+		 */
+		if (contain_leaked_vars(expr))
+			ereport(WARNING,
+					(errcode(ERRCODE_WARNING),
+					 errmsg("mask expression for column \"%s\" is not leakproof",
+							raw->colname),
+					 errdetail("Non-leakproof functions may reveal information about the masked value through error messages."),
+					 parser_errposition(pstate, exprLocation(raw->expr))));
+
+		resolved = makeNode(PolicyColumnMaskItem);
+		resolved->colname = pstrdup(raw->colname);
+		resolved->attnum = attnum;
+		resolved->expr = expr;
+		resolved->location = -1;
+
+		result = lappend(result, resolved);
+	}
+
+	bms_free(seen);
+	return result;
+}
+
+/*
+ * check_mask_conflicts
+ *		Enforce the "one policy masks each column per applicable role" rule.
+ *
+ * For every attnum appearing in mask_quals, scan pg_policy for other policies
+ * on the same relation whose polcmd overlaps with polcmd and whose role set
+ * intersects role_ids; if any such policy declares a mask on the same column,
+ * raise an error at DDL time.  This prevents dynamic runtime conflicts that
+ * could otherwise leak information through error text.
+ *
+ * excluded_policy_oid is the OID of the policy currently being altered; pass
+ * InvalidOid during CREATE POLICY.
+ */
+static void
+check_mask_conflicts(Relation pg_policy_rel,
+					 Relation target_table,
+					 Oid excluded_policy_oid,
+					 char polcmd, ArrayType *role_ids,
+					 List *mask_quals)
+{
+	ScanKeyData skey;
+	SysScanDesc sscan;
+	HeapTuple	tuple;
+	Bitmapset  *my_attnums = NULL;
+	ListCell   *lc;
+
+	if (mask_quals == NIL)
+		return;
+
+	foreach(lc, mask_quals)
+	{
+		PolicyColumnMaskItem *m = lfirst_node(PolicyColumnMaskItem, lc);
+
+		my_attnums = bms_add_member(my_attnums, m->attnum);
+	}
+
+	ScanKeyInit(&skey,
+				Anum_pg_policy_polrelid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(RelationGetRelid(target_table)));
+
+	sscan = systable_beginscan(pg_policy_rel, PolicyPolrelidPolnameIndexId,
+							   true, NULL, 1, &skey);
+
+	while (HeapTupleIsValid(tuple = systable_getnext(sscan)))
+	{
+		Form_pg_policy other = (Form_pg_policy) GETSTRUCT(tuple);
+		Datum		datum;
+		bool		isnull;
+		char	   *str;
+		List	   *other_mask;
+		ListCell   *lc2;
+		bool		cmd_overlap;
+		bool		role_overlap;
+		ArrayType  *other_roles;
+
+		if (other->oid == excluded_policy_oid)
+			continue;
+
+		/* polcmd overlaps if either side is '*' or they match. */
+		cmd_overlap = (other->polcmd == '*' || polcmd == '*'
+					   || other->polcmd == polcmd);
+		if (!cmd_overlap)
+			continue;
+
+		datum = heap_getattr(tuple, Anum_pg_policy_polmask,
+							 RelationGetDescr(pg_policy_rel), &isnull);
+		if (isnull)
+			continue;
+
+		datum = heap_getattr(tuple, Anum_pg_policy_polroles,
+							 RelationGetDescr(pg_policy_rel), &isnull);
+		if (isnull)
+			continue;
+
+		other_roles = DatumGetArrayTypeP(datum);
+		role_overlap = false;
+		{
+			Oid		   *my_role_ids;
+			Oid		   *other_role_ids;
+			int			my_nr;
+			int			other_nr;
+			int			i,
+						j;
+
+			my_role_ids = (Oid *) ARR_DATA_PTR(role_ids);
+			my_nr = ARR_DIMS(role_ids)[0];
+			other_role_ids = (Oid *) ARR_DATA_PTR(other_roles);
+			other_nr = ARR_DIMS(other_roles)[0];
+
+			for (i = 0; i < my_nr && !role_overlap; i++)
+			{
+				if (my_role_ids[i] == ACL_ID_PUBLIC)
+				{
+					role_overlap = true;
+					break;
+				}
+				for (j = 0; j < other_nr; j++)
+				{
+					if (other_role_ids[j] == ACL_ID_PUBLIC
+						|| other_role_ids[j] == my_role_ids[i])
+					{
+						role_overlap = true;
+						break;
+					}
+				}
+			}
+		}
+		if (!role_overlap)
+			continue;
+
+		datum = heap_getattr(tuple, Anum_pg_policy_polmask,
+							 RelationGetDescr(pg_policy_rel), &isnull);
+		Assert(!isnull);
+		str = TextDatumGetCString(datum);
+		other_mask = (List *) stringToNode(str);
+		pfree(str);
+
+		foreach(lc2, other_mask)
+		{
+			PolicyColumnMaskItem *m = lfirst_node(PolicyColumnMaskItem, lc2);
+
+			if (bms_is_member(m->attnum, my_attnums))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+						 errmsg("column \"%s\" of relation \"%s\" is already masked by policy \"%s\"",
+								m->colname,
+								RelationGetRelationName(target_table),
+								NameStr(other->polname)),
+						 errhint("Each column may be masked by at most one applicable policy.")));
+		}
+	}
+
+	systable_endscan(sscan);
+	bms_free(my_attnums);
+}
+
+/*
+ * record_mask_dependencies
+ *		Record NORMAL dependencies of the policy on the mask expressions and
+ *		on each masked column, so that DROP COLUMN cascades to the policy.
+ */
+static void
+record_mask_dependencies(ObjectAddress *myself, Oid target_relid,
+						 List *rtable, List *mask_quals)
+{
+	ListCell   *lc;
+
+	foreach(lc, mask_quals)
+	{
+		PolicyColumnMaskItem *m = lfirst_node(PolicyColumnMaskItem, lc);
+		ObjectAddress column;
+
+		recordDependencyOnExpr(myself, m->expr, rtable, DEPENDENCY_NORMAL);
+
+		column.classId = RelationRelationId;
+		column.objectId = target_relid;
+		column.objectSubId = m->attnum;
+		recordDependencyOn(myself, &column, DEPENDENCY_NORMAL);
+	}
+}
+
+/*
  * Load row security policy from the catalog, and store it in
  * the relation's relcache entry.
  *
@@ -294,6 +594,20 @@ RelationBuildRowSecurity(Relation relation)
 		}
 		else
 			policy->with_check_qual = NULL;
+
+		/* Get column mask list */
+		datum = heap_getattr(tuple, Anum_pg_policy_polmask,
+							 RelationGetDescr(catalog), &isnull);
+		if (!isnull)
+		{
+			str_value = TextDatumGetCString(datum);
+			MemoryContextSwitchTo(rscxt);
+			policy->mask_quals = (List *) stringToNode(str_value);
+			MemoryContextSwitchTo(oldcxt);
+			pfree(str_value);
+		}
+		else
+			policy->mask_quals = NIL;
 
 		/* We want to cache whether there are SubLinks in these expressions */
 		policy->hassublinks = checkExprHasSubLink((Node *) policy->qual) ||
@@ -581,6 +895,7 @@ CreatePolicy(CreatePolicyStmt *stmt)
 	ParseNamespaceItem *nsitem;
 	Node	   *qual;
 	Node	   *with_check_qual;
+	List	   *mask_quals;
 	ScanKeyData skey[2];
 	SysScanDesc sscan;
 	HeapTuple	policy_tuple;
@@ -610,6 +925,17 @@ CreatePolicy(CreatePolicyStmt *stmt)
 		ereport(ERROR,
 				(errcode(ERRCODE_SYNTAX_ERROR),
 				 errmsg("only WITH CHECK expression allowed for INSERT")));
+
+	/*
+	 * WITH MASK is only meaningful for read paths (SELECT / ALL).  Rejecting
+	 * mask on write-only commands avoids surprising semantics on INSERT,
+	 * UPDATE (SET side) and DELETE where masking is not applied.
+	 */
+	if (stmt->with_mask != NIL &&
+		polcmd != ACL_SELECT_CHR && polcmd != '*')
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("WITH MASK can only be used with FOR SELECT or FOR ALL policies")));
 
 	/* Collect role ids */
 	role_oids = policy_role_list_to_array(stmt->roles, &nitems);
@@ -658,8 +984,21 @@ CreatePolicy(CreatePolicyStmt *stmt)
 	assign_expr_collations(qual_pstate, qual);
 	assign_expr_collations(with_check_pstate, with_check_qual);
 
+	/* Transform WITH MASK column list, if any. */
+	mask_quals = transform_policy_mask_list(qual_pstate, target_table,
+											stmt->with_mask);
+
 	/* Open pg_policy catalog */
 	pg_policy_rel = table_open(PolicyRelationId, RowExclusiveLock);
+
+	/*
+	 * Reject conflict with an existing policy that already masks any of the
+	 * requested columns for an overlapping polcmd/role set.  Doing this now
+	 * (before we insert the tuple) means DDL fails cleanly instead of
+	 * producing runtime errors when the policy is later evaluated.
+	 */
+	check_mask_conflicts(pg_policy_rel, target_table, InvalidOid,
+						 polcmd, role_ids, mask_quals);
 
 	/* Set key - policy's relation id. */
 	ScanKeyInit(&skey[0],
@@ -708,6 +1047,13 @@ CreatePolicy(CreatePolicyStmt *stmt)
 	else
 		isnull[Anum_pg_policy_polwithcheck - 1] = true;
 
+	/* Add WITH MASK list if present */
+	if (mask_quals != NIL)
+		values[Anum_pg_policy_polmask - 1] =
+			CStringGetTextDatum(nodeToString(mask_quals));
+	else
+		isnull[Anum_pg_policy_polmask - 1] = true;
+
 	policy_tuple = heap_form_tuple(RelationGetDescr(pg_policy_rel), values,
 								   isnull);
 
@@ -729,6 +1075,9 @@ CreatePolicy(CreatePolicyStmt *stmt)
 
 	recordDependencyOnExpr(&myself, with_check_qual,
 						   with_check_pstate->p_rtable, DEPENDENCY_NORMAL);
+
+	record_mask_dependencies(&myself, table_id, qual_pstate->p_rtable,
+							 mask_quals);
 
 	/* Register role dependencies */
 	target.classId = AuthIdRelationId;
@@ -776,8 +1125,12 @@ AlterPolicy(AlterPolicyStmt *stmt)
 	ArrayType  *role_ids = NULL;
 	List	   *qual_parse_rtable = NIL;
 	List	   *with_check_parse_rtable = NIL;
+	List	   *mask_parse_rtable = NIL;
 	Node	   *qual = NULL;
 	Node	   *with_check_qual = NULL;
+	List	   *mask_quals = NIL;
+	bool		mask_changed = false;
+	ArrayType  *effective_role_ids = NULL;
 	ScanKeyData skey[2];
 	SysScanDesc sscan;
 	HeapTuple	policy_tuple;
@@ -914,6 +1267,39 @@ AlterPolicy(AlterPolicyStmt *stmt)
 				(errcode(ERRCODE_SYNTAX_ERROR),
 				 errmsg("only WITH CHECK expression allowed for INSERT")));
 
+	/*
+	 * WITH MASK requires a read-visible policy.  RESET MASK is unconditionally
+	 * allowed (it just clears any existing mask).
+	 */
+	if (stmt->with_mask != NIL &&
+		polcmd != ACL_SELECT_CHR && polcmd != '*')
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("WITH MASK can only be used with FOR SELECT or FOR ALL policies")));
+
+	/* Transform new mask list, if supplied. */
+	if (stmt->with_mask != NIL)
+	{
+		ParseNamespaceItem *nsitem;
+		ParseState *mask_pstate = make_parsestate(NULL);
+
+		nsitem = addRangeTableEntryForRelation(mask_pstate, target_table,
+											   AccessShareLock,
+											   NULL, false, false);
+		addNSItemToQuery(mask_pstate, nsitem, false, true, true);
+
+		mask_quals = transform_policy_mask_list(mask_pstate, target_table,
+												stmt->with_mask);
+		mask_parse_rtable = mask_pstate->p_rtable;
+		free_parsestate(mask_pstate);
+		mask_changed = true;
+	}
+	else if (stmt->reset_mask)
+	{
+		mask_quals = NIL;
+		mask_changed = true;
+	}
+
 	policy_id = ((Form_pg_policy) GETSTRUCT(policy_tuple))->oid;
 
 	if (role_ids != NULL)
@@ -1036,6 +1422,69 @@ AlterPolicy(AlterPolicyStmt *stmt)
 		}
 	}
 
+	/*
+	 * Determine what to write for polmask:
+	 *   - user supplied a new mask list -> replace with it
+	 *   - user asked to RESET MASK -> write NULL
+	 *   - otherwise -> load the existing mask so dependencies can be recreated
+	 */
+	if (mask_changed)
+	{
+		replaces[Anum_pg_policy_polmask - 1] = true;
+		if (mask_quals != NIL)
+			values[Anum_pg_policy_polmask - 1] =
+				CStringGetTextDatum(nodeToString(mask_quals));
+		else
+			isnull[Anum_pg_policy_polmask - 1] = true;
+	}
+	else
+	{
+		Datum		value_datum;
+		bool		attr_isnull;
+
+		value_datum = heap_getattr(policy_tuple, Anum_pg_policy_polmask,
+								   RelationGetDescr(pg_policy_rel),
+								   &attr_isnull);
+		if (!attr_isnull)
+		{
+			char	   *mask_value;
+			ParseState *mask_pstate = make_parsestate(NULL);
+
+			mask_value = TextDatumGetCString(value_datum);
+			mask_quals = (List *) stringToNode(mask_value);
+
+			(void) addRangeTableEntryForRelation(mask_pstate, target_table,
+												 AccessShareLock,
+												 NULL, false, false);
+			mask_parse_rtable = mask_pstate->p_rtable;
+			free_parsestate(mask_pstate);
+		}
+	}
+
+	/*
+	 * Re-check mask conflicts against other policies before writing.  Use the
+	 * (possibly new) role set and the existing polcmd.
+	 */
+	if (mask_quals != NIL)
+	{
+		if (role_ids != NULL)
+			effective_role_ids = role_ids;
+		else
+		{
+			Datum		roles_datum;
+			bool		attr_isnull;
+
+			roles_datum = heap_getattr(policy_tuple, Anum_pg_policy_polroles,
+									   RelationGetDescr(pg_policy_rel),
+									   &attr_isnull);
+			Assert(!attr_isnull);
+			effective_role_ids = DatumGetArrayTypeP(roles_datum);
+		}
+
+		check_mask_conflicts(pg_policy_rel, target_table, policy_id,
+							 polcmd, effective_role_ids, mask_quals);
+	}
+
 	new_tuple = heap_modify_tuple(policy_tuple,
 								  RelationGetDescr(pg_policy_rel),
 								  values, isnull, replaces);
@@ -1059,6 +1508,8 @@ AlterPolicy(AlterPolicyStmt *stmt)
 
 	recordDependencyOnExpr(&myself, with_check_qual, with_check_parse_rtable,
 						   DEPENDENCY_NORMAL);
+
+	record_mask_dependencies(&myself, table_id, mask_parse_rtable, mask_quals);
 
 	/* Register role dependencies */
 	deleteSharedDependencyRecordsFor(PolicyRelationId, policy_id, 0);

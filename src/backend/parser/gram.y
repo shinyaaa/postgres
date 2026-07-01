@@ -403,8 +403,10 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 
 %type <str>		row_security_cmd RowSecurityDefaultForCmd
 %type <boolean> RowSecurityDefaultPermissive
-%type <node>	RowSecurityOptionalWithCheck RowSecurityOptionalExpr
+%type <node>	RowSecurityOptionalExpr row_security_mask_item
 %type <list>	RowSecurityDefaultToRole RowSecurityOptionalToRole
+			row_security_mask_list
+			RowSecurityCreateTail RowSecurityAlterTail
 
 %type <str>		iso_level opt_encoding
 %type <rolespec> grantee
@@ -789,7 +791,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	LEADING LEAKPROOF LEAST LEFT LEVEL LIKE LIMIT LISTEN LOAD LOCAL
 	LOCALTIME LOCALTIMESTAMP LOCATION LOCK_P LOCKED LOGGED LSN_P
 
-	MAPPING MATCH MATCHED MATERIALIZED MAXVALUE MERGE MERGE_ACTION METHOD
+	MAPPING MASK MATCH MATCHED MATERIALIZED MAXVALUE MERGE MERGE_ACTION METHOD
 	MINUTE_P MINVALUE MODE MONTH_P MOVE
 
 	NAME_P NAMES NATIONAL NATURAL NCHAR NESTED NEW NEXT NFC NFD NFKC NFKD NO NODE
@@ -6076,7 +6078,7 @@ AlterUserMappingStmt: ALTER USER MAPPING FOR auth_ident SERVER name alter_generi
 CreatePolicyStmt:
 			CREATE POLICY name ON qualified_name RowSecurityDefaultPermissive
 				RowSecurityDefaultForCmd RowSecurityDefaultToRole
-				RowSecurityOptionalExpr RowSecurityOptionalWithCheck
+				RowSecurityOptionalExpr RowSecurityCreateTail
 				{
 					CreatePolicyStmt *n = makeNode(CreatePolicyStmt);
 
@@ -6086,14 +6088,19 @@ CreatePolicyStmt:
 					n->cmd_name = $7;
 					n->roles = $8;
 					n->qual = $9;
-					n->with_check = $10;
+					/*
+					 * RowSecurityCreateTail is a 2-element list:
+					 * (Node *with_check, List *with_mask)
+					 */
+					n->with_check = (Node *) linitial($10);
+					n->with_mask = (List *) lsecond($10);
 					$$ = (Node *) n;
 				}
 		;
 
 AlterPolicyStmt:
 			ALTER POLICY name ON qualified_name RowSecurityOptionalToRole
-				RowSecurityOptionalExpr RowSecurityOptionalWithCheck
+				RowSecurityOptionalExpr RowSecurityAlterTail
 				{
 					AlterPolicyStmt *n = makeNode(AlterPolicyStmt);
 
@@ -6101,7 +6108,13 @@ AlterPolicyStmt:
 					n->table = $5;
 					n->roles = $6;
 					n->qual = $7;
-					n->with_check = $8;
+					/*
+					 * RowSecurityAlterTail is a 3-element list:
+					 * (Node *with_check, List *with_mask, Integer reset_flag)
+					 */
+					n->with_check = (Node *) linitial($8);
+					n->with_mask = (List *) lsecond($8);
+					n->reset_mask = ((Integer *) lthird($8))->ival != 0;
 					$$ = (Node *) n;
 				}
 		;
@@ -6111,9 +6124,64 @@ RowSecurityOptionalExpr:
 			| /* EMPTY */			{ $$ = NULL; }
 		;
 
-RowSecurityOptionalWithCheck:
-			WITH CHECK '(' a_expr ')'		{ $$ = $4; }
-			| /* EMPTY */					{ $$ = NULL; }
+/*
+ * The trailing clauses of CREATE/ALTER POLICY combine WITH CHECK and WITH MASK
+ * into a single non-terminal so that the shared WITH prefix does not cause an
+ * LR(1) shift/reduce conflict.  Either clause may be omitted, and their order
+ * is not fixed.  For CREATE POLICY the result is a 2-element list
+ * (with_check, with_mask); for ALTER POLICY it is a 3-element list
+ * (with_check, with_mask, reset_mask_flag).
+ */
+RowSecurityCreateTail:
+			/* EMPTY */
+				{ $$ = list_make2(NULL, NIL); }
+			| WITH CHECK '(' a_expr ')'
+				{ $$ = list_make2($4, NIL); }
+			| WITH MASK '(' row_security_mask_list ')'
+				{ $$ = list_make2(NULL, $4); }
+			| WITH CHECK '(' a_expr ')' WITH MASK '(' row_security_mask_list ')'
+				{ $$ = list_make2($4, $9); }
+			| WITH MASK '(' row_security_mask_list ')' WITH CHECK '(' a_expr ')'
+				{ $$ = list_make2($9, $4); }
+		;
+
+RowSecurityAlterTail:
+			/* EMPTY */
+				{ $$ = list_make3(NULL, NIL, makeInteger(0)); }
+			| WITH CHECK '(' a_expr ')'
+				{ $$ = list_make3($4, NIL, makeInteger(0)); }
+			| WITH MASK '(' row_security_mask_list ')'
+				{ $$ = list_make3(NULL, $4, makeInteger(0)); }
+			| RESET MASK
+				{ $$ = list_make3(NULL, NIL, makeInteger(1)); }
+			| WITH CHECK '(' a_expr ')' WITH MASK '(' row_security_mask_list ')'
+				{ $$ = list_make3($4, $9, makeInteger(0)); }
+			| WITH MASK '(' row_security_mask_list ')' WITH CHECK '(' a_expr ')'
+				{ $$ = list_make3($9, $4, makeInteger(0)); }
+			| WITH CHECK '(' a_expr ')' RESET MASK
+				{ $$ = list_make3($4, NIL, makeInteger(1)); }
+			| RESET MASK WITH CHECK '(' a_expr ')'
+				{ $$ = list_make3($6, NIL, makeInteger(1)); }
+		;
+
+row_security_mask_list:
+			row_security_mask_item
+				{ $$ = list_make1($1); }
+			| row_security_mask_list ',' row_security_mask_item
+				{ $$ = lappend($1, $3); }
+		;
+
+row_security_mask_item:
+			ColId '=' a_expr
+				{
+					PolicyColumnMaskItem *m = makeNode(PolicyColumnMaskItem);
+
+					m->colname = $1;
+					m->attnum = 0;
+					m->expr = $3;
+					m->location = @1;
+					$$ = (Node *) m;
+				}
 		;
 
 RowSecurityDefaultToRole:
@@ -18978,6 +19046,7 @@ unreserved_keyword:
 			| LOGGED
 			| LSN_P
 			| MAPPING
+			| MASK
 			| MATCH
 			| MATCHED
 			| MATERIALIZED
@@ -19610,6 +19679,7 @@ bare_label_keyword:
 			| LOGGED
 			| LSN_P
 			| MAPPING
+			| MASK
 			| MATCH
 			| MATCHED
 			| MATERIALIZED
