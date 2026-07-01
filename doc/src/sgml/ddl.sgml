@@ -3244,6 +3244,21 @@ UPDATE 0
   </para>
 
   <para>
+   <xref linkend="sql-refreshmaterializedview"/> executes the materialized
+   view's defining query with the privileges of the materialized view's
+   owner, not the invoking user.  If the owner is the owner of a referenced
+   table and has not set <literal>FORCE ROW LEVEL SECURITY</literal> on it,
+   or if the owner has the <literal>BYPASSRLS</literal> attribute, row
+   security policies on the referenced tables are not applied while
+   refreshing.  As a result, the refreshed materialized view may contain
+   rows that a user with only <literal>SELECT</literal> privilege on the
+   materialized view could not have read directly from the underlying
+   tables.  Grant <literal>SELECT</literal> on materialized views built
+   from row-security-protected tables only to roles that are also permitted
+   to see the underlying data.
+  </para>
+
+  <para>
    In the examples above, the policy expressions consider only the current
    values in the row to be accessed or updated.  This is the simplest and
    best-performing case; when possible, it's best to design row security
