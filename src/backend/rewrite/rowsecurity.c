@@ -725,6 +725,14 @@ add_security_quals(int rt_index,
 	/*
 	 * First collect up the permissive quals.  If we do not find any
 	 * permissive policies then no rows are visible (this is handled below).
+	 *
+	 * Per CREATE POLICY, a policy with no explicit USING clause defaults to
+	 * enabling access to all rows, so treat a NULL qual as an implicit TRUE.
+	 * Otherwise a permissive policy created with only a WITH CHECK clause
+	 * (e.g. FOR UPDATE WITH CHECK (...)) would fail to contribute to the
+	 * USING side and, if it were the only permissive policy, would trigger
+	 * the default-deny path below and silently drop any coexisting
+	 * restrictive policies' quals as well.
 	 */
 	foreach(item, permissive_policies)
 	{
@@ -736,6 +744,9 @@ add_security_quals(int rt_index,
 									   copyObject(policy->qual));
 			*hasSubLinks |= policy->hassublinks;
 		}
+		else
+			permissive_quals = lappend(permissive_quals,
+									   (Expr *) makeBoolConst(true, false));
 	}
 
 	/*
@@ -827,7 +838,11 @@ add_with_check_options(Relation rel,
 
 	/*
 	 * First collect up the permissive policy clauses, similar to
-	 * add_security_quals.
+	 * add_security_quals.  A permissive policy with neither an applicable
+	 * WITH CHECK clause nor a fallback USING clause is treated as an
+	 * implicit TRUE, mirroring add_security_quals and the CREATE POLICY
+	 * documented defaults ("no USING => all rows"; "no WITH CHECK =>
+	 * USING").
 	 */
 	foreach(item, permissive_policies)
 	{
@@ -839,6 +854,9 @@ add_with_check_options(Relation rel,
 			permissive_quals = lappend(permissive_quals, copyObject(qual));
 			*hasSubLinks |= policy->hassublinks;
 		}
+		else
+			permissive_quals = lappend(permissive_quals,
+									   (Expr *) makeBoolConst(true, false));
 	}
 
 	/*

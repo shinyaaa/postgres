@@ -2297,6 +2297,72 @@ SELECT * FROM r1;
 
 DROP TABLE r1;
 
+--
+-- Test policies with only WITH CHECK (no USING) - a PERMISSIVE policy with
+-- an omitted USING clause defaults to enabling access to all rows per
+-- CREATE POLICY docs.  This must not silently trigger the default-deny
+-- path in add_security_quals and must not swallow any coexisting
+-- RESTRICTIVE policies' USING quals.
+--
+SET SESSION AUTHORIZATION regress_rls_alice;
+SET row_security = on;
+CREATE TABLE rls_wc_only (a int);
+INSERT INTO rls_wc_only VALUES (1), (2), (5), (50), (150);
+GRANT SELECT, INSERT, UPDATE, DELETE ON rls_wc_only TO regress_rls_bob;
+
+-- PERMISSIVE FOR UPDATE with only WITH CHECK: USING defaults to TRUE
+CREATE POLICY p_wc ON rls_wc_only FOR UPDATE WITH CHECK (a > 0);
+-- RESTRICTIVE with USING must still apply on top of the implicit TRUE
+CREATE POLICY p_r ON rls_wc_only AS RESTRICTIVE FOR UPDATE USING (a < 100);
+-- Permissive SELECT policy so we can inspect the rows
+CREATE POLICY p_sel ON rls_wc_only FOR SELECT USING (true);
+ALTER TABLE rls_wc_only ENABLE ROW LEVEL SECURITY;
+
+SET SESSION AUTHORIZATION regress_rls_bob;
+-- The USING-phase security quals become "a < 100" (RESTRICTIVE p_r) ANDed
+-- with the implicit TRUE from p_wc.  Row a=150 is filtered out.  Before
+-- the fix, an empty permissive set triggered the default-deny path and
+-- also dropped p_r's qual, so every UPDATE silently affected 0 rows.
+UPDATE rls_wc_only SET a = a + 1 WHERE a < 10;
+SELECT * FROM rls_wc_only ORDER BY a;   -- 2,3,6,50,150
+
+-- RESTRICTIVE WITH CHECK falls back to its USING clause, so an update
+-- that would drive the new row to a>=100 must be rejected by p_r as WCO.
+UPDATE rls_wc_only SET a = a + 1000 WHERE a = 50;
+
+-- Row a=150 was invisible to the USING-phase, so this WHERE matches
+-- nothing and the UPDATE affects zero rows without error.
+UPDATE rls_wc_only SET a = 0 WHERE a = 150;
+
+-- Now switch the PERMISSIVE WITH CHECK to something the new row violates;
+-- USING side still allows all rows, so the update is rejected by p_wc's
+-- WCO (permissive WCO has no polname in the error message).
+SET SESSION AUTHORIZATION regress_rls_alice;
+DROP POLICY p_wc ON rls_wc_only;
+CREATE POLICY p_wc ON rls_wc_only FOR UPDATE WITH CHECK (a < 0);
+SET SESSION AUTHORIZATION regress_rls_bob;
+UPDATE rls_wc_only SET a = a + 1 WHERE a = 2;   -- fails p_wc
+
+-- Same behavior for an ALL policy with only WITH CHECK: SELECT sees all
+-- rows; INSERT must satisfy the WITH CHECK.
+SET SESSION AUTHORIZATION regress_rls_alice;
+DROP POLICY p_wc ON rls_wc_only;
+DROP POLICY p_r ON rls_wc_only;
+DROP POLICY p_sel ON rls_wc_only;
+CREATE POLICY p_all_wc ON rls_wc_only FOR ALL WITH CHECK (a > 0);
+
+SET SESSION AUTHORIZATION regress_rls_bob;
+-- SELECT should return every row (implicit USING true)
+SELECT * FROM rls_wc_only ORDER BY a;
+-- INSERT below the WITH CHECK must fail
+INSERT INTO rls_wc_only VALUES (-1);
+-- INSERT above the WITH CHECK must succeed
+INSERT INTO rls_wc_only VALUES (7);
+SELECT * FROM rls_wc_only ORDER BY a;
+
+SET SESSION AUTHORIZATION regress_rls_alice;
+DROP TABLE rls_wc_only;
+
 -- Check dependency handling
 RESET SESSION AUTHORIZATION;
 CREATE TABLE dep1 (c1 int);
