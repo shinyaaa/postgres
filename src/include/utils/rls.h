@@ -46,5 +46,6 @@ enum CheckEnableRlsResult
 };
 
 extern int	check_enable_rls(Oid relid, Oid checkAsUser, bool noError);
+extern int	check_enable_colmask(Oid relid, Oid checkAsUser, bool noError);
 
 #endif							/* RLS_H */

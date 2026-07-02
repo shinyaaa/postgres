@@ -81,6 +81,8 @@ CREATE VIEW pg_policies AS
         C.relname AS tablename,
         pol.polname AS policyname,
         CASE
+            WHEN pol.polmasking THEN
+                'MASKING'
             WHEN pol.polpermissive THEN
                 'PERMISSIVE'
             ELSE
@@ -105,10 +107,15 @@ CREATE VIEW pg_policies AS
             WHEN '*' THEN 'ALL'
         END AS cmd,
         pg_catalog.pg_get_expr(pol.polqual, pol.polrelid) AS qual,
-        pg_catalog.pg_get_expr(pol.polwithcheck, pol.polrelid) AS with_check
+        pg_catalog.pg_get_expr(pol.polwithcheck, pol.polrelid) AS with_check,
+        A.attname AS masked_column,
+        pg_catalog.pg_get_expr(pol.polmaskexpr, pol.polrelid) AS mask_expression
     FROM pg_catalog.pg_policy pol
     JOIN pg_catalog.pg_class C ON (C.oid = pol.polrelid)
-    LEFT JOIN pg_catalog.pg_namespace N ON (N.oid = C.relnamespace);
+    LEFT JOIN pg_catalog.pg_namespace N ON (N.oid = C.relnamespace)
+    LEFT JOIN pg_catalog.pg_attribute A ON (A.attrelid = pol.polrelid
+                                            AND A.attnum = pol.polmaskattnum
+                                            AND pol.polmasking);
 
 CREATE VIEW pg_rules AS
     SELECT
@@ -273,7 +280,8 @@ CREATE VIEW pg_stats WITH (security_barrier) AS
          LEFT JOIN pg_namespace n ON (n.oid = c.relnamespace)
     WHERE NOT attisdropped
     AND has_column_privilege(c.oid, a.attnum, 'select')
-    AND (c.relrowsecurity = false OR NOT row_security_active(c.oid));
+    AND (c.relrowsecurity = false OR NOT row_security_active(c.oid))
+    AND (c.relcolmasking = false OR NOT column_masking_active(c.oid));
 
 REVOKE ALL ON pg_statistic FROM public;
 
@@ -311,7 +319,8 @@ CREATE VIEW pg_stats_ext WITH (security_barrier) AS
                      FROM pg_mcv_list_items(sd.stxdmcv)
                    ) m ON sd.stxdmcv IS NOT NULL
     WHERE pg_has_role(c.relowner, 'USAGE')
-    AND (c.relrowsecurity = false OR NOT row_security_active(c.oid));
+    AND (c.relrowsecurity = false OR NOT row_security_active(c.oid))
+    AND (c.relcolmasking = false OR NOT column_masking_active(c.oid));
 
 CREATE VIEW pg_stats_ext_exprs WITH (security_barrier) AS
     SELECT cn.nspname AS schemaname,
@@ -405,7 +414,8 @@ CREATE VIEW pg_stats_ext_exprs WITH (security_barrier) AS
                     unnest(sd.stxdexpr)::pg_statistic AS a
          ) stat ON (stat.expr IS NOT NULL)
     WHERE pg_has_role(c.relowner, 'USAGE')
-    AND (c.relrowsecurity = false OR NOT row_security_active(c.oid));
+    AND (c.relrowsecurity = false OR NOT row_security_active(c.oid))
+    AND (c.relcolmasking = false OR NOT column_masking_active(c.oid));
 
 -- unprivileged users may read pg_statistic_ext but not pg_statistic_ext_data
 REVOKE ALL ON pg_statistic_ext_data FROM public;

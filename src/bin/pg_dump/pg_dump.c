@@ -4236,6 +4236,9 @@ getPolicies(Archive *fout, TableInfo tblinfo[], int numTables)
 	int			i_polname;
 	int			i_polcmd;
 	int			i_polpermissive;
+	int			i_polmasking;
+	int			i_polmaskcol;
+	int			i_polmaskexpr;
 	int			i_polroles;
 	int			i_polqual;
 	int			i_polwithcheck;
@@ -4299,9 +4302,41 @@ getPolicies(Archive *fout, TableInfo tblinfo[], int numTables)
 			polinfo->polname = NULL;
 			polinfo->polcmd = '\0';
 			polinfo->polpermissive = 0;
+			polinfo->polmasking = false;
 			polinfo->polroles = NULL;
 			polinfo->polqual = NULL;
 			polinfo->polwithcheck = NULL;
+			polinfo->polmaskcol = NULL;
+			polinfo->polmaskexpr = NULL;
+		}
+
+		/* Likewise, is column masking enabled? */
+		if (tbinfo->colmask)
+		{
+			tbinfo->dobj.components |= DUMP_COMPONENT_POLICY;
+
+			/*
+			 * We represent column masking being enabled on a table by
+			 * creating a PolicyInfo object with null polname and polmasking
+			 * set.
+			 */
+			polinfo = pg_malloc_object(PolicyInfo);
+			polinfo->dobj.objType = DO_POLICY;
+			polinfo->dobj.catId.tableoid = 0;
+			polinfo->dobj.catId.oid = tbinfo->dobj.catId.oid;
+			AssignDumpId(&polinfo->dobj);
+			polinfo->dobj.namespace = tbinfo->dobj.namespace;
+			polinfo->dobj.name = pg_strdup(tbinfo->dobj.name);
+			polinfo->poltable = tbinfo;
+			polinfo->polname = NULL;
+			polinfo->polcmd = '\0';
+			polinfo->polpermissive = 0;
+			polinfo->polmasking = true;
+			polinfo->polroles = NULL;
+			polinfo->polqual = NULL;
+			polinfo->polwithcheck = NULL;
+			polinfo->polmaskcol = NULL;
+			polinfo->polmaskexpr = NULL;
 		}
 	}
 	appendPQExpBufferChar(tbloids, '}');
@@ -4320,6 +4355,17 @@ getPolicies(Archive *fout, TableInfo tblinfo[], int numTables)
 		appendPQExpBufferStr(query, "pol.polpermissive, ");
 	else
 		appendPQExpBufferStr(query, "'t' as polpermissive, ");
+	if (fout->remoteVersion >= 190000)
+		appendPQExpBufferStr(query,
+							 "pol.polmasking, "
+							 "(SELECT quote_ident(a.attname) FROM pg_catalog.pg_attribute a "
+							 " WHERE a.attrelid = pol.polrelid AND a.attnum = pol.polmaskattnum) AS polmaskcol, "
+							 "pg_catalog.pg_get_expr(pol.polmaskexpr, pol.polrelid) AS polmaskexpr, ");
+	else
+		appendPQExpBufferStr(query,
+							 "'f' as polmasking, "
+							 "NULL as polmaskcol, "
+							 "NULL as polmaskexpr, ");
 	appendPQExpBuffer(query,
 					  "CASE WHEN pol.polroles = '{0}' THEN NULL ELSE "
 					  "   pg_catalog.array_to_string(ARRAY(SELECT pg_catalog.quote_ident(rolname) from pg_catalog.pg_roles WHERE oid = ANY(pol.polroles)), ', ') END AS polroles, "
@@ -4340,6 +4386,9 @@ getPolicies(Archive *fout, TableInfo tblinfo[], int numTables)
 		i_polname = PQfnumber(res, "polname");
 		i_polcmd = PQfnumber(res, "polcmd");
 		i_polpermissive = PQfnumber(res, "polpermissive");
+		i_polmasking = PQfnumber(res, "polmasking");
+		i_polmaskcol = PQfnumber(res, "polmaskcol");
+		i_polmaskexpr = PQfnumber(res, "polmaskexpr");
 		i_polroles = PQfnumber(res, "polroles");
 		i_polqual = PQfnumber(res, "polqual");
 		i_polwithcheck = PQfnumber(res, "polwithcheck");
@@ -4365,6 +4414,17 @@ getPolicies(Archive *fout, TableInfo tblinfo[], int numTables)
 
 			polinfo[j].polcmd = *(PQgetvalue(res, j, i_polcmd));
 			polinfo[j].polpermissive = *(PQgetvalue(res, j, i_polpermissive)) == 't';
+			polinfo[j].polmasking = *(PQgetvalue(res, j, i_polmasking)) == 't';
+
+			if (PQgetisnull(res, j, i_polmaskcol))
+				polinfo[j].polmaskcol = NULL;
+			else
+				polinfo[j].polmaskcol = pg_strdup(PQgetvalue(res, j, i_polmaskcol));
+
+			if (PQgetisnull(res, j, i_polmaskexpr))
+				polinfo[j].polmaskexpr = NULL;
+			else
+				polinfo[j].polmaskexpr = pg_strdup(PQgetvalue(res, j, i_polmaskexpr));
 
 			if (PQgetisnull(res, j, i_polroles))
 				polinfo[j].polroles = NULL;
@@ -4419,8 +4479,12 @@ dumpPolicy(Archive *fout, const PolicyInfo *polinfo)
 	{
 		query = createPQExpBuffer();
 
-		appendPQExpBuffer(query, "ALTER TABLE %s ENABLE ROW LEVEL SECURITY;",
-						  fmtQualifiedDumpable(tbinfo));
+		if (polinfo->polmasking)
+			appendPQExpBuffer(query, "ALTER TABLE %s ENABLE COLUMN MASKING;",
+							  fmtQualifiedDumpable(tbinfo));
+		else
+			appendPQExpBuffer(query, "ALTER TABLE %s ENABLE ROW LEVEL SECURITY;",
+							  fmtQualifiedDumpable(tbinfo));
 
 		/*
 		 * We must emit the ROW SECURITY object's dependency on its table
@@ -4432,7 +4496,8 @@ dumpPolicy(Archive *fout, const PolicyInfo *polinfo)
 						 ARCHIVE_OPTS(.tag = polinfo->dobj.name,
 									  .namespace = polinfo->dobj.namespace->dobj.name,
 									  .owner = tbinfo->rolname,
-									  .description = "ROW SECURITY",
+									  .description = polinfo->polmasking ?
+									  "COLUMN MASKING" : "ROW SECURITY",
 									  .section = SECTION_POST_DATA,
 									  .createStmt = query->data,
 									  .deps = &(tbinfo->dobj.dumpId),
@@ -4464,8 +4529,12 @@ dumpPolicy(Archive *fout, const PolicyInfo *polinfo)
 
 	appendPQExpBuffer(query, "CREATE POLICY %s", fmtId(polinfo->polname));
 
-	appendPQExpBuffer(query, " ON %s%s%s", fmtQualifiedDumpable(tbinfo),
-					  !polinfo->polpermissive ? " AS RESTRICTIVE" : "", cmd);
+	if (polinfo->polmasking)
+		appendPQExpBuffer(query, " ON %s AS MASKING",
+						  fmtQualifiedDumpable(tbinfo));
+	else
+		appendPQExpBuffer(query, " ON %s%s%s", fmtQualifiedDumpable(tbinfo),
+						  !polinfo->polpermissive ? " AS RESTRICTIVE" : "", cmd);
 
 	if (polinfo->polroles != NULL)
 		appendPQExpBuffer(query, " TO %s", polinfo->polroles);
@@ -4475,6 +4544,10 @@ dumpPolicy(Archive *fout, const PolicyInfo *polinfo)
 
 	if (polinfo->polwithcheck != NULL)
 		appendPQExpBuffer(query, " WITH CHECK (%s)", polinfo->polwithcheck);
+
+	if (polinfo->polmasking)
+		appendPQExpBuffer(query, " MASK (%s WITH %s)",
+						  polinfo->polmaskcol, polinfo->polmaskexpr);
 
 	appendPQExpBufferStr(query, ";\n");
 
@@ -7308,6 +7381,8 @@ getTables(Archive *fout, int *numTables)
 	int			i_relreplident;
 	int			i_relrowsec;
 	int			i_relforcerowsec;
+	int			i_relcolmask;
+	int			i_relforcecolmask;
 	int			i_relfrozenxid;
 	int			i_toastfrozenxid;
 	int			i_toastoid;
@@ -7399,6 +7474,14 @@ getTables(Archive *fout, int *numTables)
 		appendPQExpBufferStr(query,
 							 "false AS relrowsecurity, "
 							 "false AS relforcerowsecurity, ");
+
+	if (fout->remoteVersion >= 190000)
+		appendPQExpBufferStr(query,
+							 "c.relcolmasking, c.relforcecolmasking, ");
+	else
+		appendPQExpBufferStr(query,
+							 "false AS relcolmasking, "
+							 "false AS relforcecolmasking, ");
 
 	if (fout->remoteVersion >= 90300)
 		appendPQExpBufferStr(query,
@@ -7533,6 +7616,8 @@ getTables(Archive *fout, int *numTables)
 	i_relreplident = PQfnumber(res, "relreplident");
 	i_relrowsec = PQfnumber(res, "relrowsecurity");
 	i_relforcerowsec = PQfnumber(res, "relforcerowsecurity");
+	i_relcolmask = PQfnumber(res, "relcolmasking");
+	i_relforcecolmask = PQfnumber(res, "relforcecolmasking");
 	i_relfrozenxid = PQfnumber(res, "relfrozenxid");
 	i_toastfrozenxid = PQfnumber(res, "tfrozenxid");
 	i_toastoid = PQfnumber(res, "toid");
@@ -7611,6 +7696,8 @@ getTables(Archive *fout, int *numTables)
 		tblinfo[i].relreplident = *(PQgetvalue(res, i, i_relreplident));
 		tblinfo[i].rowsec = (strcmp(PQgetvalue(res, i, i_relrowsec), "t") == 0);
 		tblinfo[i].forcerowsec = (strcmp(PQgetvalue(res, i, i_relforcerowsec), "t") == 0);
+		tblinfo[i].colmask = (strcmp(PQgetvalue(res, i, i_relcolmask), "t") == 0);
+		tblinfo[i].forcecolmask = (strcmp(PQgetvalue(res, i, i_relforcecolmask), "t") == 0);
 		tblinfo[i].frozenxid = atooid(PQgetvalue(res, i, i_relfrozenxid));
 		tblinfo[i].toast_frozenxid = atooid(PQgetvalue(res, i, i_toastfrozenxid));
 		tblinfo[i].toast_oid = atooid(PQgetvalue(res, i, i_toastoid));
@@ -18185,6 +18272,10 @@ dumpTableSchema(Archive *fout, const TableInfo *tbinfo)
 
 	if (tbinfo->forcerowsec)
 		appendPQExpBuffer(q, "\nALTER TABLE ONLY %s FORCE ROW LEVEL SECURITY;\n",
+						  qualrelname);
+
+	if (tbinfo->forcecolmask)
+		appendPQExpBuffer(q, "\nALTER TABLE ONLY %s FORCE COLUMN MASKING;\n",
 						  qualrelname);
 
 	appendPQExpBuffer(delq, "DROP %s %s;\n", reltypename, qualrelname);

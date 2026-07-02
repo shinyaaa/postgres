@@ -980,6 +980,12 @@ equalPolicy(RowSecurityPolicy *policy1, RowSecurityPolicy *policy2)
 
 		if (policy1->polcmd != policy2->polcmd)
 			return false;
+		if (policy1->permissive != policy2->permissive)
+			return false;
+		if (policy1->masking != policy2->masking)
+			return false;
+		if (policy1->maskattnum != policy2->maskattnum)
+			return false;
 		if (policy1->hassublinks != policy2->hassublinks)
 			return false;
 		if (strcmp(policy1->policy_name, policy2->policy_name) != 0)
@@ -999,6 +1005,8 @@ equalPolicy(RowSecurityPolicy *policy1, RowSecurityPolicy *policy2)
 		if (!equal(policy1->qual, policy2->qual))
 			return false;
 		if (!equal(policy1->with_check_qual, policy2->with_check_qual))
+			return false;
+		if (!equal(policy1->mask_expr, policy2->mask_expr))
 			return false;
 	}
 	else if (policy2 != NULL)
@@ -1258,7 +1266,7 @@ retry:
 	else
 		relation->trigdesc = NULL;
 
-	if (relation->rd_rel->relrowsecurity)
+	if (relation->rd_rel->relrowsecurity || relation->rd_rel->relcolmasking)
 		RelationBuildRowSecurity(relation);
 	else
 		relation->rd_rsdesc = NULL;
@@ -4344,7 +4352,8 @@ RelationCacheInitializePhase3(void)
 		 * RelationBuildRowSecurity will create a single default-deny policy
 		 * if there is no policy defined in pg_policy.
 		 */
-		if (relation->rd_rel->relrowsecurity && relation->rd_rsdesc == NULL)
+		if ((relation->rd_rel->relrowsecurity ||
+			 relation->rd_rel->relcolmasking) && relation->rd_rsdesc == NULL)
 		{
 			RelationBuildRowSecurity(relation);
 

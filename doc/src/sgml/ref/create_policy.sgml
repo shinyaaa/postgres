@@ -22,11 +22,12 @@ PostgreSQL documentation
  <refsynopsisdiv>
 <synopsis>
 CREATE POLICY <replaceable class="parameter">name</replaceable> ON <replaceable class="parameter">table_name</replaceable>
-    [ AS { PERMISSIVE | RESTRICTIVE } ]
+    [ AS { PERMISSIVE | RESTRICTIVE | MASKING } ]
     [ FOR { ALL | SELECT | INSERT | UPDATE | DELETE } ]
     [ TO { <replaceable class="parameter">role_name</replaceable> | PUBLIC | CURRENT_ROLE | CURRENT_USER | SESSION_USER } [, ...] ]
     [ USING ( <replaceable class="parameter">using_expression</replaceable> ) ]
     [ WITH CHECK ( <replaceable class="parameter">check_expression</replaceable> ) ]
+    [ MASK ( <replaceable class="parameter">column_name</replaceable> WITH <replaceable class="parameter">mask_expression</replaceable> ) ]
 </synopsis>
  </refsynopsisdiv>
 
@@ -161,6 +162,55 @@ CREATE POLICY <replaceable class="parameter">name</replaceable> ON <replaceable 
    </varlistentry>
 
    <varlistentry>
+    <term><literal>MASKING</literal></term>
+    <listitem>
+     <para>
+      Specify that the policy is to be created as a column masking policy.
+      A masking policy does not affect which rows are visible; instead,
+      when the policy applies to the user reading the table, references to
+      the masked column yield the value of the
+      <replaceable class="parameter">mask_expression</replaceable> instead
+      of the stored value.  If a <literal>USING</literal> clause is given,
+      rows for which the expression returns true show the stored value,
+      while other rows show the masked value.  Masking policies are only
+      applied when column masking is enabled on the table with
+      <command>ALTER TABLE ... ENABLE COLUMN MASKING</command>.
+     </para>
+
+     <para>
+      Masking policies apply when the table is read, so they are
+      implicitly <literal>FOR SELECT</literal>, and cannot have a
+      <literal>WITH CHECK</literal> clause.  A column may have at most one
+      masking policy, regardless of the roles the policies apply to.
+     </para>
+
+     <para>
+      The masked value is substituted throughout the query, including in
+      <literal>WHERE</literal> clauses, join conditions and whole-row
+      references, so that stored values cannot be inferred by probing with
+      predicates.  As a consequence, a user subject to masking cannot use
+      the stored values of the masked column for searching or joining, and
+      masked columns of the target relation of an
+      <command>INSERT</command>, <command>UPDATE</command>,
+      <command>DELETE</command> or <command>MERGE</command> command cannot
+      be referenced at all (assigning a new value to a masked column is
+      allowed, though).  <literal>SELECT ... FOR UPDATE/SHARE</literal>
+      is not supported on relations with applicable masking policies.
+     </para>
+
+     <para>
+      Like row-level security, column masking is not applied to the table
+      owner (unless <command>ALTER TABLE ... FORCE COLUMN
+      MASKING</command> is used) or to roles with the
+      <literal>BYPASSRLS</literal> attribute, and setting
+      <xref linkend="guc-row-security"/> to <literal>off</literal> causes
+      queries which would be affected by masking to fail rather than
+      silently return masked or unmasked data.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
     <term><replaceable class="parameter">command</replaceable></term>
     <listitem>
      <para>
@@ -218,6 +268,19 @@ CREATE POLICY <replaceable class="parameter">name</replaceable> ON <replaceable 
       the <replaceable class="parameter">check_expression</replaceable> is
       evaluated against the proposed new contents of the row, not the
       original contents.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term><replaceable class="parameter">column_name</replaceable> <literal>WITH</literal> <replaceable class="parameter">mask_expression</replaceable></term>
+    <listitem>
+     <para>
+      For a <literal>MASKING</literal> policy, the column to be masked and
+      the SQL expression whose value is returned in place of the stored
+      value.  The expression may reference columns of the same row and
+      must be coercible to the type of the masked column.  It cannot
+      contain aggregate or window functions.
      </para>
     </listitem>
    </varlistentry>

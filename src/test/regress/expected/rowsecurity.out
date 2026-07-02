@@ -386,7 +386,7 @@ CREATE POLICY p1 ON document AS UGLY
 ERROR:  unrecognized row security option "ugly"
 LINE 1: CREATE POLICY p1 ON document AS UGLY
                                         ^
-HINT:  Only PERMISSIVE or RESTRICTIVE policies are supported currently.
+HINT:  Only PERMISSIVE, RESTRICTIVE, or MASKING policies are supported currently.
 -- but Dave isn't allowed to anything at cid 50 or above
 -- this is to make sure that we sort the policies by name first
 -- when applying WITH CHECK, a later INSERT by Dave should fail due
@@ -442,13 +442,13 @@ Policies:
       USING (((cid <> 44) AND (cid < 50)))
 
 SELECT * FROM pg_policies WHERE schemaname = 'regress_rls_schema' AND tablename = 'document' ORDER BY policyname;
-     schemaname     | tablename | policyname | permissive  |       roles        | cmd |                    qual                    | with_check 
---------------------+-----------+------------+-------------+--------------------+-----+--------------------------------------------+------------
- regress_rls_schema | document  | p1         | PERMISSIVE  | {public}           | ALL | (dlevel <= ( SELECT uaccount.seclv        +| 
-                    |           |            |             |                    |     |    FROM uaccount                          +| 
-                    |           |            |             |                    |     |   WHERE (uaccount.pguser = CURRENT_USER))) | 
- regress_rls_schema | document  | p1r        | RESTRICTIVE | {regress_rls_dave} | ALL | (cid <> 44)                                | 
- regress_rls_schema | document  | p2r        | RESTRICTIVE | {regress_rls_dave} | ALL | ((cid <> 44) AND (cid < 50))               | 
+     schemaname     | tablename | policyname | permissive  |       roles        | cmd |                    qual                    | with_check | masked_column | mask_expression 
+--------------------+-----------+------------+-------------+--------------------+-----+--------------------------------------------+------------+---------------+-----------------
+ regress_rls_schema | document  | p1         | PERMISSIVE  | {public}           | ALL | (dlevel <= ( SELECT uaccount.seclv        +|            |               | 
+                    |           |            |             |                    |     |    FROM uaccount                          +|            |               | 
+                    |           |            |             |                    |     |   WHERE (uaccount.pguser = CURRENT_USER))) |            |               | 
+ regress_rls_schema | document  | p1r        | RESTRICTIVE | {regress_rls_dave} | ALL | (cid <> 44)                                |            |               | 
+ regress_rls_schema | document  | p2r        | RESTRICTIVE | {regress_rls_dave} | ALL | ((cid <> 44) AND (cid < 50))               |            |               | 
 (3 rows)
 
 -- viewpoint from regress_rls_bob
@@ -1267,12 +1267,12 @@ Partitions:
     part_document_satire FOR VALUES FROM (55) TO (56)
 
 SELECT * FROM pg_policies WHERE schemaname = 'regress_rls_schema' AND tablename like '%part_document%' ORDER BY policyname;
-     schemaname     |   tablename   | policyname | permissive  |       roles        | cmd |                    qual                    | with_check 
---------------------+---------------+------------+-------------+--------------------+-----+--------------------------------------------+------------
- regress_rls_schema | part_document | pp1        | PERMISSIVE  | {public}           | ALL | (dlevel <= ( SELECT uaccount.seclv        +| 
-                    |               |            |             |                    |     |    FROM uaccount                          +| 
-                    |               |            |             |                    |     |   WHERE (uaccount.pguser = CURRENT_USER))) | 
- regress_rls_schema | part_document | pp1r       | RESTRICTIVE | {regress_rls_dave} | ALL | (cid < 55)                                 | 
+     schemaname     |   tablename   | policyname | permissive  |       roles        | cmd |                    qual                    | with_check | masked_column | mask_expression 
+--------------------+---------------+------------+-------------+--------------------+-----+--------------------------------------------+------------+---------------+-----------------
+ regress_rls_schema | part_document | pp1        | PERMISSIVE  | {public}           | ALL | (dlevel <= ( SELECT uaccount.seclv        +|            |               | 
+                    |               |            |             |                    |     |    FROM uaccount                          +|            |               | 
+                    |               |            |             |                    |     |   WHERE (uaccount.pguser = CURRENT_USER))) |            |               | 
+ regress_rls_schema | part_document | pp1r       | RESTRICTIVE | {regress_rls_dave} | ALL | (cid < 55)                                 |            |               | 
 (2 rows)
 
 -- viewpoint from regress_rls_bob

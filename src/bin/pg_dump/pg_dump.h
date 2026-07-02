@@ -321,6 +321,8 @@ typedef struct _tableInfo
 	bool		hascolumnACLs;	/* do any columns have non-default ACLs? */
 	bool		rowsec;			/* is row security enabled? */
 	bool		forcerowsec;	/* is row security forced? */
+	bool		colmask;		/* is column masking enabled? */
+	bool		forcecolmask;	/* is column masking forced? */
 	bool		hasoids;		/* does it have OIDs? */
 	uint32		frozenxid;		/* table's relfrozenxid */
 	uint32		minmxid;		/* table's relminmxid */
@@ -655,12 +657,16 @@ typedef struct _policyInfo
 {
 	DumpableObject dobj;
 	TableInfo  *poltable;
-	char	   *polname;		/* null indicates RLS is enabled on rel */
+	char	   *polname;		/* null indicates RLS (or column masking, per
+								 * polmasking) is enabled on rel */
 	char		polcmd;
 	bool		polpermissive;
+	bool		polmasking;
 	char	   *polroles;
 	char	   *polqual;
 	char	   *polwithcheck;
+	char	   *polmaskcol;
+	char	   *polmaskexpr;
 } PolicyInfo;
 
 /*

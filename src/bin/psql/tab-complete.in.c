@@ -2832,6 +2832,7 @@ match_previous_words(int pattern_id,
 					  "OWNER TO", "SET", "VALIDATE CONSTRAINT",
 					  "REPLICA IDENTITY", "ATTACH PARTITION",
 					  "DETACH PARTITION", "FORCE ROW LEVEL SECURITY",
+					  "FORCE COLUMN MASKING",
 					  "SPLIT PARTITION", "MERGE PARTITIONS (",
 					  "OF", "NOT OF");
 	/* ALTER TABLE xxx ADD */
@@ -2889,8 +2890,8 @@ match_previous_words(int pattern_id,
 	}
 	/* ALTER TABLE xxx ENABLE */
 	else if (Matches("ALTER", "TABLE", MatchAny, "ENABLE"))
-		COMPLETE_WITH("ALWAYS", "REPLICA", "ROW LEVEL SECURITY", "RULE",
-					  "TRIGGER");
+		COMPLETE_WITH("ALWAYS", "COLUMN MASKING", "REPLICA",
+					  "ROW LEVEL SECURITY", "RULE", "TRIGGER");
 	else if (Matches("ALTER", "TABLE", MatchAny, "ENABLE", "REPLICA|ALWAYS"))
 		COMPLETE_WITH("RULE", "TRIGGER");
 	else if (Matches("ALTER", "TABLE", MatchAny, "ENABLE", "RULE"))
@@ -2918,13 +2919,15 @@ match_previous_words(int pattern_id,
 		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_tables);
 	/* ALTER TABLE xxx NO */
 	else if (Matches("ALTER", "TABLE", MatchAny, "NO"))
-		COMPLETE_WITH("FORCE ROW LEVEL SECURITY", "INHERIT");
+		COMPLETE_WITH("FORCE ROW LEVEL SECURITY", "FORCE COLUMN MASKING",
+					  "INHERIT");
 	/* ALTER TABLE xxx NO INHERIT */
 	else if (Matches("ALTER", "TABLE", MatchAny, "NO", "INHERIT"))
 		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_tables);
 	/* ALTER TABLE xxx DISABLE */
 	else if (Matches("ALTER", "TABLE", MatchAny, "DISABLE"))
-		COMPLETE_WITH("ROW LEVEL SECURITY", "RULE", "TRIGGER");
+		COMPLETE_WITH("COLUMN MASKING", "ROW LEVEL SECURITY", "RULE",
+					  "TRIGGER");
 	else if (Matches("ALTER", "TABLE", MatchAny, "DISABLE", "RULE"))
 	{
 		set_completion_reference(prev3_wd);
@@ -3650,9 +3653,9 @@ match_previous_words(int pattern_id,
 	/* Complete "CREATE POLICY <name> ON <table> AS|FOR|TO|USING|WITH CHECK" */
 	else if (Matches("CREATE", "POLICY", MatchAny, "ON", MatchAny))
 		COMPLETE_WITH("AS", "FOR", "TO", "USING (", "WITH CHECK (");
-	/* CREATE POLICY <name> ON <table> AS PERMISSIVE|RESTRICTIVE */
+	/* CREATE POLICY <name> ON <table> AS PERMISSIVE|RESTRICTIVE|MASKING */
 	else if (Matches("CREATE", "POLICY", MatchAny, "ON", MatchAny, "AS"))
-		COMPLETE_WITH("PERMISSIVE", "RESTRICTIVE");
+		COMPLETE_WITH("PERMISSIVE", "RESTRICTIVE", "MASKING");
 
 	/*
 	 * CREATE POLICY <name> ON <table> AS PERMISSIVE|RESTRICTIVE

@@ -735,6 +735,8 @@ static void ATExecReplicaIdentity(Relation rel, ReplicaIdentityStmt *stmt, LOCKM
 static void ATExecGenericOptions(Relation rel, List *options);
 static void ATExecSetRowSecurity(Relation rel, bool rls);
 static void ATExecForceNoForceRowSecurity(Relation rel, bool force_rls);
+static void ATExecSetColumnMasking(Relation rel, bool masking);
+static void ATExecForceNoForceColumnMasking(Relation rel, bool force_masking);
 static ObjectAddress ATExecSetCompression(Relation rel,
 										  const char *column, Node *newValue, LOCKMODE lockmode);
 
@@ -4766,6 +4768,10 @@ AlterTableGetLockLevel(List *cmds)
 			case AT_DisableRowSecurity:
 			case AT_ForceRowSecurity:
 			case AT_NoForceRowSecurity:
+			case AT_EnableColumnMasking:
+			case AT_DisableColumnMasking:
+			case AT_ForceColumnMasking:
+			case AT_NoForceColumnMasking:
 			case AT_AddIdentity:
 			case AT_DropIdentity:
 			case AT_SetIdentity:
@@ -5314,6 +5320,10 @@ ATPrepCmd(List **wqueue, Relation rel, AlterTableCmd *cmd,
 		case AT_DisableRowSecurity:
 		case AT_ForceRowSecurity:
 		case AT_NoForceRowSecurity:
+		case AT_EnableColumnMasking:
+		case AT_DisableColumnMasking:
+		case AT_ForceColumnMasking:
+		case AT_NoForceColumnMasking:
 			ATSimplePermissions(cmd->subtype, rel,
 								ATT_TABLE | ATT_PARTITIONED_TABLE);
 			/* These commands never recurse */
@@ -5715,6 +5725,18 @@ ATExecCmd(List **wqueue, AlteredTableInfo *tab,
 			break;
 		case AT_NoForceRowSecurity:
 			ATExecForceNoForceRowSecurity(rel, false);
+			break;
+		case AT_EnableColumnMasking:
+			ATExecSetColumnMasking(rel, true);
+			break;
+		case AT_DisableColumnMasking:
+			ATExecSetColumnMasking(rel, false);
+			break;
+		case AT_ForceColumnMasking:
+			ATExecForceNoForceColumnMasking(rel, true);
+			break;
+		case AT_NoForceColumnMasking:
+			ATExecForceNoForceColumnMasking(rel, false);
 			break;
 		case AT_GenericOptions:
 			ATExecGenericOptions(rel, (List *) cmd->def);
@@ -6793,6 +6815,14 @@ alter_table_type_to_string(AlterTableType cmdtype)
 			return "FORCE ROW SECURITY";
 		case AT_NoForceRowSecurity:
 			return "NO FORCE ROW SECURITY";
+		case AT_EnableColumnMasking:
+			return "ENABLE COLUMN MASKING";
+		case AT_DisableColumnMasking:
+			return "DISABLE COLUMN MASKING";
+		case AT_ForceColumnMasking:
+			return "FORCE COLUMN MASKING";
+		case AT_NoForceColumnMasking:
+			return "NO FORCE COLUMN MASKING";
 		case AT_GenericOptions:
 			return "OPTIONS";
 		case AT_AttachPartition:
@@ -18895,6 +18925,65 @@ ATExecForceNoForceRowSecurity(Relation rel, bool force_rls)
 		elog(ERROR, "cache lookup failed for relation %u", relid);
 
 	((Form_pg_class) GETSTRUCT(tuple))->relforcerowsecurity = force_rls;
+	CatalogTupleUpdate(pg_class, &tuple->t_self, tuple);
+
+	InvokeObjectPostAlterHook(RelationRelationId,
+							  RelationGetRelid(rel), 0);
+
+	table_close(pg_class, RowExclusiveLock);
+	heap_freetuple(tuple);
+}
+
+/*
+ * ALTER TABLE ENABLE/DISABLE COLUMN MASKING
+ */
+static void
+ATExecSetColumnMasking(Relation rel, bool masking)
+{
+	Relation	pg_class;
+	Oid			relid;
+	HeapTuple	tuple;
+
+	relid = RelationGetRelid(rel);
+
+	/* Pull the record for this relation and update it */
+	pg_class = table_open(RelationRelationId, RowExclusiveLock);
+
+	tuple = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(relid));
+
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "cache lookup failed for relation %u", relid);
+
+	((Form_pg_class) GETSTRUCT(tuple))->relcolmasking = masking;
+	CatalogTupleUpdate(pg_class, &tuple->t_self, tuple);
+
+	InvokeObjectPostAlterHook(RelationRelationId,
+							  RelationGetRelid(rel), 0);
+
+	table_close(pg_class, RowExclusiveLock);
+	heap_freetuple(tuple);
+}
+
+/*
+ * ALTER TABLE FORCE/NO FORCE COLUMN MASKING
+ */
+static void
+ATExecForceNoForceColumnMasking(Relation rel, bool force_masking)
+{
+	Relation	pg_class;
+	Oid			relid;
+	HeapTuple	tuple;
+
+	relid = RelationGetRelid(rel);
+
+	pg_class = table_open(RelationRelationId, RowExclusiveLock);
+
+	tuple = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(relid));
+
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "cache lookup failed for relation %u", relid);
+
+	((Form_pg_class) GETSTRUCT(tuple))->relforcecolmasking = force_masking;
 	CatalogTupleUpdate(pg_class, &tuple->t_self, tuple);
 
 	InvokeObjectPostAlterHook(RelationRelationId,

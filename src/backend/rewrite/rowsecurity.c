@@ -545,6 +545,146 @@ get_row_security_policies(Query *root, RangeTblEntry *rte, int rt_index,
 }
 
 /*
+ * get_column_masks
+ *
+ * Get the column masking expressions that should be applied to the specified
+ * RTE for the current user.  For each masked column, an expression is
+ * returned which is to be substituted for references to that column; the
+ * expression's Vars reference the relation at varno 1, which is suitable for
+ * use in the single-relation subquery that the rewriter builds to apply
+ * masking (see fireRIRrules).
+ *
+ * If a masking policy has a USING qual, the mask is applied conditionally:
+ * rows satisfying the qual show the original value, while other rows show
+ * the result of the masking expression.  This is implemented by wrapping the
+ * masking expression in a CASE.
+ *
+ * maskattnos and maskexprs receive parallel lists of the masked columns'
+ * attribute numbers and their replacement expressions.  hasColumnMasks is
+ * set to true if column masking affects this RTE (even if no masks apply to
+ * the current user), so that the plan can be invalidated if the environment
+ * changes.  hasSubLinks is set to true if any returned expression contains
+ * sublink subqueries.
+ */
+void
+get_column_masks(Query *root, RangeTblEntry *rte,
+				 List **maskattnos, List **maskexprs,
+				 bool *hasColumnMasks, bool *hasSubLinks)
+{
+	Oid			user_id;
+	int			colmask_status;
+	Relation	rel;
+	TupleDesc	tupdesc;
+	RTEPermissionInfo *perminfo;
+	ListCell   *item;
+
+	/* Defaults for the return values */
+	*maskattnos = NIL;
+	*maskexprs = NIL;
+	*hasColumnMasks = false;
+	*hasSubLinks = false;
+
+	Assert(rte->rtekind == RTE_RELATION);
+
+	/* If this is not a normal relation, just return immediately */
+	if (rte->relkind != RELKIND_RELATION &&
+		rte->relkind != RELKIND_PARTITIONED_TABLE)
+		return;
+
+	perminfo = getRTEPermissionInfo(root->rteperminfos, rte);
+
+	/* Switch to checkAsUser if it's set */
+	user_id = OidIsValid(perminfo->checkAsUser) ?
+		perminfo->checkAsUser : GetUserId();
+
+	/* Determine the state of column masking for this relation */
+	colmask_status = check_enable_colmask(rte->relid, perminfo->checkAsUser,
+										  false);
+
+	/* If there is no column masking on this table at all, nothing to do */
+	if (colmask_status == RLS_NONE)
+		return;
+
+	/*
+	 * RLS_NONE_ENV means that masking is not applied now, but that may
+	 * change if the environment (the role or the row_security GUC) changes,
+	 * so we must mark the query to force a re-plan in that case.
+	 */
+	*hasColumnMasks = true;
+
+	if (colmask_status == RLS_NONE_ENV)
+		return;
+
+	/*
+	 * Column masking is enabled for this relation, so collect up the masks
+	 * which apply to the current role.
+	 */
+	rel = table_open(rte->relid, NoLock);
+	tupdesc = RelationGetDescr(rel);
+
+	foreach(item, rel->rd_rsdesc->policies)
+	{
+		RowSecurityPolicy *policy = (RowSecurityPolicy *) lfirst(item);
+		Form_pg_attribute att;
+		Expr	   *maskexpr;
+
+		if (!policy->masking)
+			continue;
+
+		if (!check_role_for_policy(policy->roles, user_id))
+			continue;
+
+		/* Defend against dropped or bogus attribute numbers */
+		if (policy->maskattnum <= 0 ||
+			policy->maskattnum > tupdesc->natts)
+			continue;
+		att = TupleDescAttr(tupdesc, policy->maskattnum - 1);
+		if (att->attisdropped)
+			continue;
+
+		if (policy->qual != NULL)
+		{
+			/*
+			 * Conditional mask: rows satisfying the policy's USING qual show
+			 * the original value; all other rows are masked.
+			 */
+			CaseExpr   *caseexpr = makeNode(CaseExpr);
+			CaseWhen   *whenclause = makeNode(CaseWhen);
+
+			whenclause->expr = copyObject(policy->qual);
+			whenclause->result = (Expr *)
+				makeVar(1, policy->maskattnum,
+						att->atttypid, att->atttypmod, att->attcollation,
+						0);
+			whenclause->location = -1;
+
+			caseexpr->casetype = att->atttypid;
+			caseexpr->casecollid = att->attcollation;
+			caseexpr->arg = NULL;
+			caseexpr->args = list_make1(whenclause);
+			caseexpr->defresult = copyObject(policy->mask_expr);
+			caseexpr->location = -1;
+
+			maskexpr = (Expr *) caseexpr;
+		}
+		else
+			maskexpr = copyObject(policy->mask_expr);
+
+		*maskattnos = lappend_int(*maskattnos, policy->maskattnum);
+		*maskexprs = lappend(*maskexprs, maskexpr);
+		*hasSubLinks |= policy->hassublinks;
+	}
+
+	table_close(rel, NoLock);
+
+	/*
+	 * Copy checkAsUser to the mask expressions, in case they contain any
+	 * subqueries referring to other relations.
+	 */
+	setRuleCheckAsUser((Node *) *maskexprs, perminfo->checkAsUser);
+}
+
+/*
  * get_policies_for_relation
  *
  * Returns lists of permissive and restrictive policies to be applied to the
@@ -567,6 +707,13 @@ get_policies_for_relation(Relation relation, CmdType cmd, Oid user_id,
 	{
 		bool		cmd_matches = false;
 		RowSecurityPolicy *policy = (RowSecurityPolicy *) lfirst(item);
+
+		/*
+		 * Masking policies do not affect the visibility of rows; they are
+		 * handled separately, by get_column_masks().
+		 */
+		if (policy->masking)
+			continue;
 
 		/* Always add ALL policies, if they exist. */
 		if (policy->polcmd == '*')

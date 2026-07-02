@@ -3363,6 +3363,68 @@ SELECT * FROM information WHERE group_id = 2 FOR UPDATE;
    and <xref linkend="sql-altertable"/>.
   </para>
 
+  <sect2 id="ddl-rowsecurity-column-masking">
+   <title>Column Masking</title>
+
+   <indexterm zone="ddl-rowsecurity-column-masking">
+    <primary>column masking</primary>
+   </indexterm>
+
+   <para>
+    In addition to filtering out entire rows, the policy machinery can be
+    used to <firstterm>mask</firstterm> the values of individual columns:
+    rows remain visible, but references to a masked column yield the value
+    of a masking expression instead of the stored value.  Masking policies
+    are created with <command>CREATE POLICY ... AS MASKING</command> and
+    are applied only after column masking has been enabled on the table
+    with <command>ALTER TABLE ... ENABLE COLUMN MASKING</command>.  Unlike
+    row-level security, enabling column masking without any masking
+    policies has no effect; columns without a masking policy are simply
+    not masked.
+   </para>
+
+   <para>
+    A masking policy can be made conditional on the row's contents by
+    giving it a <literal>USING</literal> clause: rows for which the
+    expression returns true show the stored value, while all other rows
+    show the masked value.  For example, the following allows every user
+    to see the list of employees, while social security numbers are only
+    shown in full to each employee's manager:
+   </para>
+
+<programlisting>
+CREATE TABLE employees (
+    name     text,
+    ssn      text,
+    manager  name
+);
+
+GRANT SELECT ON employees TO public;
+
+CREATE POLICY mask_ssn ON employees
+    AS MASKING
+    USING (manager = current_user)
+    MASK (ssn WITH '***-**-' || right(ssn, 4));
+
+ALTER TABLE employees ENABLE COLUMN MASKING;
+</programlisting>
+
+   <para>
+    The masked value is substituted everywhere the column is referenced,
+    including in <literal>WHERE</literal> clauses and join conditions, so
+    stored values cannot be inferred by probing with predicates.  Masking
+    is bypassed by the table owner (unless <literal>FORCE COLUMN
+    MASKING</literal> is set) and by roles with the
+    <literal>BYPASSRLS</literal> attribute, following the same rules as
+    row-level security.  Note that, as with row-level security, masking
+    policies are not applied to referential integrity checks or when rows
+    are accessed below the SQL level (for example, by streaming
+    replication); and the table owner or a superuser can always see the
+    stored values, so masking is no substitute for revoking privileges on
+    data that a user must not be able to access at all.
+   </para>
+  </sect2>
+
  </sect1>
 
  <sect1 id="ddl-schemas">

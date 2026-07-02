@@ -238,8 +238,16 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 		 *
 		 * If RLS is not enabled for this, then just fall through to the
 		 * normal non-filtering relation handling.
+		 *
+		 * Similarly, if the relation has column masking policies which are
+		 * to be applied, COPY TO must be performed as a "query" copy so
+		 * that the masking expressions are substituted by the rewriter.
+		 * Column masking does not affect COPY FROM, which does not read
+		 * existing data.
 		 */
-		if (check_enable_rls(relid, InvalidOid, false) == RLS_ENABLED)
+		if (check_enable_rls(relid, InvalidOid, false) == RLS_ENABLED ||
+			(!is_from &&
+			 check_enable_colmask(relid, InvalidOid, false) == RLS_ENABLED))
 		{
 			SelectStmt *select;
 			ColumnRef  *cr;

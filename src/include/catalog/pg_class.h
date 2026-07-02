@@ -115,6 +115,12 @@ CATALOG(pg_class,1259,RelationRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(83,Relat
 	/* row security forced for owners or not */
 	bool		relforcerowsecurity BKI_DEFAULT(f);
 
+	/* column masking is enabled or not */
+	bool		relcolmasking BKI_DEFAULT(f);
+
+	/* column masking forced for owners or not */
+	bool		relforcecolmasking BKI_DEFAULT(f);
+
 	/* matview currently holds query results */
 	bool		relispopulated BKI_DEFAULT(t);
 

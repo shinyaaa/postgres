@@ -36,12 +36,15 @@ CATALOG(pg_policy,3256,PolicyRelationId)
 												 * policy. */
 	char		polcmd;			/* One of ACL_*_CHR, or '*' for all */
 	bool		polpermissive;	/* restrictive or permissive policy */
+	bool		polmasking;		/* is this a column masking policy? */
+	int16		polmaskattnum;	/* masked column, or 0 if not masking */
 
 #ifdef CATALOG_VARLEN
 	/* Roles to which the policy is applied; zero means PUBLIC */
 	Oid			polroles[1] BKI_LOOKUP_OPT(pg_authid) BKI_FORCE_NOT_NULL;
 	pg_node_tree polqual;		/* Policy quals. */
 	pg_node_tree polwithcheck;	/* WITH CHECK quals. */
+	pg_node_tree polmaskexpr;	/* Masking expression. */
 #endif
 } FormData_pg_policy;
 

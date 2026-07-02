@@ -3043,7 +3043,8 @@ _tocEntryRequired(TocEntry *te, teSection curSection, ArchiveHandle *AH)
 	/* If it's a policy, maybe ignore it */
 	if (ropt->no_policies &&
 		(strcmp(te->desc, "POLICY") == 0 ||
-		 strcmp(te->desc, "ROW SECURITY") == 0))
+		 strcmp(te->desc, "ROW SECURITY") == 0 ||
+		 strcmp(te->desc, "COLUMN MASKING") == 0))
 		return 0;
 
 	/*
@@ -3911,6 +3912,7 @@ _getObjectDescription(PQExpBuffer buf, const TocEntry *te)
 			 strcmp(type, "RULE") == 0 ||
 			 strcmp(type, "TRIGGER") == 0 ||
 			 strcmp(type, "ROW SECURITY") == 0 ||
+			 strcmp(type, "COLUMN MASKING") == 0 ||
 			 strcmp(type, "POLICY") == 0 ||
 			 strcmp(type, "USER MAPPING") == 0)
 	{

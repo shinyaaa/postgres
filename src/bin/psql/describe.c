@@ -2834,17 +2834,24 @@ describeOneTableDetails(const char *schemaname,
 			else
 				appendPQExpBufferStr(&buf,
 									 " 't' as polpermissive,\n");
+			appendPQExpBufferStr(&buf,
+								 "  CASE WHEN pol.polroles = '{0}' THEN NULL ELSE pg_catalog.array_to_string(array(select rolname from pg_catalog.pg_roles where oid = any (pol.polroles) order by 1),',') END,\n"
+								 "  pg_catalog.pg_get_expr(pol.polqual, pol.polrelid),\n"
+								 "  pg_catalog.pg_get_expr(pol.polwithcheck, pol.polrelid),\n"
+								 "  CASE pol.polcmd\n"
+								 "    WHEN 'r' THEN 'SELECT'\n"
+								 "    WHEN 'a' THEN 'INSERT'\n"
+								 "    WHEN 'w' THEN 'UPDATE'\n"
+								 "    WHEN 'd' THEN 'DELETE'\n"
+								 "    END AS cmd");
+			if (pset.sversion >= 190000)
+				appendPQExpBufferStr(&buf,
+									 ",\n  pol.polmasking,\n"
+									 "  (SELECT a.attname FROM pg_catalog.pg_attribute a\n"
+									 "   WHERE a.attrelid = pol.polrelid AND a.attnum = pol.polmaskattnum) AS maskcol,\n"
+									 "  pg_catalog.pg_get_expr(pol.polmaskexpr, pol.polrelid) AS maskexpr");
 			appendPQExpBuffer(&buf,
-							  "  CASE WHEN pol.polroles = '{0}' THEN NULL ELSE pg_catalog.array_to_string(array(select rolname from pg_catalog.pg_roles where oid = any (pol.polroles) order by 1),',') END,\n"
-							  "  pg_catalog.pg_get_expr(pol.polqual, pol.polrelid),\n"
-							  "  pg_catalog.pg_get_expr(pol.polwithcheck, pol.polrelid),\n"
-							  "  CASE pol.polcmd\n"
-							  "    WHEN 'r' THEN 'SELECT'\n"
-							  "    WHEN 'a' THEN 'INSERT'\n"
-							  "    WHEN 'w' THEN 'UPDATE'\n"
-							  "    WHEN 'd' THEN 'DELETE'\n"
-							  "    END AS cmd\n"
-							  "FROM pg_catalog.pg_policy pol\n"
+							  "\nFROM pg_catalog.pg_policy pol\n"
 							  "WHERE pol.polrelid = '%s' ORDER BY 1;",
 							  oid);
 
@@ -2877,13 +2884,20 @@ describeOneTableDetails(const char *schemaname,
 			/* Might be an empty set - that's ok */
 			for (i = 0; i < tuples; i++)
 			{
+				bool		masking;
+
+				masking = pset.sversion >= 190000 &&
+					*(PQgetvalue(result, i, 6)) == 't';
+
 				printfPQExpBuffer(&buf, "    POLICY \"%s\"",
 								  PQgetvalue(result, i, 0));
 
-				if (*(PQgetvalue(result, i, 1)) == 'f')
+				if (masking)
+					appendPQExpBufferStr(&buf, " AS MASKING");
+				else if (*(PQgetvalue(result, i, 1)) == 'f')
 					appendPQExpBufferStr(&buf, " AS RESTRICTIVE");
 
-				if (!PQgetisnull(result, i, 5))
+				if (!masking && !PQgetisnull(result, i, 5))
 					appendPQExpBuffer(&buf, " FOR %s",
 									  PQgetvalue(result, i, 5));
 
@@ -2900,6 +2914,11 @@ describeOneTableDetails(const char *schemaname,
 				if (!PQgetisnull(result, i, 4))
 					appendPQExpBuffer(&buf, "\n      WITH CHECK (%s)",
 									  PQgetvalue(result, i, 4));
+
+				if (masking)
+					appendPQExpBuffer(&buf, "\n      MASK (%s WITH %s)",
+									  PQgetvalue(result, i, 7),
+									  PQgetvalue(result, i, 8));
 
 				printTableAddFooter(&cont, buf.data);
 			}

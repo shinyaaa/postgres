@@ -28,9 +28,12 @@
 #include "catalog/pg_type.h"
 #include "commands/policy.h"
 #include "miscadmin.h"
+#include "nodes/nodeFuncs.h"
 #include "nodes/pg_list.h"
 #include "parser/parse_clause.h"
+#include "parser/parse_coerce.h"
 #include "parser/parse_collate.h"
+#include "parser/parse_expr.h"
 #include "parser/parse_node.h"
 #include "parser/parse_relation.h"
 #include "rewrite/rewriteManip.h"
@@ -253,6 +256,10 @@ RelationBuildRowSecurity(Relation relation)
 		/* Get policy, permissive or restrictive */
 		policy->permissive = policy_form->polpermissive;
 
+		/* Get column masking information */
+		policy->masking = policy_form->polmasking;
+		policy->maskattnum = policy_form->polmaskattnum;
+
 		/* Get policy name */
 		policy->policy_name =
 			MemoryContextStrdup(rscxt, NameStr(policy_form->polname));
@@ -295,9 +302,24 @@ RelationBuildRowSecurity(Relation relation)
 		else
 			policy->with_check_qual = NULL;
 
+		/* Get masking expression */
+		datum = heap_getattr(tuple, Anum_pg_policy_polmaskexpr,
+							 RelationGetDescr(catalog), &isnull);
+		if (!isnull)
+		{
+			str_value = TextDatumGetCString(datum);
+			MemoryContextSwitchTo(rscxt);
+			policy->mask_expr = (Expr *) stringToNode(str_value);
+			MemoryContextSwitchTo(oldcxt);
+			pfree(str_value);
+		}
+		else
+			policy->mask_expr = NULL;
+
 		/* We want to cache whether there are SubLinks in these expressions */
 		policy->hassublinks = checkExprHasSubLink((Node *) policy->qual) ||
-			checkExprHasSubLink((Node *) policy->with_check_qual);
+			checkExprHasSubLink((Node *) policy->with_check_qual) ||
+			checkExprHasSubLink((Node *) policy->mask_expr);
 
 		/*
 		 * Add this object to list.  For historical reasons, the list is built
@@ -578,9 +600,12 @@ CreatePolicy(CreatePolicyStmt *stmt)
 	ArrayType  *role_ids;
 	ParseState *qual_pstate;
 	ParseState *with_check_pstate;
+	ParseState *mask_pstate;
 	ParseNamespaceItem *nsitem;
 	Node	   *qual;
 	Node	   *with_check_qual;
+	Node	   *mask_expr = NULL;
+	AttrNumber	maskattnum = InvalidAttrNumber;
 	ScanKeyData skey[2];
 	SysScanDesc sscan;
 	HeapTuple	policy_tuple;
@@ -592,6 +617,26 @@ CreatePolicy(CreatePolicyStmt *stmt)
 
 	/* Parse command */
 	polcmd = parse_policy_command(stmt->cmd_name);
+
+	/*
+	 * Masking policies apply when the table is read, so they are implicitly
+	 * FOR SELECT.  We accept the default of "all" (mapping it to SELECT) but
+	 * reject the other commands.
+	 */
+	if (stmt->masking)
+	{
+		if (polcmd == '*')
+			polcmd = ACL_SELECT_CHR;
+		else if (polcmd != ACL_SELECT_CHR)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("MASKING policies can only be defined FOR SELECT")));
+
+		if (stmt->with_check != NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("WITH CHECK cannot be applied to MASKING policies")));
+	}
 
 	/*
 	 * If the command is SELECT or DELETE then WITH CHECK should be NULL.
@@ -618,6 +663,7 @@ CreatePolicy(CreatePolicyStmt *stmt)
 	/* Parse the supplied clause */
 	qual_pstate = make_parsestate(NULL);
 	with_check_pstate = make_parsestate(NULL);
+	mask_pstate = make_parsestate(NULL);
 
 	/* zero-clear */
 	memset(values, 0, sizeof(values));
@@ -658,6 +704,49 @@ CreatePolicy(CreatePolicyStmt *stmt)
 	assign_expr_collations(qual_pstate, qual);
 	assign_expr_collations(with_check_pstate, with_check_qual);
 
+	/*
+	 * For a masking policy, look up the masked column and transform the
+	 * masking expression.  The expression must be coercible to the column's
+	 * type, since it is substituted for references to the column.
+	 */
+	if (stmt->masking)
+	{
+		Form_pg_attribute att;
+
+		maskattnum = attnameAttNum(target_table, stmt->mask_colname, false);
+		if (maskattnum == InvalidAttrNumber)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_COLUMN),
+					 errmsg("column \"%s\" of relation \"%s\" does not exist",
+							stmt->mask_colname,
+							RelationGetRelationName(target_table))));
+
+		att = TupleDescAttr(RelationGetDescr(target_table), maskattnum - 1);
+
+		nsitem = addRangeTableEntryForRelation(mask_pstate, target_table,
+											   AccessShareLock,
+											   NULL, false, false);
+		addNSItemToQuery(mask_pstate, nsitem, false, true, true);
+
+		mask_expr = transformExpr(mask_pstate, stmt->mask_expr,
+								  EXPR_KIND_POLICY);
+
+		mask_expr = coerce_to_target_type(mask_pstate, mask_expr,
+										  exprType(mask_expr),
+										  att->atttypid, att->atttypmod,
+										  COERCION_ASSIGNMENT,
+										  COERCE_IMPLICIT_CAST,
+										  -1);
+		if (mask_expr == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATATYPE_MISMATCH),
+					 errmsg("masking expression for column \"%s\" must be of type %s",
+							stmt->mask_colname,
+							format_type_be(att->atttypid))));
+
+		assign_expr_collations(mask_pstate, mask_expr);
+	}
+
 	/* Open pg_policy catalog */
 	pg_policy_rel = table_open(PolicyRelationId, RowExclusiveLock);
 
@@ -686,6 +775,43 @@ CreatePolicy(CreatePolicyStmt *stmt)
 				 errmsg("policy \"%s\" for table \"%s\" already exists",
 						stmt->policy_name, RelationGetRelationName(target_table))));
 
+	/*
+	 * A column may have at most one masking policy, regardless of the roles
+	 * the policies apply to, so that it is never necessary to combine
+	 * multiple masking expressions.
+	 */
+	if (stmt->masking)
+	{
+		ScanKeyData mskey;
+		SysScanDesc msscan;
+		HeapTuple	mtuple;
+
+		ScanKeyInit(&mskey,
+					Anum_pg_policy_polrelid,
+					BTEqualStrategyNumber, F_OIDEQ,
+					ObjectIdGetDatum(table_id));
+
+		msscan = systable_beginscan(pg_policy_rel,
+									PolicyPolrelidPolnameIndexId, true, NULL,
+									1, &mskey);
+
+		while (HeapTupleIsValid(mtuple = systable_getnext(msscan)))
+		{
+			Form_pg_policy mform = (Form_pg_policy) GETSTRUCT(mtuple);
+
+			if (mform->polmasking && mform->polmaskattnum == maskattnum)
+				ereport(ERROR,
+						(errcode(ERRCODE_DUPLICATE_OBJECT),
+						 errmsg("column \"%s\" of table \"%s\" already has a masking policy",
+								stmt->mask_colname,
+								RelationGetRelationName(target_table)),
+						 errdetail("Masking policy \"%s\" already applies to this column.",
+								   NameStr(mform->polname))));
+		}
+
+		systable_endscan(msscan);
+	}
+
 	policy_id = GetNewOidWithIndex(pg_policy_rel, PolicyOidIndexId,
 								   Anum_pg_policy_oid);
 	values[Anum_pg_policy_oid - 1] = ObjectIdGetDatum(policy_id);
@@ -694,6 +820,8 @@ CreatePolicy(CreatePolicyStmt *stmt)
 															 CStringGetDatum(stmt->policy_name));
 	values[Anum_pg_policy_polcmd - 1] = CharGetDatum(polcmd);
 	values[Anum_pg_policy_polpermissive - 1] = BoolGetDatum(stmt->permissive);
+	values[Anum_pg_policy_polmasking - 1] = BoolGetDatum(stmt->masking);
+	values[Anum_pg_policy_polmaskattnum - 1] = Int16GetDatum(maskattnum);
 	values[Anum_pg_policy_polroles - 1] = PointerGetDatum(role_ids);
 
 	/* Add qual if present. */
@@ -707,6 +835,12 @@ CreatePolicy(CreatePolicyStmt *stmt)
 		values[Anum_pg_policy_polwithcheck - 1] = CStringGetTextDatum(nodeToString(with_check_qual));
 	else
 		isnull[Anum_pg_policy_polwithcheck - 1] = true;
+
+	/* Add masking expression if present */
+	if (mask_expr)
+		values[Anum_pg_policy_polmaskexpr - 1] = CStringGetTextDatum(nodeToString(mask_expr));
+	else
+		isnull[Anum_pg_policy_polmaskexpr - 1] = true;
 
 	policy_tuple = heap_form_tuple(RelationGetDescr(pg_policy_rel), values,
 								   isnull);
@@ -730,6 +864,22 @@ CreatePolicy(CreatePolicyStmt *stmt)
 	recordDependencyOnExpr(&myself, with_check_qual,
 						   with_check_pstate->p_rtable, DEPENDENCY_NORMAL);
 
+	if (mask_expr)
+	{
+		recordDependencyOnExpr(&myself, mask_expr, mask_pstate->p_rtable,
+							   DEPENDENCY_NORMAL);
+
+		/*
+		 * Also record an explicit dependency on the masked column, which the
+		 * masking expression need not itself reference, so that the column
+		 * cannot be dropped without also dropping the policy.
+		 */
+		target.classId = RelationRelationId;
+		target.objectId = table_id;
+		target.objectSubId = maskattnum;
+		recordDependencyOn(&myself, &target, DEPENDENCY_NORMAL);
+	}
+
 	/* Register role dependencies */
 	target.classId = AuthIdRelationId;
 	target.objectSubId = 0;
@@ -751,6 +901,7 @@ CreatePolicy(CreatePolicyStmt *stmt)
 	heap_freetuple(policy_tuple);
 	free_parsestate(qual_pstate);
 	free_parsestate(with_check_pstate);
+	free_parsestate(mask_pstate);
 	systable_endscan(sscan);
 	relation_close(target_table, NoLock);
 	table_close(pg_policy_rel, RowExclusiveLock);
@@ -776,8 +927,10 @@ AlterPolicy(AlterPolicyStmt *stmt)
 	ArrayType  *role_ids = NULL;
 	List	   *qual_parse_rtable = NIL;
 	List	   *with_check_parse_rtable = NIL;
+	List	   *mask_parse_rtable = NIL;
 	Node	   *qual = NULL;
 	Node	   *with_check_qual = NULL;
+	Node	   *mask_expr = NULL;
 	ScanKeyData skey[2];
 	SysScanDesc sscan;
 	HeapTuple	policy_tuple;
@@ -1036,6 +1189,38 @@ AlterPolicy(AlterPolicyStmt *stmt)
 		}
 	}
 
+	/*
+	 * ALTER POLICY cannot change the masking expression, but we must pull it
+	 * from the catalog so that we can recreate its dependencies correctly.
+	 */
+	{
+		Datum		value_datum;
+		bool		attr_isnull;
+
+		value_datum = heap_getattr(policy_tuple, Anum_pg_policy_polmaskexpr,
+								   RelationGetDescr(pg_policy_rel),
+								   &attr_isnull);
+		if (!attr_isnull)
+		{
+			char	   *mask_value;
+			ParseState *mask_pstate;
+
+			/* parsestate is built just to build the range table */
+			mask_pstate = make_parsestate(NULL);
+
+			mask_value = TextDatumGetCString(value_datum);
+			mask_expr = stringToNode(mask_value);
+
+			/* Add this rel to the parsestate's rangetable, for dependencies */
+			(void) addRangeTableEntryForRelation(mask_pstate, target_table,
+												 AccessShareLock,
+												 NULL, false, false);
+
+			mask_parse_rtable = mask_pstate->p_rtable;
+			free_parsestate(mask_pstate);
+		}
+	}
+
 	new_tuple = heap_modify_tuple(policy_tuple,
 								  RelationGetDescr(pg_policy_rel),
 								  values, isnull, replaces);
@@ -1059,6 +1244,21 @@ AlterPolicy(AlterPolicyStmt *stmt)
 
 	recordDependencyOnExpr(&myself, with_check_qual, with_check_parse_rtable,
 						   DEPENDENCY_NORMAL);
+
+	if (mask_expr)
+	{
+		AttrNumber	maskattnum;
+
+		recordDependencyOnExpr(&myself, mask_expr, mask_parse_rtable,
+							   DEPENDENCY_NORMAL);
+
+		/* Re-record the explicit dependency on the masked column */
+		maskattnum = ((Form_pg_policy) GETSTRUCT(policy_tuple))->polmaskattnum;
+		target.classId = RelationRelationId;
+		target.objectId = table_id;
+		target.objectSubId = maskattnum;
+		recordDependencyOn(&myself, &target, DEPENDENCY_NORMAL);
+	}
 
 	/* Register role dependencies */
 	deleteSharedDependencyRecordsFor(PolicyRelationId, policy_id, 0);

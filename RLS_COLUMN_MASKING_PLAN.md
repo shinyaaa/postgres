@@ -6,6 +6,22 @@
 - 対象ブランチ: `claude/rls-column-masking-plan-h0frux`
 - 調査対象コードベース: PostgreSQL master(catversion 2026 系)
 
+> **実装状況 (2026-07-02):** 本計画の v1 スコープは同ブランチ上で実装済み
+> (`CREATE POLICY ... AS MASKING ... MASK (col WITH expr)`、
+> `ALTER TABLE ... ENABLE/DISABLE/FORCE/NO FORCE COLUMN MASKING`、
+> リライタでの security_barrier 副問い合わせ置換、DML 参照エラー、COPY TO、
+> pg_stats ガード、psql/pg_dump 対応、リグレッションテスト `colmasking`、SGML 文書)。
+> 実装時に確定した計画からの主な差分:
+>
+> - カタログは 1 ポリシー = 1 列に単純化(`polmaskattnum int2` + `polmaskexpr pg_node_tree`)。
+>   複数列は複数ポリシーで表現し、`pg_get_expr` による deparse と pg_dump を単純化した。
+> - `EXPR_KIND_COLUMN_MASK` は新設せず、制約が同一の `EXPR_KIND_POLICY` を再利用。
+> - リライタでは fireRIRrules を再帰させる代わりに、生成した副問い合わせの内側 RTE へ
+>   `get_row_security_policies()` を直接適用し、マスク式のサブリンクには RLS と同じ
+>   `acquireLocksOnSubLinks` + `fireRIRonSubLink` + activeRIRs 再帰ガードを適用する。
+> - マスク対象リレーションへの `SELECT ... FOR UPDATE/SHARE` は v1 ではエラー。
+> - `ALTER POLICY` は TO / USING の変更のみ対応(MASK 句の変更は将来課題)。
+
 ---
 
 ## 1. 目的と背景

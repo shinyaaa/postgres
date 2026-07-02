@@ -1,0 +1,422 @@
+--
+-- Test of column masking policies
+--
+-- Suppress NOTICE messages when users/groups don't exist
+SET client_min_messages TO 'warning';
+DROP ROLE IF EXISTS regress_cm_owner;
+DROP ROLE IF EXISTS regress_cm_alice;
+DROP ROLE IF EXISTS regress_cm_bob;
+DROP ROLE IF EXISTS regress_cm_admin;
+RESET client_min_messages;
+CREATE ROLE regress_cm_owner;
+CREATE ROLE regress_cm_alice;
+CREATE ROLE regress_cm_bob;
+CREATE ROLE regress_cm_admin BYPASSRLS;
+SET SESSION AUTHORIZATION regress_cm_owner;
+CREATE TABLE cm_employees (
+    id      int PRIMARY KEY,
+    name    text,
+    ssn     text,
+    salary  int,
+    manager name
+);
+INSERT INTO cm_employees VALUES
+    (1, 'anne',  '123-45-6789', 5000, 'regress_cm_alice'),
+    (2, 'ben',   '987-65-4321', 6000, 'regress_cm_bob'),
+    (3, 'carol', '555-11-2222', 7000, 'regress_cm_alice');
+GRANT SELECT, INSERT, UPDATE, DELETE ON cm_employees
+    TO regress_cm_alice, regress_cm_bob, regress_cm_admin;
+-- conditional mask: rows satisfying USING show the real value
+CREATE POLICY cm_mask_ssn ON cm_employees
+    AS MASKING
+    FOR SELECT
+    TO PUBLIC
+    USING (manager = current_user)
+    MASK (ssn WITH '***-**-' || right(ssn, 4));
+-- unconditional mask
+CREATE POLICY cm_mask_salary ON cm_employees
+    AS MASKING
+    MASK (salary WITH NULL);
+-- masking policies are not applied until COLUMN MASKING is enabled
+SET SESSION AUTHORIZATION regress_cm_alice;
+SELECT * FROM cm_employees ORDER BY id;
+ id | name  |     ssn     | salary |     manager      
+----+-------+-------------+--------+------------------
+  1 | anne  | 123-45-6789 |   5000 | regress_cm_alice
+  2 | ben   | 987-65-4321 |   6000 | regress_cm_bob
+  3 | carol | 555-11-2222 |   7000 | regress_cm_alice
+(3 rows)
+
+SET SESSION AUTHORIZATION regress_cm_owner;
+ALTER TABLE cm_employees ENABLE COLUMN MASKING;
+-- check the catalog representation
+SELECT policyname, permissive, cmd, qual, masked_column, mask_expression
+  FROM pg_policies WHERE tablename = 'cm_employees' ORDER BY policyname;
+   policyname   | permissive |  cmd   |           qual           | masked_column |           mask_expression            
+----------------+------------+--------+--------------------------+---------------+--------------------------------------
+ cm_mask_salary | MASKING    | SELECT |                          | salary        | NULL::integer
+ cm_mask_ssn    | MASKING    | SELECT | (manager = CURRENT_USER) | ssn           | ('***-**-'::text || "right"(ssn, 4))
+(2 rows)
+
+\d cm_employees
+            Table "public.cm_employees"
+ Column  |  Type   | Collation | Nullable | Default 
+---------+---------+-----------+----------+---------
+ id      | integer |           | not null | 
+ name    | text    |           |          | 
+ ssn     | text    |           |          | 
+ salary  | integer |           |          | 
+ manager | name    |           |          | 
+Indexes:
+    "cm_employees_pkey" PRIMARY KEY, btree (id)
+Policies (row security disabled):
+    POLICY "cm_mask_salary" AS MASKING
+      MASK (salary WITH NULL::integer)
+    POLICY "cm_mask_ssn" AS MASKING
+      USING ((manager = CURRENT_USER))
+      MASK (ssn WITH ('***-**-'::text || "right"(ssn, 4)))
+
+SELECT column_masking_active('cm_employees');
+ column_masking_active 
+-----------------------
+ f
+(1 row)
+
+SELECT row_security_active('cm_employees');
+ row_security_active 
+---------------------
+ f
+(1 row)
+
+-- invalid masking policy definitions
+CREATE POLICY cm_err ON cm_employees AS MASKING MASK (ssn WITH 'x');  -- duplicate mask
+ERROR:  column "ssn" of table "cm_employees" already has a masking policy
+DETAIL:  Masking policy "cm_mask_ssn" already applies to this column.
+CREATE POLICY cm_err ON cm_employees AS MASKING MASK (salary WITH 'not a number');  -- type mismatch
+ERROR:  invalid input syntax for type integer: "not a number"
+CREATE POLICY cm_err ON cm_employees AS MASKING FOR UPDATE MASK (name WITH 'x');  -- bad command
+ERROR:  MASKING policies can only be defined FOR SELECT
+CREATE POLICY cm_err ON cm_employees AS MASKING WITH CHECK (true) MASK (name WITH 'x');  -- WITH CHECK
+ERROR:  WITH CHECK cannot be applied to MASKING policies
+CREATE POLICY cm_err ON cm_employees FOR SELECT MASK (name WITH 'x');  -- MASK without MASKING
+ERROR:  MASK clause is only allowed for MASKING policies
+LINE 1: CREATE POLICY cm_err ON cm_employees FOR SELECT MASK (name W...
+                                                        ^
+CREATE POLICY cm_err ON cm_employees AS MASKING;  -- MASKING without MASK
+ERROR:  MASK clause is required for MASKING policies
+LINE 1: CREATE POLICY cm_err ON cm_employees AS MASKING;
+                                             ^
+CREATE POLICY cm_err ON cm_employees AS MASKING MASK (nosuchcol WITH 'x');  -- bad column
+ERROR:  column "nosuchcol" of relation "cm_employees" does not exist
+CREATE POLICY cm_err ON cm_employees AS MASKING MASK (name WITH max(name));  -- no aggregates
+ERROR:  aggregate functions are not allowed in policy expressions
+-- sublinks are allowed in masking expressions
+CREATE POLICY cm_sub ON cm_employees AS MASKING
+    MASK (name WITH (SELECT 'x')::text);
+DROP POLICY cm_sub ON cm_employees;
+-- table owner is not masked
+SELECT * FROM cm_employees ORDER BY id;
+ id | name  |     ssn     | salary |     manager      
+----+-------+-------------+--------+------------------
+  1 | anne  | 123-45-6789 |   5000 | regress_cm_alice
+  2 | ben   | 987-65-4321 |   6000 | regress_cm_bob
+  3 | carol | 555-11-2222 |   7000 | regress_cm_alice
+(3 rows)
+
+-- regress_cm_alice manages rows 1 and 3, so sees those SSNs unmasked
+SET SESSION AUTHORIZATION regress_cm_alice;
+SELECT * FROM cm_employees ORDER BY id;
+ id | name  |     ssn     | salary |     manager      
+----+-------+-------------+--------+------------------
+  1 | anne  | 123-45-6789 |        | regress_cm_alice
+  2 | ben   | ***-**-4321 |        | regress_cm_bob
+  3 | carol | 555-11-2222 |        | regress_cm_alice
+(3 rows)
+
+-- predicates see masked values, so real values cannot be probed
+SELECT count(*) FROM cm_employees WHERE ssn = '987-65-4321';
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM cm_employees WHERE ssn = '***-**-4321';
+ count 
+-------
+     1
+(1 row)
+
+SELECT count(*) FROM cm_employees WHERE ssn = '123-45-6789';
+ count 
+-------
+     1
+(1 row)
+
+-- whole-row references see masked values too
+SELECT row_to_json(e) FROM cm_employees e WHERE id = 2;
+                                    row_to_json                                     
+------------------------------------------------------------------------------------
+ {"id":2,"name":"ben","ssn":"***-**-4321","salary":null,"manager":"regress_cm_bob"}
+(1 row)
+
+-- aggregates work over the masked values
+SELECT count(DISTINCT salary) FROM cm_employees;
+ count 
+-------
+     0
+(1 row)
+
+-- masked columns of a DML target relation cannot be referenced...
+UPDATE cm_employees SET name = 'x' WHERE ssn = '987-65-4321';
+ERROR:  column "ssn" of relation "cm_employees" is masked and cannot be referenced in a data-modifying statement
+UPDATE cm_employees SET name = ssn WHERE id = 2;
+ERROR:  column "ssn" of relation "cm_employees" is masked and cannot be referenced in a data-modifying statement
+UPDATE cm_employees SET name = 'x' WHERE id = 2 RETURNING ssn;
+ERROR:  column "ssn" of relation "cm_employees" is masked and cannot be referenced in a data-modifying statement
+UPDATE cm_employees SET name = 'x' WHERE id = 2 RETURNING cm_employees.*;
+ERROR:  column "ssn" of relation "cm_employees" is masked and cannot be referenced in a data-modifying statement
+UPDATE cm_employees SET name = 'x' WHERE id = 2 RETURNING cm_employees;
+ERROR:  whole-row reference to masked relation "cm_employees" is not allowed in a data-modifying statement
+DELETE FROM cm_employees WHERE ssn = '987-65-4321';
+ERROR:  column "ssn" of relation "cm_employees" is masked and cannot be referenced in a data-modifying statement
+INSERT INTO cm_employees VALUES (4, 'dave', '111-22-3333', 100, NULL)
+    ON CONFLICT (id) DO UPDATE SET name = excluded.name WHERE cm_employees.ssn <> '';
+ERROR:  column "ssn" of relation "cm_employees" is masked and cannot be referenced in a data-modifying statement
+-- ...but writing them, or not referencing them, is fine
+UPDATE cm_employees SET name = 'benny' WHERE id = 2;
+UPDATE cm_employees SET ssn = '000-00-0000' WHERE id = 2;
+INSERT INTO cm_employees VALUES (4, 'dave', '111-22-3333', 100, NULL);
+DELETE FROM cm_employees WHERE id = 4;
+-- row-level locking is not supported on masked relations
+SELECT id FROM cm_employees WHERE id = 1 FOR UPDATE;
+ERROR:  row-level locks cannot be used on relation "cm_employees" because it has column masking
+-- COPY TO applies masking
+COPY cm_employees TO stdout;
+1	anne	123-45-6789	\N	regress_cm_alice
+3	carol	555-11-2222	\N	regress_cm_alice
+2	benny	***-**-0000	\N	regress_cm_bob
+-- masking applies within subqueries, CTEs and joins
+WITH x AS (SELECT ssn FROM cm_employees WHERE id = 1) SELECT * FROM x;
+     ssn     
+-------------
+ 123-45-6789
+(1 row)
+
+SELECT e1.name, e2.ssn
+  FROM cm_employees e1 JOIN cm_employees e2 ON e1.id = e2.id
+ WHERE e1.id = 1;
+ name |     ssn     
+------+-------------
+ anne | 123-45-6789
+(1 row)
+
+-- INSERT ... SELECT from a masked table stores the masked values
+SET SESSION AUTHORIZATION regress_cm_owner;
+CREATE TABLE cm_snapshot AS SELECT * FROM cm_employees LIMIT 0;
+GRANT SELECT, INSERT ON cm_snapshot TO regress_cm_bob;
+SET SESSION AUTHORIZATION regress_cm_bob;
+INSERT INTO cm_snapshot SELECT * FROM cm_employees WHERE id = 1;
+SELECT * FROM cm_snapshot;
+ id | name |     ssn     | salary |     manager      
+----+------+-------------+--------+------------------
+  1 | anne | ***-**-6789 |        | regress_cm_alice
+(1 row)
+
+-- prepared statements are replanned when the role changes
+PREPARE cm_p1 AS SELECT ssn FROM cm_employees WHERE id = 1;
+EXECUTE cm_p1;
+     ssn     
+-------------
+ ***-**-6789
+(1 row)
+
+SET SESSION AUTHORIZATION regress_cm_alice;
+EXECUTE cm_p1;
+     ssn     
+-------------
+ 123-45-6789
+(1 row)
+
+DEALLOCATE cm_p1;
+-- BYPASSRLS roles bypass masking
+SET SESSION AUTHORIZATION regress_cm_admin;
+SELECT * FROM cm_employees ORDER BY id;
+ id | name  |     ssn     | salary |     manager      
+----+-------+-------------+--------+------------------
+  1 | anne  | 123-45-6789 |   5000 | regress_cm_alice
+  2 | benny | 000-00-0000 |   6000 | regress_cm_bob
+  3 | carol | 555-11-2222 |   7000 | regress_cm_alice
+(3 rows)
+
+-- with row_security = off, masking is bypassed for those who may do so...
+SET row_security = off;
+SELECT * FROM cm_employees ORDER BY id;
+ id | name  |     ssn     | salary |     manager      
+----+-------+-------------+--------+------------------
+  1 | anne  | 123-45-6789 |   5000 | regress_cm_alice
+  2 | benny | 000-00-0000 |   6000 | regress_cm_bob
+  3 | carol | 555-11-2222 |   7000 | regress_cm_alice
+(3 rows)
+
+-- ...but is an error for anybody else
+SET SESSION AUTHORIZATION regress_cm_bob;
+SELECT * FROM cm_employees ORDER BY id;
+ERROR:  query would be affected by column masking policy for table "cm_employees"
+RESET row_security;
+-- views: access through an owner's view is checked as the view owner
+SET SESSION AUTHORIZATION regress_cm_owner;
+CREATE VIEW cm_v_emp AS SELECT name, ssn FROM cm_employees;
+CREATE VIEW cm_v_emp_inv WITH (security_invoker) AS
+    SELECT name, ssn FROM cm_employees;
+GRANT SELECT ON cm_v_emp, cm_v_emp_inv TO regress_cm_bob;
+SET SESSION AUTHORIZATION regress_cm_bob;
+SELECT * FROM cm_v_emp ORDER BY name;
+ name  |     ssn     
+-------+-------------
+ anne  | 123-45-6789
+ benny | 000-00-0000
+ carol | 555-11-2222
+(3 rows)
+
+SELECT * FROM cm_v_emp_inv ORDER BY name;
+ name  |     ssn     
+-------+-------------
+ anne  | ***-**-6789
+ benny | 000-00-0000
+ carol | ***-**-2222
+(3 rows)
+
+-- FORCE COLUMN MASKING applies masking to the table owner as well
+SET SESSION AUTHORIZATION regress_cm_owner;
+ALTER TABLE cm_employees FORCE COLUMN MASKING;
+SELECT ssn, salary FROM cm_employees WHERE id = 2;
+     ssn     | salary 
+-------------+--------
+ ***-**-0000 |       
+(1 row)
+
+ALTER TABLE cm_employees NO FORCE COLUMN MASKING;
+SELECT ssn, salary FROM cm_employees WHERE id = 2;
+     ssn     | salary 
+-------------+--------
+ 000-00-0000 |   6000
+(1 row)
+
+-- combination with row-level security
+CREATE POLICY cm_rows ON cm_employees FOR SELECT USING (salary < 6500);
+ALTER TABLE cm_employees ENABLE ROW LEVEL SECURITY;
+SET SESSION AUTHORIZATION regress_cm_bob;
+SELECT * FROM cm_employees ORDER BY id;
+ id | name  |     ssn     | salary |     manager      
+----+-------+-------------+--------+------------------
+  1 | anne  | ***-**-6789 |        | regress_cm_alice
+  2 | benny | 000-00-0000 |        | regress_cm_bob
+(2 rows)
+
+SET SESSION AUTHORIZATION regress_cm_owner;
+ALTER TABLE cm_employees DISABLE ROW LEVEL SECURITY;
+DROP POLICY cm_rows ON cm_employees;
+-- DISABLE COLUMN MASKING stops applying the policies
+ALTER TABLE cm_employees DISABLE COLUMN MASKING;
+SET SESSION AUTHORIZATION regress_cm_bob;
+SELECT * FROM cm_employees ORDER BY id;
+ id | name  |     ssn     | salary |     manager      
+----+-------+-------------+--------+------------------
+  1 | anne  | 123-45-6789 |   5000 | regress_cm_alice
+  2 | benny | 000-00-0000 |   6000 | regress_cm_bob
+  3 | carol | 555-11-2222 |   7000 | regress_cm_alice
+(3 rows)
+
+SET SESSION AUTHORIZATION regress_cm_owner;
+ALTER TABLE cm_employees ENABLE COLUMN MASKING;
+-- masking policies on partitioned tables apply when accessed via the parent
+CREATE TABLE cm_pt (id int, secret text, region text) PARTITION BY LIST (region);
+CREATE TABLE cm_pt_a PARTITION OF cm_pt FOR VALUES IN ('a');
+CREATE TABLE cm_pt_b PARTITION OF cm_pt FOR VALUES IN ('b');
+INSERT INTO cm_pt VALUES (1, 's1', 'a'), (2, 's2', 'b');
+GRANT SELECT ON cm_pt, cm_pt_a, cm_pt_b TO regress_cm_bob;
+CREATE POLICY cm_mask_secret ON cm_pt AS MASKING MASK (secret WITH '<hidden>');
+ALTER TABLE cm_pt ENABLE COLUMN MASKING;
+SET SESSION AUTHORIZATION regress_cm_bob;
+SELECT * FROM cm_pt ORDER BY id;
+ id |  secret  | region 
+----+----------+--------
+  1 | <hidden> | a
+  2 | <hidden> | b
+(2 rows)
+
+-- directly accessed partitions have no masking policies of their own
+SELECT * FROM cm_pt_a ORDER BY id;
+ id | secret | region 
+----+--------+--------
+  1 | s1     | a
+(1 row)
+
+SET SESSION AUTHORIZATION regress_cm_owner;
+-- a masked column cannot be dropped without CASCADE
+ALTER TABLE cm_employees DROP COLUMN salary;
+ERROR:  cannot drop column salary of table cm_employees because other objects depend on it
+DETAIL:  policy cm_mask_salary on table cm_employees depends on column salary of table cm_employees
+HINT:  Use DROP ... CASCADE to drop the dependent objects too.
+ALTER TABLE cm_employees DROP COLUMN salary CASCADE;
+NOTICE:  drop cascades to policy cm_mask_salary on table cm_employees
+SET SESSION AUTHORIZATION regress_cm_bob;
+SELECT * FROM cm_employees ORDER BY id;
+ id | name  |     ssn     |     manager      
+----+-------+-------------+------------------
+  1 | anne  | ***-**-6789 | regress_cm_alice
+  2 | benny | 000-00-0000 | regress_cm_bob
+  3 | carol | ***-**-2222 | regress_cm_alice
+(3 rows)
+
+SET SESSION AUTHORIZATION regress_cm_owner;
+-- ALTER POLICY can change the roles and the USING expression
+ALTER POLICY cm_mask_ssn ON cm_employees TO regress_cm_alice;
+SET SESSION AUTHORIZATION regress_cm_bob;
+SELECT ssn FROM cm_employees ORDER BY id;  -- policy no longer applies to bob
+     ssn     
+-------------
+ 123-45-6789
+ 000-00-0000
+ 555-11-2222
+(3 rows)
+
+SET SESSION AUTHORIZATION regress_cm_alice;
+SELECT ssn FROM cm_employees ORDER BY id;
+     ssn     
+-------------
+ 123-45-6789
+ ***-**-0000
+ 555-11-2222
+(3 rows)
+
+SET SESSION AUTHORIZATION regress_cm_owner;
+ALTER POLICY cm_mask_ssn ON cm_employees TO PUBLIC USING (false);
+SET SESSION AUTHORIZATION regress_cm_alice;
+SELECT ssn FROM cm_employees ORDER BY id;  -- now always masked
+     ssn     
+-------------
+ ***-**-6789
+ ***-**-0000
+ ***-**-2222
+(3 rows)
+
+SET SESSION AUTHORIZATION regress_cm_owner;
+-- masking expressions may not reference the table recursively
+CREATE TABLE cm_rec (a int, b text);
+GRANT SELECT ON cm_rec TO regress_cm_bob;
+CREATE POLICY cm_rec_mask ON cm_rec AS MASKING
+    MASK (b WITH (SELECT min(b) FROM cm_rec));
+ALTER TABLE cm_rec ENABLE COLUMN MASKING;
+SET SESSION AUTHORIZATION regress_cm_bob;
+SELECT * FROM cm_rec;
+ERROR:  infinite recursion detected in policy for relation "cm_rec"
+SET SESSION AUTHORIZATION regress_cm_owner;
+-- clean up
+RESET SESSION AUTHORIZATION;
+DROP VIEW cm_v_emp, cm_v_emp_inv;
+DROP TABLE cm_employees, cm_snapshot, cm_pt, cm_rec;
+DROP ROLE regress_cm_owner;
+DROP ROLE regress_cm_alice;
+DROP ROLE regress_cm_bob;
+DROP ROLE regress_cm_admin;

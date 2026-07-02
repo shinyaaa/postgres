@@ -23,8 +23,11 @@ typedef struct RowSecurityPolicy
 	char		polcmd;			/* Type of command policy is for */
 	ArrayType  *roles;			/* Array of roles policy is for */
 	bool		permissive;		/* restrictive or permissive policy */
+	bool		masking;		/* column masking policy */
+	AttrNumber	maskattnum;		/* masked column, or 0 if not masking */
 	Expr	   *qual;			/* Expression to filter rows */
 	Expr	   *with_check_qual;	/* Expression to limit rows allowed */
+	Expr	   *mask_expr;		/* Expression to mask the column with */
 	bool		hassublinks;	/* If either expression has sublinks */
 } RowSecurityPolicy;
 
@@ -45,5 +48,9 @@ extern void get_row_security_policies(Query *root,
 									  RangeTblEntry *rte, int rt_index,
 									  List **securityQuals, List **withCheckOptions,
 									  bool *hasRowSecurity, bool *hasSubLinks);
+
+extern void get_column_masks(Query *root, RangeTblEntry *rte,
+							 List **maskattnos, List **maskexprs,
+							 bool *hasColumnMasks, bool *hasSubLinks);
 
 #endif							/* ROWSECURITY_H */

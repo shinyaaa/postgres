@@ -80,6 +80,10 @@ ALTER TABLE [ IF EXISTS ] <replaceable class="parameter">name</replaceable>
     ENABLE ROW LEVEL SECURITY
     FORCE ROW LEVEL SECURITY
     NO FORCE ROW LEVEL SECURITY
+    DISABLE COLUMN MASKING
+    ENABLE COLUMN MASKING
+    FORCE COLUMN MASKING
+    NO FORCE COLUMN MASKING
     CLUSTER ON <replaceable class="parameter">index_name</replaceable>
     SET WITHOUT CLUSTER
     SET WITHOUT OIDS
@@ -738,6 +742,37 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
       security policies will be applied when the user is the table owner.  If
       disabled (the default) then row-level security will not be applied when
       the user is the table owner.
+      See also
+      <link linkend="sql-createpolicy"><command>CREATE POLICY</command></link>.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry id="sql-altertable-desc-disable-enable-column-masking">
+    <term><literal>DISABLE</literal>/<literal>ENABLE COLUMN MASKING</literal></term>
+    <listitem>
+     <para>
+      These forms control the application of column masking policies
+      belonging to the table.  Unlike row-level security, no default policy
+      is assumed when column masking is enabled: columns without a masking
+      policy are simply not masked.  Note that masking policies can exist
+      for a table even if column masking is disabled; in this case the
+      policies will <emphasis>not</emphasis> be applied and will be
+      ignored.  See also
+      <link linkend="sql-createpolicy"><command>CREATE POLICY</command></link>.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry id="sql-altertable-desc-force-column-masking">
+    <term><literal>NO FORCE</literal>/<literal>FORCE COLUMN MASKING</literal></term>
+    <listitem>
+     <para>
+      These forms control the application of column masking policies
+      belonging to the table when the user is the table owner.  If enabled,
+      masking policies will be applied when the user is the table owner.
+      If disabled (the default) then column masking will not be applied
+      when the user is the table owner.
       See also
       <link linkend="sql-createpolicy"><command>CREATE POLICY</command></link>.
      </para>

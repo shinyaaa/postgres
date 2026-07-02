@@ -24,6 +24,7 @@
 #include "access/sysattr.h"
 #include "access/table.h"
 #include "catalog/dependency.h"
+#include "catalog/pg_type.h"
 #include "commands/trigger.h"
 #include "executor/executor.h"
 #include "foreign/fdwapi.h"
@@ -2032,6 +2033,271 @@ fireRIRonSubLink(Node *node, fireRIRonSubLink_context *context)
 
 
 /*
+ * build_column_masking_subquery -
+ *	Build a subquery which applies the given column masking expressions to
+ *	the relation of the given RTE.
+ *
+ * The subquery selects every column of the relation, in attribute-number
+ * order, replacing masked columns by their masking expressions (whose Vars
+ * already reference the relation at varno 1).  The caller converts the
+ * original RTE into an RTE_SUBQUERY over the result, so that all references
+ * to the relation, including those in quals and whole-row references, see
+ * the masked values.
+ *
+ * The RTE's permission information is moved into the subquery, so that
+ * permissions continue to be checked with the original requiredPerms and
+ * column sets; the caller must reset rte->perminfoindex.  The original
+ * entry remains in the outer query's rteperminfos list, but is harmless
+ * there since it is no longer referenced by any RTE.
+ */
+static Query *
+build_column_masking_subquery(Query *parsetree, RangeTblEntry *rte,
+							  Relation rel,
+							  List *maskattnos, List *maskexprs,
+							  bool hasSubLinks)
+{
+	Query	   *sub;
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	RangeTblEntry *innerrte;
+	RTEPermissionInfo *innerperminfo;
+	RangeTblRef *rtr;
+	List	   *tlist = NIL;
+	AttrNumber	attno;
+
+	/* Copy the outer RTE's permission info for use inside the subquery */
+	innerperminfo = copyObject(getRTEPermissionInfo(parsetree->rteperminfos,
+													rte));
+
+	innerrte = makeNode(RangeTblEntry);
+	innerrte->rtekind = RTE_RELATION;
+	innerrte->relid = rte->relid;
+	innerrte->relkind = rte->relkind;
+	innerrte->rellockmode = rte->rellockmode;
+	innerrte->tablesample = rte->tablesample;
+	innerrte->inh = rte->inh;
+	innerrte->eref = copyObject(rte->eref);
+	innerrte->inFromCl = true;
+	innerrte->perminfoindex = 1;
+
+	sub = makeNode(Query);
+	sub->commandType = CMD_SELECT;
+	sub->rtable = list_make1(innerrte);
+	sub->rteperminfos = list_make1(innerperminfo);
+	rtr = makeNode(RangeTblRef);
+	rtr->rtindex = 1;
+	sub->jointree = makeFromExpr(list_make1(rtr), NULL);
+	sub->hasSubLinks = hasSubLinks;
+
+	for (attno = 1; attno <= tupdesc->natts; attno++)
+	{
+		Form_pg_attribute att = TupleDescAttr(tupdesc, attno - 1);
+		Expr	   *expr = NULL;
+		ListCell   *lca,
+				   *lce;
+
+		if (att->attisdropped)
+		{
+			/*
+			 * Emit a NULL constant to keep the subquery's output columns
+			 * aligned with the relation's attribute numbers.  Use a
+			 * stand-in type whose length and pass-by-value properties match
+			 * the dropped column's, so that whole-row references to the
+			 * relation continue to work (see ExecEvalWholeRowVar).
+			 */
+			Oid			standintype;
+			int16		standinlen;
+			bool		standinbyval;
+
+			if (att->attbyval && att->attlen == 1)
+				standintype = BOOLOID;
+			else if (att->attbyval && att->attlen == 2)
+				standintype = INT2OID;
+			else if (att->attbyval && att->attlen == 4)
+				standintype = INT4OID;
+			else if (att->attbyval && att->attlen == 8)
+				standintype = INT8OID;
+			else
+				standintype = TEXTOID;
+			get_typlenbyval(standintype, &standinlen, &standinbyval);
+
+			expr = (Expr *) makeConst(standintype, -1, InvalidOid,
+									  standinlen, (Datum) 0,
+									  true, standinbyval);
+		}
+		else
+		{
+			/* Is this column masked? */
+			forboth(lca, maskattnos, lce, maskexprs)
+			{
+				if (lfirst_int(lca) == attno)
+				{
+					expr = (Expr *) lfirst(lce);
+					break;
+				}
+			}
+
+			if (expr == NULL)
+				expr = (Expr *) makeVar(1, attno,
+										att->atttypid, att->atttypmod,
+										att->attcollation, 0);
+		}
+
+		tlist = lappend(tlist,
+						makeTargetEntry(expr, attno,
+										pstrdup(NameStr(att->attname)),
+										false));
+	}
+
+	sub->targetList = tlist;
+
+	return sub;
+}
+
+/*
+ * Check for references to masked columns of a DML target relation.
+ *
+ * The target relation of an INSERT/UPDATE/DELETE/MERGE cannot be converted
+ * into a subquery, so we cannot substitute masking expressions for
+ * references to its columns.  Instead, we simply forbid a user subject to
+ * column masking from referencing a masked column of the target relation
+ * (in WHERE clauses, SET expressions, RETURNING lists, ON CONFLICT clauses,
+ * and so on), much as if column privileges had been revoked.  Assigning a
+ * new value to a masked column remains allowed, since that does not reveal
+ * the existing value.
+ */
+typedef struct masked_col_ref_context
+{
+	int			varno;			/* RT index of the target relation */
+	int			sublevels_up;	/* current nesting depth */
+	Bitmapset  *maskedcols;		/* masked attribute numbers */
+	AttrNumber	offender;		/* offending attnum, or 0 for whole-row */
+	bool		found;
+} masked_col_ref_context;
+
+static bool
+masked_col_ref_walker(Node *node, masked_col_ref_context *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Var))
+	{
+		Var		   *var = (Var *) node;
+
+		if (var->varlevelsup == (Index) context->sublevels_up &&
+			var->varno == context->varno)
+		{
+			if (var->varattno == InvalidAttrNumber)
+			{
+				/* whole-row reference includes all masked columns */
+				context->found = true;
+				context->offender = InvalidAttrNumber;
+				return true;
+			}
+			if (var->varattno > 0 &&
+				bms_is_member(var->varattno, context->maskedcols))
+			{
+				context->found = true;
+				context->offender = var->varattno;
+				return true;
+			}
+		}
+		return false;
+	}
+	if (IsA(node, Query))
+	{
+		bool		result;
+
+		context->sublevels_up++;
+		result = query_tree_walker((Query *) node, masked_col_ref_walker,
+								   context, 0);
+		context->sublevels_up--;
+		return result;
+	}
+	return expression_tree_walker(node, masked_col_ref_walker, context);
+}
+
+static void
+check_masked_column_refs(Query *parsetree, int rt_index, List *maskattnos,
+						 Relation rel)
+{
+	masked_col_ref_context context;
+	ListCell   *lc;
+
+	context.varno = rt_index;
+	context.sublevels_up = 0;
+	context.maskedcols = NULL;
+	context.offender = InvalidAttrNumber;
+	context.found = false;
+
+	foreach(lc, maskattnos)
+		context.maskedcols = bms_add_member(context.maskedcols,
+											lfirst_int(lc));
+
+	/*
+	 * Walk everything that can contain user-supplied references to the
+	 * target relation.  We skip the top-level range table here so as not to
+	 * complain about references in securityQuals, which contain only
+	 * policy-provided expressions (from RLS policies or view quals added by
+	 * rewriteTargetView) and are not visible to the user; the pieces of the
+	 * range table which can contain user-supplied expressions are then
+	 * walked explicitly.  Nested queries are walked in full, since
+	 * policy-provided expressions never contain uplevel references to the
+	 * target relation.
+	 */
+	if (!query_tree_walker(parsetree, masked_col_ref_walker, &context,
+						   QTW_IGNORE_RANGE_TABLE))
+	{
+		foreach(lc, parsetree->rtable)
+		{
+			RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+
+			switch (rte->rtekind)
+			{
+				case RTE_SUBQUERY:
+					if (masked_col_ref_walker((Node *) rte->subquery,
+											  &context))
+						break;
+					continue;
+				case RTE_FUNCTION:
+					if (masked_col_ref_walker((Node *) rte->functions,
+											  &context))
+						break;
+					continue;
+				case RTE_TABLEFUNC:
+					if (masked_col_ref_walker((Node *) rte->tablefunc,
+											  &context))
+						break;
+					continue;
+				case RTE_VALUES:
+					if (masked_col_ref_walker((Node *) rte->values_lists,
+											  &context))
+						break;
+					continue;
+				default:
+					continue;
+			}
+			break;
+		}
+	}
+
+	if (context.found)
+	{
+		if (context.offender == InvalidAttrNumber)
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("whole-row reference to masked relation \"%s\" is not allowed in a data-modifying statement",
+							RelationGetRelationName(rel))));
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("column \"%s\" of relation \"%s\" is masked and cannot be referenced in a data-modifying statement",
+							get_attname(RelationGetRelid(rel),
+										context.offender, false),
+							RelationGetRelationName(rel))));
+	}
+}
+
+/*
  * fireRIRrules -
  *	Apply all RIR rules on each rangetable entry in the given query
  *
@@ -2262,6 +2528,10 @@ fireRIRrules(Query *parsetree, List *activeRIRs)
 		List	   *withCheckOptions;
 		bool		hasRowSecurity;
 		bool		hasSubLinks;
+		List	   *maskattnos;
+		List	   *maskexprs;
+		bool		hasColumnMasks;
+		bool		maskHasSubLinks;
 
 		++rt_index;
 
@@ -2272,6 +2542,141 @@ fireRIRrules(Query *parsetree, List *activeRIRs)
 			continue;
 
 		rel = relation_open(rte->relid, NoLock);
+
+		/*
+		 * Apply any column masking policies first: masked relations that are
+		 * read by the query are converted into subqueries, whose row
+		 * security is then handled when the subquery is built, while the
+		 * row security of unconverted relations is handled below.
+		 */
+		get_column_masks(parsetree, rte, &maskattnos, &maskexprs,
+						 &hasColumnMasks, &maskHasSubLinks);
+
+		/*
+		 * Mark this query as having column masking, so plancache can
+		 * invalidate it when necessary (eg: role changes).
+		 */
+		if (hasColumnMasks)
+			parsetree->hasRowSecurity = true;
+
+		if (maskexprs != NIL)
+		{
+			if (rt_index == parsetree->resultRelation ||
+				rt_index == parsetree->mergeTargetRelation)
+			{
+				/*
+				 * The target relation of a data-modifying statement cannot
+				 * be converted into a subquery, so simply forbid references
+				 * to its masked columns.  Row security is still applied
+				 * below.
+				 */
+				check_masked_column_refs(parsetree, rt_index, maskattnos,
+										 rel);
+			}
+			else
+			{
+				Query	   *sub;
+				RangeTblEntry *innerrte;
+
+				/*
+				 * Row-level locks would silently become no-ops if the
+				 * relation were replaced by a subquery, so reject them.
+				 */
+				if (get_parse_rowmark(parsetree, rt_index) != NULL)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("row-level locks cannot be used on relation \"%s\" because it has column masking",
+									RelationGetRelationName(rel))));
+
+				sub = build_column_masking_subquery(parsetree, rte, rel,
+													maskattnos, maskexprs,
+													maskHasSubLinks);
+
+				/*
+				 * Process the new subquery, checking for infinite recursion
+				 * in case the masking expressions reference the relation
+				 * itself via sublink subqueries.
+				 */
+				if (list_member_oid(activeRIRs, RelationGetRelid(rel)))
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+							 errmsg("infinite recursion detected in policy for relation \"%s\"",
+									RelationGetRelationName(rel))));
+
+				activeRIRs = lappend_oid(activeRIRs, RelationGetRelid(rel));
+
+				/*
+				 * Apply the relation's row-level security policies to the
+				 * scan inside the subquery.  No WithCheckOptions can be
+				 * returned, since the subquery is a plain SELECT.
+				 */
+				innerrte = rt_fetch(1, sub->rtable);
+
+				get_row_security_policies(sub, innerrte, 1,
+										  &securityQuals, &withCheckOptions,
+										  &hasRowSecurity, &hasSubLinks);
+
+				Assert(withCheckOptions == NIL);
+
+				innerrte->securityQuals = securityQuals;
+				sub->hasRowSecurity = hasRowSecurity;
+				sub->hasSubLinks |= hasSubLinks;
+				parsetree->hasRowSecurity |= hasRowSecurity;
+
+				if (sub->hasSubLinks)
+				{
+					acquireLocksOnSubLinks_context context;
+					fireRIRonSubLink_context fire_context;
+
+					/*
+					 * The masking expressions and security quals were added
+					 * post-parsing, so make sure we lock any relations they
+					 * reference via sublinks, then fire any RIR rules for
+					 * them.
+					 */
+					context.for_execute = true;
+					(void) acquireLocksOnSubLinks((Node *) sub->targetList,
+												  &context);
+					(void) acquireLocksOnSubLinks((Node *) innerrte->securityQuals,
+												  &context);
+
+					fire_context.activeRIRs = activeRIRs;
+					fire_context.hasRowSecurity = false;
+
+					expression_tree_walker((Node *) sub->targetList,
+										   fireRIRonSubLink, &fire_context);
+					expression_tree_walker((Node *) innerrte->securityQuals,
+										   fireRIRonSubLink, &fire_context);
+
+					sub->hasRowSecurity |= fire_context.hasRowSecurity;
+					parsetree->hasRowSecurity |= fire_context.hasRowSecurity;
+				}
+
+				activeRIRs = list_delete_last(activeRIRs);
+
+				/*
+				 * Now plug the subquery in, converting the relation's
+				 * original RTE to a subquery RTE, similar to a view.  Mark
+				 * it as a security barrier so that the planner does not push
+				 * unsafe quals down past the masking expressions.
+				 *
+				 * As with views, we leave the relid, relkind and
+				 * rellockmode fields set, so that the relation can be
+				 * appropriately locked before execution.  Its permissions
+				 * are checked through the permission info that
+				 * build_column_masking_subquery moved inside the subquery.
+				 */
+				rte->rtekind = RTE_SUBQUERY;
+				rte->subquery = sub;
+				rte->security_barrier = true;
+				rte->tablesample = NULL;
+				rte->inh = false;	/* must not be set for a subquery */
+				rte->perminfoindex = 0;
+
+				relation_close(rel, NoLock);
+				continue;
+			}
+		}
 
 		/*
 		 * Fetch any new security quals that must be applied to this RTE.

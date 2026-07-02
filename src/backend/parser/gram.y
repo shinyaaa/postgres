@@ -147,6 +147,11 @@ typedef struct KeyActions
 #define CAS_NOT_ENFORCED			0x40
 #define CAS_ENFORCED				0x80
 
+/* Policy kinds returned by RowSecurityDefaultPermissive */
+#define POLICY_KIND_PERMISSIVE		1
+#define POLICY_KIND_RESTRICTIVE		2
+#define POLICY_KIND_MASKING			3
+
 
 #define parser_yyerror(msg)  scanner_yyerror(msg, yyscanner)
 #define parser_errposition(pos)  scanner_errposition(pos, yyscanner)
@@ -402,9 +407,10 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <str>		all_Op MathOp
 
 %type <str>		row_security_cmd RowSecurityDefaultForCmd
-%type <boolean> RowSecurityDefaultPermissive
+%type <ival>	RowSecurityDefaultPermissive
 %type <node>	RowSecurityOptionalWithCheck RowSecurityOptionalExpr
 %type <list>	RowSecurityDefaultToRole RowSecurityOptionalToRole
+%type <list>	RowSecurityOptionalMask
 
 %type <str>		iso_level opt_encoding
 %type <rolespec> grantee
@@ -789,7 +795,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	LEADING LEAKPROOF LEAST LEFT LEVEL LIKE LIMIT LISTEN LOAD LOCAL
 	LOCALTIME LOCALTIMESTAMP LOCATION LOCK_P LOCKED LOGGED LSN_P
 
-	MAPPING MATCH MATCHED MATERIALIZED MAXVALUE MERGE MERGE_ACTION METHOD
+	MAPPING MASK MASKING MATCH MATCHED MATERIALIZED MAXVALUE MERGE MERGE_ACTION METHOD
 	MINUTE_P MINVALUE MODE MONTH_P MOVE
 
 	NAME_P NAMES NATIONAL NATURAL NCHAR NESTED NEW NEXT NFC NFD NFKC NFKD NO NODE
@@ -3160,6 +3166,38 @@ alter_table_cmd:
 					AlterTableCmd *n = makeNode(AlterTableCmd);
 
 					n->subtype = AT_NoForceRowSecurity;
+					$$ = (Node *) n;
+				}
+			/* ALTER TABLE <name> ENABLE COLUMN MASKING */
+			| ENABLE_P COLUMN MASKING
+				{
+					AlterTableCmd *n = makeNode(AlterTableCmd);
+
+					n->subtype = AT_EnableColumnMasking;
+					$$ = (Node *) n;
+				}
+			/* ALTER TABLE <name> DISABLE COLUMN MASKING */
+			| DISABLE_P COLUMN MASKING
+				{
+					AlterTableCmd *n = makeNode(AlterTableCmd);
+
+					n->subtype = AT_DisableColumnMasking;
+					$$ = (Node *) n;
+				}
+			/* ALTER TABLE <name> FORCE COLUMN MASKING */
+			| FORCE COLUMN MASKING
+				{
+					AlterTableCmd *n = makeNode(AlterTableCmd);
+
+					n->subtype = AT_ForceColumnMasking;
+					$$ = (Node *) n;
+				}
+			/* ALTER TABLE <name> NO FORCE COLUMN MASKING */
+			| NO FORCE COLUMN MASKING
+				{
+					AlterTableCmd *n = makeNode(AlterTableCmd);
+
+					n->subtype = AT_NoForceColumnMasking;
 					$$ = (Node *) n;
 				}
 			| alter_generic_options
@@ -6077,16 +6115,33 @@ CreatePolicyStmt:
 			CREATE POLICY name ON qualified_name RowSecurityDefaultPermissive
 				RowSecurityDefaultForCmd RowSecurityDefaultToRole
 				RowSecurityOptionalExpr RowSecurityOptionalWithCheck
+				RowSecurityOptionalMask
 				{
 					CreatePolicyStmt *n = makeNode(CreatePolicyStmt);
 
 					n->policy_name = $3;
 					n->table = $5;
-					n->permissive = $6;
+					n->permissive = ($6 != POLICY_KIND_RESTRICTIVE);
+					n->masking = ($6 == POLICY_KIND_MASKING);
 					n->cmd_name = $7;
 					n->roles = $8;
 					n->qual = $9;
 					n->with_check = $10;
+					if ($11 != NIL)
+					{
+						n->mask_colname = strVal(linitial($11));
+						n->mask_expr = (Node *) lsecond($11);
+					}
+					if (n->masking && n->mask_expr == NULL)
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("MASK clause is required for MASKING policies"),
+								 parser_errposition(@6)));
+					if (!n->masking && n->mask_expr != NULL)
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("MASK clause is only allowed for MASKING policies"),
+								 parser_errposition(@11)));
 					$$ = (Node *) n;
 				}
 		;
@@ -6116,6 +6171,14 @@ RowSecurityOptionalWithCheck:
 			| /* EMPTY */					{ $$ = NULL; }
 		;
 
+RowSecurityOptionalMask:
+			MASK '(' ColId WITH a_expr ')'
+				{
+					$$ = list_make2(makeString($3), $5);
+				}
+			| /* EMPTY */					{ $$ = NIL; }
+		;
+
 RowSecurityDefaultToRole:
 			TO role_list			{ $$ = $2; }
 			| /* EMPTY */			{ $$ = list_make1(makeRoleSpec(ROLESPEC_PUBLIC, -1)); }
@@ -6130,18 +6193,19 @@ RowSecurityDefaultPermissive:
 			AS IDENT
 				{
 					if (strcmp($2, "permissive") == 0)
-						$$ = true;
+						$$ = POLICY_KIND_PERMISSIVE;
 					else if (strcmp($2, "restrictive") == 0)
-						$$ = false;
+						$$ = POLICY_KIND_RESTRICTIVE;
 					else
 						ereport(ERROR,
 								(errcode(ERRCODE_SYNTAX_ERROR),
 								 errmsg("unrecognized row security option \"%s\"", $2),
-								 errhint("Only PERMISSIVE or RESTRICTIVE policies are supported currently."),
+								 errhint("Only PERMISSIVE, RESTRICTIVE, or MASKING policies are supported currently."),
 								 parser_errposition(@2)));
 
 				}
-			| /* EMPTY */			{ $$ = true; }
+			| AS MASKING			{ $$ = POLICY_KIND_MASKING; }
+			| /* EMPTY */			{ $$ = POLICY_KIND_PERMISSIVE; }
 		;
 
 RowSecurityDefaultForCmd:
@@ -18978,6 +19042,8 @@ unreserved_keyword:
 			| LOGGED
 			| LSN_P
 			| MAPPING
+			| MASK
+			| MASKING
 			| MATCH
 			| MATCHED
 			| MATERIALIZED
@@ -19610,6 +19676,8 @@ bare_label_keyword:
 			| LOGGED
 			| LSN_P
 			| MAPPING
+			| MASK
+			| MASKING
 			| MATCH
 			| MATCHED
 			| MATERIALIZED

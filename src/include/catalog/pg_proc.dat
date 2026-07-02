@@ -12327,6 +12327,14 @@
   descr => 'row security for current context active on table by table name',
   proname => 'row_security_active', provolatile => 's', prorettype => 'bool',
   proargtypes => 'text', prosrc => 'row_security_active_name' },
+{ oid => '9719',
+  descr => 'column masking for current context active on table by table oid',
+  proname => 'column_masking_active', provolatile => 's', prorettype => 'bool',
+  proargtypes => 'oid', prosrc => 'column_masking_active' },
+{ oid => '9720',
+  descr => 'column masking for current context active on table by table name',
+  proname => 'column_masking_active', provolatile => 's', prorettype => 'bool',
+  proargtypes => 'text', prosrc => 'column_masking_active_name' },
 
 # pg_config
 { oid => '3400', descr => 'pg_config binary as a function',

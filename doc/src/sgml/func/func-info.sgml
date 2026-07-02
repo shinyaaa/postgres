@@ -954,6 +954,21 @@ SELECT has_function_privilege('joeuser', 'myfunc(int, text)', 'execute');
         the current user and current environment?
        </para></entry>
       </row>
+
+      <row>
+       <entry role="func_table_entry"><para role="func_signature">
+        <indexterm>
+         <primary>column_masking_active</primary>
+        </indexterm>
+        <function>column_masking_active</function> (
+          <parameter>table</parameter> <type>text</type> or <type>oid</type> )
+        <returnvalue>boolean</returnvalue>
+       </para>
+       <para>
+        Is column masking active for the specified table in the context of
+        the current user and current environment?
+       </para></entry>
+      </row>
      </tbody>
     </tgroup>
    </table>

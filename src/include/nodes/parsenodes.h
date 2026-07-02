@@ -2576,6 +2576,10 @@ typedef enum AlterTableType
 	AT_DisableRowSecurity,		/* DISABLE ROW SECURITY */
 	AT_ForceRowSecurity,		/* FORCE ROW SECURITY */
 	AT_NoForceRowSecurity,		/* NO FORCE ROW SECURITY */
+	AT_EnableColumnMasking,		/* ENABLE COLUMN MASKING */
+	AT_DisableColumnMasking,	/* DISABLE COLUMN MASKING */
+	AT_ForceColumnMasking,		/* FORCE COLUMN MASKING */
+	AT_NoForceColumnMasking,	/* NO FORCE COLUMN MASKING */
 	AT_GenericOptions,			/* OPTIONS (...) */
 	AT_AttachPartition,			/* ATTACH PARTITION */
 	AT_DetachPartition,			/* DETACH PARTITION */
@@ -3174,9 +3178,12 @@ typedef struct CreatePolicyStmt
 	RangeVar   *table;			/* the table name the policy applies to */
 	char	   *cmd_name;		/* the command name the policy applies to */
 	bool		permissive;		/* restrictive or permissive policy */
+	bool		masking;		/* column masking policy */
 	List	   *roles;			/* the roles associated with the policy */
 	Node	   *qual;			/* the policy's condition */
 	Node	   *with_check;		/* the policy's WITH CHECK condition. */
+	char	   *mask_colname;	/* column to be masked, or NULL */
+	Node	   *mask_expr;		/* masking expression, or NULL */
 } CreatePolicyStmt;
 
 /*----------------------
