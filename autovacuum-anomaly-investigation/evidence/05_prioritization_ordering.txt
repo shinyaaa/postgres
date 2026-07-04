@@ -1,0 +1,23 @@
+## Prioritization: 6 tables, distinct dead counts -> distinct scores; single worker must process highest score first
+-- expected order (score desc) --
+ relname |  dead  | score 
+---------+--------+-------
+ pa      | 100000 |  2000
+ pb      |  50000 |  1000
+ pc      |  20000 |   400
+ pd      |  10000 |   200
+ pe      |   5000 |   100
+ pf      |   1000 |    20
+(6 rows)
+
+-- ACTUAL processing order (by last_autovacuum) --
+ relname |        last_autovacuum        
+---------+-------------------------------
+ pa      | 2026-07-04 23:16:37.836378+00
+ pb      | 2026-07-04 23:16:37.943923+00
+ pc      | 2026-07-04 23:16:38.003065+00
+ pd      | 2026-07-04 23:16:38.019646+00
+ pe      | 2026-07-04 23:16:38.049279+00
+ pf      | 2026-07-04 23:16:38.056673+00
+(6 rows)
+

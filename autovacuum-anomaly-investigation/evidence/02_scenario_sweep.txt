@@ -1,0 +1,14 @@
+## Scenario sweep: dead-tuple / insert-only / analyze / delete — all must autovacuum
+NOTICE:  table "s1" does not exist, skipping
+NOTICE:  table "s2" does not exist, skipping
+NOTICE:  table "s3" does not exist, skipping
+NOTICE:  table "s4" does not exist, skipping
+workload applied at 23:15:21; waiting for autovacuum (naptime=1s)...
+ relname | dead | ins | mod | avc | aac | vac_ran | anl_ran 
+---------+------+-----+-----+-----+-----+---------+---------
+ s1      |    0 |   0 |   0 |   1 |   1 | t       | t
+ s2      |    0 |   0 |   0 |   1 |   1 | t       | t
+ s3      |    0 |   0 |   0 |   1 |   1 | t       | t
+ s4      |    0 |   0 |   0 |   1 |   1 | t       | t
+(4 rows)
+

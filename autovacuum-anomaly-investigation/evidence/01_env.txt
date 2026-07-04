@@ -1,0 +1,6 @@
+HEAD: 6d4ca6de97770cdaee18517dd2f8fe8f4ecee187
+subject: psql: Fix \df tab completion for procedures
+date: 2026-07-03 13:48:59 +0900
+shallow: true, depth=50
+postgres (PostgreSQL) 20devel
+configure: --prefix=$HOME/pgav --enable-debug --enable-cassert CFLAGS="-O0 -g3"

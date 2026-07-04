@@ -1,0 +1,81 @@
+### src/backend/utils/activity/pgstat_relation.c (counter reset vs deferred flush) ###
+  	 * until enough tuples have been inserted to trigger another insert
+  	 * autovacuum.  An anti-wraparound autovacuum will catch any persistent
+  	 * stragglers.
+  	 */
+  	tabentry->ins_since_vacuum = 0;
+  
+  	if (AmAutoVacuumWorkerProcess())
+  	tabentry->dead_tuples = deadtuples;
+  
+  	/*
+  	 * If commanded, reset mod_since_analyze to zero.  This forgets any
+  	 * changes that were committed while the ANALYZE was in progress, but we
+  	 * have no good way to estimate how many of those there were.
+  	 */
+  	if (resetcounter)
+  		tabentry->mod_since_analyze = 0;
+  
+  	if (AmAutoVacuumWorkerProcess())
+
+  flush callback ADDS pending inserts on top of any reset:
+  	/*
+  	 * Using tuples_inserted to update ins_since_vacuum does mean that we'll
+  	 * track aborted inserts too.  This isn't ideal, but otherwise probably
+  	 * not worth adding an extra field for.  It may just amount to autovacuums
+  	 * triggering for inserts more often than they maybe should, which is
+  	 * probably not going to be common enough to be too concerned about here.
+  	 */
+  	tabentry->ins_since_vacuum += lstats->counts.tuples_inserted;
+  
+
+### src/backend/postmaster/autovacuum.c (score comparator, descending) ###
+   * on their scores in descending order.
+   */
+  static int
+  TableToProcessComparator(const ListCell *a, const ListCell *b)
+  {
+  	TableToProcess *t1 = (TableToProcess *) lfirst(a);
+  	TableToProcess *t2 = (TableToProcess *) lfirst(b);
+  
+  	return (t2->score < t1->score) ? -1 : (t2->score > t1->score) ? 1 : 0;
+  }
+
+### threshold + trigger decisions ###
+  	vacthresh = (float4) vac_base_thresh + vac_scale_factor * reltuples;
+  	if (vac_max_thresh >= 0 && vacthresh > (float4) vac_max_thresh)
+  		vacthresh = (float4) vac_max_thresh;
+  
+  	vacinsthresh = (float4) vac_ins_base_thresh +
+  		vac_ins_scale_factor * reltuples * pcnt_unfrozen;
+  	anlthresh = (float4) anl_base_thresh + anl_scale_factor * reltuples;
+  
+  	/* Determine if this table needs vacuum, and update the score. */
+  	scores->vac = (double) vactuples / Max(vacthresh, 1);
+  	scores->vac *= autovacuum_vacuum_score_weight;
+  	scores->max = Max(scores->max, scores->vac);
+  	if (av_enabled && vactuples > vacthresh)
+  		*dovacuum = true;
+  
+  	if (vac_ins_base_thresh >= 0)
+  	{
+  		scores->vac_ins = (double) instuples / Max(vacinsthresh, 1);
+  		scores->vac_ins *= autovacuum_vacuum_insert_score_weight;
+  		scores->max = Max(scores->max, scores->vac_ins);
+  		if (av_enabled && instuples > vacinsthresh)
+  			*dovacuum = true;
+  	}
+  
+  	/*
+  	 * Determine if this table needs analyze, and update the score.  Note that
+  	 * we don't analyze TOAST tables and pg_statistic.
+  	 */
+  	if (relid != StatisticRelationId &&
+  		classForm->relkind != RELKIND_TOASTVALUE)
+  	{
+  		scores->anl = (double) anltuples / Max(anlthresh, 1);
+  		scores->anl *= autovacuum_analyze_score_weight;
+  		scores->max = Max(scores->max, scores->anl);
+  		if (av_enabled && anltuples > anlthresh)
+  			*doanalyze = true;
+  	}

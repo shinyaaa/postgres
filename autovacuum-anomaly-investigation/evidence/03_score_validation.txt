@@ -1,0 +1,14 @@
+## Score validation. GUCs: vac_thresh=50 scale=0.1 max_thresh=500 ins_thresh=100 ins_scale=0 anl_thresh=50 anl_scale=0, weights=1.0
+NOTICE:  table "v1" does not exist, skipping
+-- catalog inputs --
+ reltuples | dead 
+-----------+------
+     10000 | 3000
+(1 row)
+
+-- EXPECT vacthresh=min(50+0.1*10000,500)=500 ; vacuum_score=3000/500=6.00 --
+ vacuum_score 
+--------------
+        6.000
+(1 row)
+

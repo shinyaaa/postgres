@@ -1,0 +1,5 @@
+## Score-weight GUC scaling (autovacuum_vacuum_score_weight). Table: 5000 dead, vac_thresh=50,scale=0 -> base score 100
+weight=1.0 -> vacuum_score=100.00
+weight=3.0 -> vacuum_score=300.00
+weight=0.0 -> vacuum_score=0.00
+(expected 100, 300, 0)

@@ -1,0 +1,6 @@
+[repro] initdb (postgres (PostgreSQL) 20devel)
+[repro] trial 1: ANOMALY -- n_ins_since_vacuum=10000 after VACUUM (expected 0)
+[repro] trial 2: ANOMALY -- n_ins_since_vacuum=10000 after VACUUM (expected 0)
+[repro] trial 3: ANOMALY -- n_ins_since_vacuum=10000 after VACUUM (expected 0)
+[repro] reproduced in 3/3 trials
+exit=1

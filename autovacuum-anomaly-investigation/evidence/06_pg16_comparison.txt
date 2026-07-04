@@ -1,0 +1,25 @@
+## Same-session INSERT + immediate VACUUM (no delay): does VACUUM reset n_ins_since_vacuum?
+## Expected correct value = 0.  Both versions leave it at 10000 -> PRE-EXISTING, not a master regression.
+
+-- PostgreSQL 20devel (master 6d4ca6d) --
+NOTICE:  table "r1" does not exist, skipping
+  v   | ins_after_vacuum 
+------+------------------
+ pg20 |            10000
+(1 row)
+
+-- PostgreSQL 16.13 (stock Ubuntu) --
+NOTICE:  table "r1" does not exist, skipping
+  v   | ins_after_vacuum 
+------+------------------
+ pg16 |            10000
+(1 row)
+
+
+-- Control: with a 2s gap before VACUUM (pending stats flush first), pg20 resets correctly --
+NOTICE:  table "r2" does not exist, skipping
+    v     | ins_after_vacuum 
+----------+------------------
+ pg20+gap |                0
+(1 row)
+

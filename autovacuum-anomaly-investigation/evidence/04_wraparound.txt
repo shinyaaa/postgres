@@ -1,0 +1,20 @@
+## Anti-wraparound: table aged past autovacuum_freeze_max_age(=100000) must be force-vacuumed and relfrozenxid advanced
+-- age before burning xids --
+ rel_age 
+---------
+       1
+(1 row)
+
+-- age after burning 130000 xids (freeze_max_age still 200M until restart -> no force yet) --
+ rel_age 
+---------
+  130001
+(1 row)
+
+-- restart applies freeze_max_age=100000 (PGC_POSTMASTER) --
+-- after restart: expect wrap force-vacuumed, rel_age ~0, autovacuum_count>=1 --
+ rel_age | avc | vac_ran 
+---------+-----+---------
+       0 |   3 | t
+(1 row)
+
