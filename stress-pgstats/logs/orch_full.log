@@ -1,0 +1,8 @@
+=== run full dur=120 loops=a,b,c,d,e at 2026-07-04T12:51:28+00:00 ===
+# monitor label=full dur=120 postmaster=2993 start=2026-07-04T12:51:28+00:00
+--- stopping loops ---
+Terminated
+=== run full done at 2026-07-04T12:53:31+00:00 ===
+latency average = 49.743 ms
+initial connection time = 293.881 ms
+tps = 1005.160202 (without initial connection time)

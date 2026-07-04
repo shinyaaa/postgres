@@ -1,0 +1,15 @@
+# monitor label=full dur=120 postmaster=2993 start=2026-07-04T12:51:28+00:00
+# t  crashes  cores  kind_entries(relation/function/index/backend/database)  pm_rss_kb  tree_rss_kb  nbackends  lock_neg_or_huge
+   0  crashes=0  cores=0  kinds=[backend,-1 database,-1 function,-1 relation,-1 ] pm_rss=33296 tree_rss=532912 nback=46 ntab=122 nfunc=0 lockbad=[]
+  10  crashes=0  cores=0  kinds=[backend,-1 database,-1 function,-1 relation,-1 ] pm_rss=33296 tree_rss=2620416 nback=59 ntab=120 nfunc=0 lockbad=[]
+  20  crashes=0  cores=0  kinds=[backend,-1 database,-1 function,-1 relation,-1 ] pm_rss=33296 tree_rss=3453300 nback=60 ntab=122 nfunc=0 lockbad=[]
+  30  crashes=0  cores=0  kinds=[backend,-1 database,-1 function,-1 relation,-1 ] pm_rss=33296 tree_rss=4144144 nback=60 ntab=122 nfunc=0 lockbad=[]
+  40  crashes=0  cores=0  kinds=[backend,-1 database,-1 function,-1 relation,-1 ] pm_rss=33296 tree_rss=4690092 nback=59 ntab=122 nfunc=0 lockbad=[]
+  50  crashes=0  cores=0  kinds=[backend,-1 database,-1 function,-1 relation,-1 ] pm_rss=33296 tree_rss=5188372 nback=59 ntab=122 nfunc=0 lockbad=[]
+  60  crashes=0  cores=0  kinds=[backend,-1 database,-1 function,-1 relation,-1 ] pm_rss=33296 tree_rss=5621244 nback=61 ntab=122 nfunc=0 lockbad=[]
+  70  crashes=0  cores=0  kinds=[backend,-1 database,-1 function,-1 relation,-1 ] pm_rss=33296 tree_rss=5956656 nback=61 ntab=120 nfunc=0 lockbad=[]
+  80  crashes=0  cores=0  kinds=[backend,-1 database,-1 function,-1 relation,-1 ] pm_rss=33296 tree_rss=6256272 nback=65 ntab=120 nfunc=0 lockbad=[]
+  90  crashes=0  cores=0  kinds=[backend,-1 database,-1 function,-1 relation,-1 ] pm_rss=33296 tree_rss=6460124 nback=59 ntab=122 nfunc=0 lockbad=[]
+ 100  crashes=0  cores=0  kinds=[backend,-1 database,-1 function,-1 relation,-1 ] pm_rss=33296 tree_rss=6642052 nback=60 ntab=120 nfunc=0 lockbad=[]
+ 110  crashes=0  cores=0  kinds=[backend,-1 database,-1 function,-1 relation,-1 ] pm_rss=33296 tree_rss=6859224 nback=61 ntab=120 nfunc=1 lockbad=[]
+# monitor end=2026-07-04T12:53:31+00:00

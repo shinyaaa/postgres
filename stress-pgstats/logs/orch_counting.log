@@ -1,0 +1,25 @@
+=== run count_noreset dur=90 loops=b,c,d,e,f at 2026-07-04T13:03:29+00:00 ===
+# monitor label=count_noreset dur=90 postmaster=15133 start=2026-07-04T13:03:29+00:00
+--- stopping loops ---
+Terminated
+=== run count_noreset done at 2026-07-04T13:05:03+00:00 ===
+latency average = 57.101 ms
+initial connection time = 100.518 ms
+tps = 875.641718 (without initial connection time)
+=== after noreset: accumulated lock stats (expect large positive, no negatives) ===
+   locktype    | waits | wait_time  | fastpath_exceeded 
+---------------+-------+------------+-------------------
+ advisory      |   120 |  28355.382 |                 0
+ relation      |     0 |          0 |            895391
+ transactionid |  1712 | 286012.025 |                 0
+ tuple         |   353 |  58731.112 |                 0
+(4 rows)
+
+=== run count_full dur=90 loops=a,b,c,d,e,f at 2026-07-04T13:05:03+00:00 ===
+# monitor label=count_full dur=90 postmaster=15133 start=2026-07-04T13:05:03+00:00
+--- stopping loops ---
+Terminated
+=== run count_full done at 2026-07-04T13:06:36+00:00 ===
+latency average = 56.163 ms
+initial connection time = 102.891 ms
+tps = 890.263880 (without initial connection time)

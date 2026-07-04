@@ -1,0 +1,5 @@
+# monitor label=smoke dur=20 postmaster=2993 start=2026-07-04T12:48:42+00:00
+# t  crashes  cores  kind_entries(relation/function/index/backend/database)  pm_rss_kb  tree_rss_kb  nbackends  lock_neg_or_huge
+   0  crashes=0  cores=0  kinds=[backend,-1 database,-1 function,-1 relation,-1 ] pm_rss=33296 tree_rss=421464 nback=50 lockbad=[]
+  10  crashes=0  cores=0  kinds=[backend,-1 database,-1 function,-1 relation,-1 ] pm_rss=33296 tree_rss=2260744 nback=60 lockbad=[]
+# monitor end=2026-07-04T12:49:02+00:00

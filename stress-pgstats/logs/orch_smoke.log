@@ -1,0 +1,10 @@
+=== run smoke dur=20 loops=a,b,c,d,e at 2026-07-04T12:48:42+00:00 ===
+# monitor label=smoke dur=20 postmaster=2993 start=2026-07-04T12:48:42+00:00
+--- stopping loops ---
+Terminated
+Terminated
+Terminated
+=== run smoke done at 2026-07-04T12:49:02+00:00 ===
+latency average = 47.656 ms
+initial connection time = 219.413 ms
+tps = 1049.195904 (without initial connection time)

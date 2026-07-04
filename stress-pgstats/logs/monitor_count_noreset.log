@@ -1,0 +1,12 @@
+# monitor label=count_noreset dur=90 postmaster=15133 start=2026-07-04T13:03:29+00:00
+# t  crashes  cores  kind_entries(relation/function/index/backend/database)  pm_rss_kb  tree_rss_kb  nbackends  lock_neg_or_huge
+   0  crashes=0  cores=0  kinds=[backend,-1 database,-1 function,-1 relation,-1 ] pm_rss=23792 tree_rss=534608 nback=58 ntab=166 nfunc=1 lockbad=[]
+  10  crashes=0  cores=0  kinds=[backend,-1 database,-1 function,-1 relation,-1 ] pm_rss=23792 tree_rss=1662240 nback=62 ntab=166 nfunc=1 lockbad=[]
+  20  crashes=0  cores=0  kinds=[backend,-1 database,-1 function,-1 relation,-1 ] pm_rss=23792 tree_rss=2397908 nback=61 ntab=166 nfunc=1 lockbad=[]
+  30  crashes=0  cores=0  kinds=[backend,-1 database,-1 function,-1 relation,-1 ] pm_rss=23792 tree_rss=3117344 nback=61 ntab=168 nfunc=1 lockbad=[]
+  40  crashes=0  cores=0  kinds=[backend,-1 database,-1 function,-1 relation,-1 ] pm_rss=23792 tree_rss=3764804 nback=61 ntab=166 nfunc=1 lockbad=[]
+  50  crashes=0  cores=0  kinds=[backend,-1 database,-1 function,-1 relation,-1 ] pm_rss=23792 tree_rss=4181900 nback=61 ntab=168 nfunc=1 lockbad=[]
+  60  crashes=0  cores=0  kinds=[backend,-1 database,-1 function,-1 relation,-1 ] pm_rss=23792 tree_rss=4690524 nback=63 ntab=168 nfunc=1 lockbad=[]
+  70  crashes=0  cores=0  kinds=[backend,-1 database,-1 function,-1 relation,-1 ] pm_rss=23792 tree_rss=5053784 nback=63 ntab=166 nfunc=1 lockbad=[]
+  80  crashes=0  cores=0  kinds=[backend,-1 database,-1 function,-1 relation,-1 ] pm_rss=23792 tree_rss=5447764 nback=67 ntab=166 nfunc=1 lockbad=[]
+# monitor end=2026-07-04T13:05:02+00:00

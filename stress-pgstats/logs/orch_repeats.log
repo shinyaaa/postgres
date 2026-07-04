@@ -1,0 +1,32 @@
+=== run rep1 dur=60 loops=a,b,c,d,e at 2026-07-04T12:55:38+00:00 ===
+# monitor label=rep1 dur=60 postmaster=6244 start=2026-07-04T12:55:38+00:00
+--- stopping loops ---
+Terminated
+Terminated
+=== run rep1 done at 2026-07-04T12:56:40+00:00 ===
+latency average = 49.266 ms
+initial connection time = 115.703 ms
+tps = 1014.902702 (without initial connection time)
+===== finished rep1 =====
+=== run rep2 dur=60 loops=a,b,c,d,e at 2026-07-04T12:56:40+00:00 ===
+# monitor label=rep2 dur=60 postmaster=6244 start=2026-07-04T12:56:40+00:00
+--- stopping loops ---
+Terminated
+Terminated
+Terminated
+=== run rep2 done at 2026-07-04T12:57:42+00:00 ===
+latency average = 48.923 ms
+initial connection time = 86.885 ms
+tps = 1022.007383 (without initial connection time)
+===== finished rep2 =====
+=== run rep3 dur=60 loops=a,b,c,d,e at 2026-07-04T12:57:42+00:00 ===
+# monitor label=rep3 dur=60 postmaster=6244 start=2026-07-04T12:57:42+00:00
+--- stopping loops ---
+Terminated
+Terminated
+Terminated
+=== run rep3 done at 2026-07-04T12:58:44+00:00 ===
+latency average = 48.485 ms
+initial connection time = 88.494 ms
+tps = 1031.241713 (without initial connection time)
+===== finished rep3 =====

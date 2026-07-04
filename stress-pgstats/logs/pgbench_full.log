@@ -1,0 +1,14 @@
+pgbench (20devel)
+starting vacuum...end.
+transaction type: <builtin: TPC-B (sort of)>
+scaling factor: 10
+query mode: simple
+number of clients: 50
+number of threads: 4
+maximum number of tries: 1
+duration: 120 s
+number of transactions actually processed: 120454
+number of failed transactions: 0 (0.000%)
+latency average = 49.743 ms
+initial connection time = 293.881 ms
+tps = 1005.160202 (without initial connection time)
