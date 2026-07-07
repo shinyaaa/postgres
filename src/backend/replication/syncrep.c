@@ -208,13 +208,13 @@ SyncRepWaitForLSN(XLogRecPtr lsn, bool commit)
 	if (WalSndCtl->sync_standbys_status & SYNC_STANDBY_INIT)
 	{
 		if ((WalSndCtl->sync_standbys_status & SYNC_STANDBY_DEFINED) == 0 ||
-			lsn <= WalSndCtl->lsn[mode])
+			lsn <= pg_atomic_read_u64(&WalSndCtl->lsn[mode]))
 		{
 			LWLockRelease(SyncRepLock);
 			return;
 		}
 	}
-	else if (lsn <= WalSndCtl->lsn[mode])
+	else if (lsn <= pg_atomic_read_u64(&WalSndCtl->lsn[mode]))
 	{
 		/*
 		 * The LSN is older than what we need to wait for.  The sync standby
@@ -483,7 +483,6 @@ SyncRepInitConfig(void)
 void
 SyncRepReleaseWaiters(void)
 {
-	volatile WalSndCtlData *walsndctl = WalSndCtl;
 	XLogRecPtr	writePtr;
 	XLogRecPtr	flushPtr;
 	XLogRecPtr	applyPtr;
@@ -558,19 +557,19 @@ SyncRepReleaseWaiters(void)
 	 * Set the lsn first so that when we wake backends they will release up to
 	 * this location.
 	 */
-	if (walsndctl->lsn[SYNC_REP_WAIT_WRITE] < writePtr)
+	if (pg_atomic_read_u64(&WalSndCtl->lsn[SYNC_REP_WAIT_WRITE]) < writePtr)
 	{
-		walsndctl->lsn[SYNC_REP_WAIT_WRITE] = writePtr;
+		pg_atomic_write_u64(&WalSndCtl->lsn[SYNC_REP_WAIT_WRITE], writePtr);
 		numwrite = SyncRepWakeQueue(false, SYNC_REP_WAIT_WRITE);
 	}
-	if (walsndctl->lsn[SYNC_REP_WAIT_FLUSH] < flushPtr)
+	if (pg_atomic_read_u64(&WalSndCtl->lsn[SYNC_REP_WAIT_FLUSH]) < flushPtr)
 	{
-		walsndctl->lsn[SYNC_REP_WAIT_FLUSH] = flushPtr;
+		pg_atomic_write_u64(&WalSndCtl->lsn[SYNC_REP_WAIT_FLUSH], flushPtr);
 		numflush = SyncRepWakeQueue(false, SYNC_REP_WAIT_FLUSH);
 	}
-	if (walsndctl->lsn[SYNC_REP_WAIT_APPLY] < applyPtr)
+	if (pg_atomic_read_u64(&WalSndCtl->lsn[SYNC_REP_WAIT_APPLY]) < applyPtr)
 	{
-		walsndctl->lsn[SYNC_REP_WAIT_APPLY] = applyPtr;
+		pg_atomic_write_u64(&WalSndCtl->lsn[SYNC_REP_WAIT_APPLY], applyPtr);
 		numapply = SyncRepWakeQueue(false, SYNC_REP_WAIT_APPLY);
 	}
 
@@ -915,7 +914,6 @@ SyncRepGetStandbyPriority(void)
 static int
 SyncRepWakeQueue(bool all, int mode)
 {
-	volatile WalSndCtlData *walsndctl = WalSndCtl;
 	int			numprocs = 0;
 	dlist_mutable_iter iter;
 
@@ -930,7 +928,7 @@ SyncRepWakeQueue(bool all, int mode)
 		/*
 		 * Assume the queue is ordered by LSN
 		 */
-		if (!all && walsndctl->lsn[mode] < proc->waitLSN)
+		if (!all && pg_atomic_read_u64(&WalSndCtl->lsn[mode]) < proc->waitLSN)
 			return numprocs;
 
 		/*

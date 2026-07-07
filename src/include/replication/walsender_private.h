@@ -16,6 +16,7 @@
 #include "lib/ilist.h"
 #include "nodes/nodes.h"
 #include "nodes/replnodes.h"
+#include "port/atomics.h"
 #include "replication/syncrep.h"
 #include "storage/condition_variable.h"
 #include "storage/shmem.h"
@@ -91,9 +92,16 @@ typedef struct
 
 	/*
 	 * Current location of the head of the queue. All waiters should have a
-	 * waitLSN that follows this value. Protected by SyncRepLock.
+	 * waitLSN that follows this value.
+	 *
+	 * Updates are protected by SyncRepLock, so that a waiter is added to the
+	 * queue and these values are advanced atomically with respect to each
+	 * other.  The values only ever move forward.  They are stored as atomics
+	 * so that they can also be read without holding SyncRepLock; a stale
+	 * (older) read is always safe for such readers, since a value satisfying
+	 * their check can be relied on.
 	 */
-	XLogRecPtr	lsn[NUM_SYNC_REP_WAIT_MODE];
+	pg_atomic_uint64 lsn[NUM_SYNC_REP_WAIT_MODE];
 
 	/*
 	 * Status of data related to the synchronous standbys.  Waiting backends
