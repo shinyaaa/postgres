@@ -34,6 +34,9 @@ SELECT * FROM undo.as_of(NULL::users, now() - interval '1 hour');
 
 ## How it works
 
+A detailed as-built architecture document (in Japanese) lives in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
 A background worker (started via `shared_preload_libraries`) consumes a
 logical replication slot **in-process** — no walsender, no network. The
 bundled output plugin buffers old/new row images of committed

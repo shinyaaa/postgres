@@ -1,6 +1,7 @@
 # pg_undo — Ctrl+Z for PostgreSQL 設計書
 
 > **実装状況**: v0.1 MVP(履歴キャプチャ+undo)、v0.2(ごみ箱)、v0.3(タイムトラベル)、v0.4(巨大トランザクションのディスクスピル)を実装済み(本リポジトリ `pg_undo/` ディレクトリ)。
+> **実装のas-built詳細設計は [`pg_undo/docs/ARCHITECTURE.md`](pg_undo/docs/ARCHITECTURE.md) を参照**(本書は企画段階の設計書であり、両者が食い違う場合はARCHITECTURE.mdが正)。
 > ロードマップ変更: `changed_by` が取得不能なため §6 の v0.2(by_role フィルタ)は成立せず、**v0.2 = §3.5 のごみ箱、v0.3 = §3.4 のタイムトラベル**として実装した。as_of の構文は設計時の `AS t(LIKE users)` 方式ではなく、ポリモーフィック引数方式 `undo.as_of(NULL::users, ts)` を採用(呼び出しが簡潔で型定義リスト不要のため)。
 > **対象バージョンは PostgreSQL 19(19devel/19beta1)に限定**(`pg_undo.h` でコンパイル時に強制)。
 > 実装で判明した設計からの変更点: §3.2 の `changed_by` は WAL にロール情報が載らないため v0.1 では NULL。
