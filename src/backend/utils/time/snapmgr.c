@@ -1928,18 +1928,18 @@ XidInMVCCSnapshot(TransactionId xid, Snapshot snapshot)
 		return true;
 
 	/*
-	 * Snapshots built by GetSnapshotData() outside recovery carry a CSN and
-	 * are checked against pg_csnlog: one lookup per XID, with no dependency
-	 * on any backend's subxid-cache overflow state and no pg_subtrans
-	 * access.  Fabricated snapshots (snapshotCsn == InvalidCommitSeqNo,
-	 * e.g. logical decoding's initial snapshots) and recovery snapshots
-	 * still use the xip/subxip representation.
+	 * Snapshots built by GetSnapshotData() - in normal running and in hot
+	 * standby alike - carry a CSN and are checked against pg_csnlog: one
+	 * lookup per XID, with no dependency on any backend's subxid-cache
+	 * overflow state (or, on a standby, on lastOverflowedXid) and no
+	 * pg_subtrans access.  Only fabricated snapshots without a CSN
+	 * (snapshotCsn == InvalidCommitSeqNo, e.g. logical decoding's initial
+	 * snapshots) still use the xip/subxip representation.
 	 *
 	 * In assert-enabled builds, cross-check the two representations against
 	 * each other; they must always agree.
 	 */
-	if (snapshot->snapshotCsn != InvalidCommitSeqNo &&
-		!snapshot->takenDuringRecovery)
+	if (snapshot->snapshotCsn != InvalidCommitSeqNo)
 	{
 		bool		in_snapshot = XidInMVCCSnapshotByCSN(xid, snapshot);
 
@@ -2010,13 +2010,8 @@ AssertCsnVisibilityConsistency(TransactionId xid, Snapshot snapshot,
 {
 	CommitSeqNo csn;
 
-	/*
-	 * Only snapshots built by GetSnapshotData() outside recovery carry a
-	 * CSN that is consistent with their xip arrays.  (Recovery snapshots
-	 * gain a meaningful CSN in a later phase.)
-	 */
-	if (snapshot->snapshotCsn == InvalidCommitSeqNo ||
-		snapshot->takenDuringRecovery)
+	/* Only snapshots built by GetSnapshotData() carry a CSN to check. */
+	if (snapshot->snapshotCsn == InvalidCommitSeqNo)
 		return;
 
 	/*
@@ -2030,7 +2025,16 @@ AssertCsnVisibilityConsistency(TransactionId xid, Snapshot snapshot,
 	csn = CSNLogGetCommitSeqNo(xid);
 
 	if (csn == InvalidCommitSeqNo)
-		Assert(in_snapshot);
+	{
+		/*
+		 * Not committed to this day: the snapshot must have seen the XID as
+		 * running.  This inference doesn't hold during recovery, where an
+		 * XID that crashed on the primary before the WAL replay window is
+		 * "in progress" in pg_csnlog but was never known-assigned (both
+		 * representations return "invisible" for it, via different routes).
+		 */
+		Assert(in_snapshot || snapshot->takenDuringRecovery);
+	}
 	else if (csn >= FirstNormalCommitSeqNo)
 		Assert(in_snapshot == (csn > snapshot->snapshotCsn));
 }
