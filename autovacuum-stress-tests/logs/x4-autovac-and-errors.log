@@ -1,0 +1,5 @@
+=== PANIC/TRAP/Assert count ===
+0
+=== real ERROR/FATAL (excl. root-noise, av-cancel, not-yet-accepting) ===
+0
+=== autovacuum runs on pgbench tables ===

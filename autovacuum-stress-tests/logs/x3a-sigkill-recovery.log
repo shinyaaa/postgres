@@ -1,0 +1,19 @@
+2026-07-04 23:02:37.904 UTC [16873] LOG:  autovacuum worker (PID 21888) was terminated by signal 9: Killed
+2026-07-04 23:02:37.904 UTC [16873] DETAIL:  Failed process was running: autovacuum: VACUUM ANALYZE public.cx
+2026-07-04 23:02:37.904 UTC [16873] LOG:  terminating any other active server processes
+2026-07-04 23:02:37.912 UTC [16873] LOG:  all server processes terminated; reinitializing
+2026-07-04 23:02:37.960 UTC [23590] LOG:  database system was interrupted; last known up at 2026-07-04 23:00:28 UTC
+2026-07-04 23:02:38.478 UTC [23590] LOG:  database system was not properly shut down; automatic recovery in progress
+2026-07-04 23:02:38.480 UTC [23590] LOG:  redo starts at 0/6410B600
+2026-07-04 23:02:41.175 UTC [23595] FATAL:  the database system is not yet accepting connections
+2026-07-04 23:02:41.175 UTC [23595] DETAIL:  Consistent recovery state has not been yet reached.
+2026-07-04 23:02:46.182 UTC [23956] FATAL:  the database system is not yet accepting connections
+2026-07-04 23:02:46.182 UTC [23956] DETAIL:  Consistent recovery state has not been yet reached.
+2026-07-04 23:02:48.480 UTC [23590] LOG:  redo in progress, elapsed time: 10.00 s, current LSN: 0/99496518
+2026-07-04 23:02:51.189 UTC [23966] FATAL:  the database system is not yet accepting connections
+2026-07-04 23:02:51.189 UTC [23966] DETAIL:  Consistent recovery state has not been yet reached.
+2026-07-04 23:02:51.651 UTC [23590] LOG:  unexpected pageaddr 0/4F614000 in WAL segment 00000001000000000000009D, LSN 0/9D614000, offset 6373376
+2026-07-04 23:02:51.651 UTC [23590] LOG:  redo done at 0/9D613F18 system usage: CPU: user: 12.16 s, system: 1.00 s, elapsed: 13.17 s
+2026-07-04 23:02:51.719 UTC [23591] LOG:  checkpoint starting: end-of-recovery fast wait
+2026-07-04 23:02:54.415 UTC [23591] LOG:  checkpoint complete: end-of-recovery fast wait: wrote 16359 buffers (99.8%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 57 recycled; write=0.190 s, sync=2.434 s, total=2.697 s; sync files=36, longest=0.934 s, average=0.068 s; distance=939042 kB, estimate=939042 kB; lsn=0/9D614048, redo lsn=0/9D614048
+2026-07-04 23:02:54.419 UTC [16873] LOG:  database system is ready to accept connections

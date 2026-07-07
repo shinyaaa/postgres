@@ -1,0 +1,4 @@
+2026-07-04 23:01:42.976 UTC [21880] STATEMENT:  LOCK TABLE cx IN ACCESS EXCLUSIVE MODE; SELECT 1 AS got_lock;
+2026-07-04 23:01:42.976 UTC [21870] ERROR:  canceling autovacuum task
+2026-07-04 23:01:42.976 UTC [21870] CONTEXT:  while scanning block 221 of relation "public.cx"
+	automatic vacuum of table "postgres.public.cx"

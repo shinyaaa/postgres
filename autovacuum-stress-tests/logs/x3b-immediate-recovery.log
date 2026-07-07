@@ -1,0 +1,8 @@
+2026-07-04 23:08:13.157 UTC [27372] LOG:  database system was interrupted; last known up at 2026-07-04 23:02:54 UTC
+2026-07-04 23:08:13.721 UTC [27372] LOG:  database system was not properly shut down; automatic recovery in progress
+2026-07-04 23:08:13.723 UTC [27372] LOG:  redo starts at 0/9D6140C8
+2026-07-04 23:08:15.786 UTC [27372] LOG:  invalid record length at 0/A8CC8FA0: expected at least 24, got 0
+2026-07-04 23:08:15.786 UTC [27372] LOG:  redo done at 0/A8CC8F78 system usage: CPU: user: 1.76 s, system: 0.29 s, elapsed: 2.06 s
+2026-07-04 23:08:15.798 UTC [27370] LOG:  checkpoint starting: end-of-recovery fast wait
+2026-07-04 23:08:16.487 UTC [27370] LOG:  checkpoint complete: end-of-recovery fast wait: wrote 16382 buffers (100.0%), wrote 3 SLRU buffers; 0 WAL file(s) added, 11 removed, 0 recycled; write=0.162 s, sync=0.473 s, total=0.690 s; sync files=12, longest=0.303 s, average=0.040 s; distance=187091 kB, estimate=187091 kB; lsn=0/A8CC8FA0, redo lsn=0/A8CC8FA0
+2026-07-04 23:08:16.491 UTC [27366] LOG:  database system is ready to accept connections

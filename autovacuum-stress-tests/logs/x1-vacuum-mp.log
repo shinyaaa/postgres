@@ -1,0 +1,18 @@
+2026-07-04 22:58:46.011 UTC [18138] LOG:  automatic vacuum of table "postgres.public.mp": index scans: 3
+	pages: 0 removed, 41667 remain, 41667 scanned (100.00% of total), 0 eagerly scanned
+	tuples: 40 removed, 2500000 remain, 0 are dead but not yet removable
+	removable cutoff: 712, which was 0 XIDs old when operation ended
+	frozen: 0 pages from table (0.00% of total) had 0 tuples frozen
+	visibility map: 41667 pages set all-visible, 36925 pages set all-frozen (0 were all-visible)
+	index scan needed: 41667 pages from table (100.00% of total) had 2500000 dead item identifiers removed
+	index "mp_a": pages: 13713 in total, 0 newly deleted, 0 currently deleted, 0 reusable
+	index "mp_b": pages: 36045 in total, 0 newly deleted, 0 currently deleted, 0 reusable
+	avg read rate: 152.340 MB/s, avg write rate: 131.386 MB/s
+	buffer usage: 89585 hits, 184788 reads, 159371 dirtied
+	WAL usage: 162493 records, 109909 full page images, 542941871 bytes, 531915236 full page image bytes, 7281 buffers full
+	memory usage: dead item storage 2.83 MB accumulated across 3 resets (limit 1.00 MB each)
+	system usage: CPU: user: 4.95 s, system: 0.75 s, elapsed: 9.47 s
+2026-07-04 23:00:28.738 UTC [16877] LOG:  checkpoint complete: wal: wrote 14129 buffers (86.2%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 33 recycled; write=108.750 s, sync=0.220 s, total=109.011 s; sync files=13, longest=0.164 s, average=0.017 s; distance=541603 kB, estimate=541603 kB; lsn=0/821639E8, redo lsn=0/6410B600
+2026-07-04 23:00:30.842 UTC [16877] LOG:  checkpoint starting: wal
+2026-07-04 23:00:39.776 UTC [20286] LOG:  automatic vacuum of table "postgres.public.cx": index scans: 0
+	pages: 0 removed, 25000 remain, 25000 scanned (100.00% of total), 0 eagerly scanned
