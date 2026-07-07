@@ -192,7 +192,7 @@ CREATE TABLE undo.history (
 
 | 項目 | 選択 | 理由 |
 |---|---|---|
-| 言語 / フレームワーク | **Rust + pgrx** | bgworker・フック・SQL 関数を一つのクレートで安全に実装できる。pgrx 自体の注目度によるスター流入も期待できる |
+| 言語 / フレームワーク | **Rust + pgrx**(詳細検討は §9。キャプチャ経路は性能次第で C 化の余地を残す) | bgworker・フック・SQL 関数を一つのクレートで安全に実装できる。pgrx 自体の注目度によるスター流入も期待できる |
 | 対応バージョン | PostgreSQL 14–18 | pgrx のサポート範囲に準拠 |
 | 配布 | pgxn / apt・rpm(pgdg 互換)/ Docker イメージ / Pigsty・Trunk 登録 | 「試すまで 1 分」を担保 |
 | テスト | pgrx test + pgTAP、CI で全対応バージョン × amd64/arm64 | |
@@ -242,3 +242,77 @@ CREATE TABLE undo.history (
 | REPLICA IDENTITY FULL のオーバーヘッドが嫌われる | PG16+ の replica identity index 活用、track 時に「キー列のみモード」(undo 精度とのトレードオフ)を提供 |
 | マネージドサービスで shared_preload_libraries を設定できない | トリガーベースのフォールバックモード(機能限定)を v0.4 で検討 |
 | 履歴テーブル自体の肥大 | max_history_size の強制 + フェイルセーフ停止(§3.6) |
+
+---
+
+## 9. 実装言語の詳細検討:pgrx (Rust) vs C
+
+§4 では pgrx を仮置きしたが、pg_undo は Postgres 内部 API への依存が深い拡張であり、言語選定は設計判断として詳細に検討する。
+
+### 9.1 前提:pg_undo が必要とする低レベル機能の棚卸し
+
+まず「どちらの言語でも書ける SQL/PLpgSQL 層」と「言語選定が効く低レベル層」を分離する。
+
+| コンポーネント | 必要な内部 API | pgrx での実現性 | C での実現性 |
+|---|---|---|---|
+| SQL API 層(`preview` / `apply` / `as_of` / `recent_changes`) | 不要(履歴テーブルへの SQL) | ◎ そもそも大半を **SQL / PLpgSQL** で書くべき層。言語選定の影響なし | ◎ 同左 |
+| GUC 定義 | GUC 登録 | ◎ `GucRegistry` で安全にラップ済み | ◎ ネイティブ |
+| janitor bgworker | bgworker 登録 + SPI | ◎ `BackgroundWorkerBuilder` + SPI ラッパーあり | ◎ ネイティブ |
+| DROP 横取り | **ProcessUtility hook** | ○ `pgrx::hooks::PgHooks` に process_utility があるが、`DropStmt` のパースツリー操作は結局 `pg_sys` の生構造体を unsafe で触る | ◎ ネイティブ。参考実装多数 |
+| 変更キャプチャ(本丸) | **logical decoding の消費**(decoding context / output plugin / ReorderBuffer) | △ pgrx にラッパーが**存在しない**。選択肢は (a) `pg_sys` 直叩きの unsafe 塊、(b) SPI で `pg_logical_slot_get_binary_changes()` + `pgoutput` を Rust 側でパース(crates.io にパーサあり) | ◎ wal2json / pglogical / test_decoding という**枯れた参考実装**がそのまま使える |
+
+**重要な観察**:pg_undo の技術的な本丸(decoding 消費)では pgrx の安全性メリットが薄まる。(a) を選べば実質「Rust の皮を被った C」になり、(b) を選べば安全だが SPI 経由のオーバーヘッドとテキスト/バイナリ変換コストを負う。
+
+### 9.2 比較マトリクス
+
+| 観点 | pgrx (Rust) | C | 備考 |
+|---|---|---|---|
+| 開発速度・保守性 | ◎ cargo、型安全、`cargo pgrx test` で複数 PG バージョン一括テスト | △ PGXS + 手書き regression test | 少人数 OSS では効く差 |
+| メモリ安全性 | ◎(unsafe 境界外) | △ 自力管理 | hook や bgworker のバグは**サーバごと落とす**。「入れたら本番が死んだ」を避けたい pg_undo の思想 (§3.6) と整合するのは Rust |
+| 本丸(decoding)の書きやすさ | △ ラッパー無し・前例少 | ◎ wal2json 等の前例豊富 | **C が明確に有利な唯一の技術領域** |
+| PG 新メジャー追従 | △ pgrx のバインディング対応を待つ(PG18 対応は 2025-09 と比較的速いが、依存が一段増える) | ◎ 自力で即対応可能 | |
+| ビルド時間・CI | △ 遅い(v0.18 で半減したが C より重い) | ◎ 数秒〜数分 | |
+| **公式パッケージング (PGDG)** | ✕ **PGDG は Rust 拡張をパッケージしない方針**(コンパイル時間が理由)。apt/yum の公式経路が閉ざされる | ◎ PGDG 収録の可能性がある | 配布面で最大の C 優位点 |
+| 代替配布路 | ○ Trunk / Pigsty / PGXN / GitHub Releases のバイナリ、Docker | ◎ 上記すべて + PGDG | Pigsty は pg_search 等 Rust 拡張を多数配布済み |
+| マネージドサービス (RDS 等) | ✕ 現状 RDS では不可 | ✕ **同じく不可** | RDS は言語に関係なく allowlist 制。pg_undo は hook + bgworker + `shared_preload_libraries` 必須なので、**どちらで書いても当面セルフホスト / セルフマネージド向け**。この観点は実は言語選定に効かない |
+| コントリビュータ獲得 | ◎ Rust コミュニティから流入(pg_search、pgvectorscale が実証) | ○ Postgres ハッカー層と相性が良いが母数が少ない | スター獲得戦略と直結 |
+| 話題性・スター | ◎ 「Rust製」自体がローンチ時のフックになる | △ | |
+
+### 9.3 先行事例からの学び
+
+- **pgmq**:pgrx で始まり、のちに配布性のため**ほぼ pure SQL に舵を切った**。「SQL で書ける拡張に Rust を使うと配布だけが重くなる」という教訓。ただし pg_undo は hook + bgworker が必須なので **SQL-only という逃げ道は存在しない**。ネイティブコードをどの言語で書くかからは逃げられない。
+- **pg_search (ParadeDB) / pgvectorscale (Timescale)**:pgrx のまま大規模プロダクションに到達。GitHub Releases + Docker + Pigsty 配布で PGDG 非収録を補えることを実証。
+- **wal2json / pglogical**:C による logical decoding 実装の教科書。キャプチャ経路を C で書く場合の参照実装として最適。
+
+### 9.4 選択肢と推奨
+
+| 案 | 内容 | 評価 |
+|---|---|---|
+| A. full pgrx | すべて pgrx。キャプチャは SPI + `pgoutput` パース(Rust crate)で開始し、性能不足なら `pg_sys` 直叩きに深化 | **推奨** |
+| B. full C | すべて C(PGXS)。wal2json 系の実装をベースにキャプチャを構築 | 配布・内部 API 適合性は最良だが、開発速度・テスト・話題性・安全性で劣る |
+| C. ハイブリッド | キャプチャ用 output plugin のみ C の小さな .so に分離し、制御層は pgrx | 技術的には合理的だが、ビルド系が二重になり OSS としての参入障壁(コントリビュートしにくさ)が上がる。v1 以降の最適化オプションに留める |
+
+**推奨:案 A(full pgrx)を第一候補とし、下記 PoC の結果で確定する。**
+
+理由:
+1. 本プロジェクトの目的(スター獲得・コミュニティ形成)に対して、Rust の話題性とコントリビュータ獲得力は直接的な武器になる。
+2. サーバプロセス内で hook を張る拡張として、unsafe 境界を最小化できる安全性は「本番を壊さない」というプロダクトの信頼性メッセージと一貫する。
+3. 決定的な C の優位点は「PGDG 配布」と「decoding の書きやすさ」の 2 点に集約されるが、前者は Trunk/Pigsty/Docker で代替可能(pg_search が実証)、後者は SPI + pgoutput パース方式で unsafe を回避したまま MVP に到達できる。
+4. マネージドサービス非対応は言語に依らない制約であり、C を選んでも解消しない。
+
+### 9.5 決定前に行う PoC スパイク(合計 1〜2 週間)
+
+推奨はあくまで仮説であり、以下の 3 本のスパイクで裏取りしてから確定する:
+
+1. **PoC-1: DROP 横取り**(2 日)— pgrx の `PgHooks::process_utility` で `DropStmt` を検知し `SET SCHEMA` に置換できるか。unsafe の量と PG 14〜18 での互換性を確認。
+2. **PoC-2: キャプチャ性能**(1 週間)— bgworker + SPI + `pg_logical_slot_get_binary_changes()` + pgoutput パースで、pgbench 実行中の取りこぼし遅延と TPS への影響を測定。比較対象として wal2json (C) の同条件値を取る。
+   - **判断基準**:pgbench (scale 100, 32 clients) で TPS 低下 5% 未満、キャプチャ遅延 p99 < 5 秒。満たせなければ `pg_sys` 直叩き実装を追加検証し、それでも不足なら案 C(ハイブリッド)へ。
+3. **PoC-3: 配布ドライラン**(2 日)— `cargo pgrx package` から deb/rpm/Docker を生成し、CI(GitHub Actions、PG 5 バージョン × amd64/arm64)の所要時間を測定。**判断基準**:フル CI 30 分以内。
+
+### 9.6 C を選ぶべき条件(撤退基準)
+
+以下のいずれかに該当する場合は案 B(full C)に切り替える:
+
+- PoC-2 で SPI 方式・pg_sys 方式ともに性能基準を満たせない
+- PGDG 収録(ディストロ公式リポジトリからの `apt install`)を戦略上の必達目標に格上げする場合
+- 将来、本家コミュニティへの寄贈(contrib 入り)を狙う方針に転換する場合(contrib は C のみ)
