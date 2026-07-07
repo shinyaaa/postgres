@@ -190,6 +190,17 @@ SyncRepWaitForLSN(XLogRecPtr lsn, bool commit)
 	Assert(dlist_node_is_detached(&MyProc->syncRepLinks));
 	Assert(WalSndCtl != NULL);
 
+	/*
+	 * Fast exit if the LSN we are interested in has already been confirmed
+	 * by a synchronous standby.  WalSndCtl->lsn[] only ever moves forward,
+	 * so if we read a value satisfying our wait, it is safe to return
+	 * without taking SyncRepLock.  A stale (older) read is harmless: we
+	 * will just take the lock and recheck below before joining the queue,
+	 * so no wakeup can be missed.
+	 */
+	if (lsn <= pg_atomic_read_u64(&WalSndCtl->lsn[mode]))
+		return;
+
 	LWLockAcquire(SyncRepLock, LW_EXCLUSIVE);
 	Assert(MyProc->syncRepState == SYNC_REP_NOT_WAITING);
 
