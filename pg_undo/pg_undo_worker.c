@@ -114,6 +114,7 @@ ensure_extension_ready(void)
 	{
 		bool		found = false;
 
+		SetCurrentStatementStartTimestamp();
 		StartTransactionCommand();
 		SPI_connect();
 		PushActiveSnapshot(GetTransactionSnapshot());
@@ -157,6 +158,7 @@ ensure_slot(void)
 			(errmsg("pg_undo: creating logical replication slot \"%s\"",
 					PG_UNDO_SLOT_NAME)));
 
+	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
 
 	CheckLogicalDecodingRequirements(false);
@@ -201,6 +203,7 @@ refresh_tracked_rels(void)
 											  "pg_undo tracked relations",
 											  ALLOCSET_SMALL_SIZES);
 
+	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
 	SPI_connect();
 	PushActiveSnapshot(GetTransactionSnapshot());
@@ -460,6 +463,7 @@ flush_completed_txns(void)
 	if (undo_completed_txns == NIL)
 		return;
 
+	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
 	SPI_connect();
 	PushActiveSnapshot(GetTransactionSnapshot());
@@ -702,6 +706,7 @@ maybe_run_janitor(void)
 		return;
 	undo_last_janitor = now;
 
+	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
 	SPI_connect();
 	PushActiveSnapshot(GetTransactionSnapshot());
@@ -717,8 +722,9 @@ maybe_run_janitor(void)
 								  1, argtypes, values, NULL,
 								  false, 0) != SPI_OK_DELETE)
 			elog(ERROR, "pg_undo: retention cleanup failed");
-		elog(DEBUG1, "pg_undo janitor: retention=%s deleted=" UINT64_FORMAT,
-			 pg_undo_retention, (uint64) SPI_processed);
+		elog(DEBUG1, "pg_undo janitor: retention=%s deleted=" UINT64_FORMAT " xact_start=%s",
+			 pg_undo_retention, (uint64) SPI_processed,
+			 timestamptz_to_str(GetCurrentTransactionStartTimestamp()));
 	}
 
 	/* recycle bin GC (0.2 objects may not exist yet after an upgrade) */

@@ -12,7 +12,7 @@ EXTENSION = pg_undo
 DATA = pg_undo--0.1.sql pg_undo--0.1--0.2.sql pg_undo--0.2--0.3.sql
 PGFILEDESC = "pg_undo - undo accidental DML using logical decoding"
 
-REGRESS = pg_undo recycle_bin time_travel
+REGRESS = pg_undo recycle_bin time_travel edge_cases
 REGRESS_OPTS = --temp-config $(CURDIR)/pg_undo.conf
 # shared_preload_libraries and wal_level cannot be applied to a running
 # server, so installcheck is not supported.

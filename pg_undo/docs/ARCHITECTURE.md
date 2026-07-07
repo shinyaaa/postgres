@@ -181,6 +181,10 @@ logical decoding のコールバックは、**historic snapshot** の下、**意
   `jsonb_populate_record()`(=入力関数)を通すので、出力→入力のラウンドトリップ
   で損失がない。`datum_to_jsonb` を使わないのは、キャスト経由の任意関数実行を
   避け、挙動を決定的に保つため。
+  **例外は json/jsonb 列**: `jsonb_populate_record` は json/jsonb 列にだけ
+  入力関数を通さず値をそのまま代入するため、文字列エンコードすると復元時に
+  オブジェクトが文字列スカラーに化ける(edge_cases テストで発見した実バグ)。
+  json/jsonb 列の値は生の JSON として埋め込む。
 - **REPLICA IDENTITY FULL** を `undo.track()` が設定する。これにより UPDATE/DELETE
   の旧行全体が WAL に載る(トレードオフ: 追跡テーブルの WAL 増加)。
 - **TOAST**: UPDATE で変更されなかった out-of-line 値は新タプル側に
@@ -372,6 +376,17 @@ logical decoding のコールバックは、**historic snapshot** の下、**意
 shutdown をチェックする。エラー時はワーカーごと死んで `bgw_restart_time=10` で
 再起動し、§3.4 の仕組みが整合性を回復する。
 
+**bgworker の落とし穴(実バグの教訓)**: bgworker では SQL の `now()`
+(=トランザクション開始時刻)の元になる statement timestamp を
+**`SetCurrentStatementStartTimestamp()` で自分で更新しなければならない**
+(worker_spi が毎トランザクション呼んでいるのはこのため)。これを怠ると
+全トランザクションの `now()` がワーカー起動時刻で凍結し、
+`changed_at < now() - retention` が「起動後に入った行」に永遠にマッチしない
+= **retention/trash GC が長期稼働ワーカーで完全に不作動**になる(再起動すると
+凍結時刻が新しくなり一見直るため、発見が非常に難しい)。TAP 003 が
+このバグを検出し、ワーカー内の全 `StartTransactionCommand()` 直前で
+タイムスタンプを更新する修正を入れた。
+
 ---
 
 ## 9. セキュリティモデル(v0.4 時点)
@@ -421,8 +436,10 @@ shutdown をチェックする。エラー時はワーカーごと死んで `bgw
 | regress `pg_undo` | track検証、I/U/D キャプチャ、TOAST完全性、recent_changes、preview非破壊、apply(xid/時間、競合3モード)、TRUNCATE、untrack。非同期性は `wait_for_history()`/`wait_ready()` ポーリングで吸収 |
 | regress `recycle_bin` | drop→restore、serial継続、同名共存(oidサフィックス)、CASCADE/temp/GUCバイパス、依存ビューの挙動、非特権ユーザーの昇格経路と権限拒否、purge |
 | regress `time_travel` | t0再構成(U巻き戻し/D復活/I不在)、PK更新の分解、snapshot view、全ガード、TRUNCATE前後 |
+| regress `edge_cases` | 引用符付き識別子、型往復(bytea/numeric/timestamptz/配列/jsonb/NULL vs 文字列'null')、同一行複数変更の巻き戻し順序、単一トランザクション内I+U+D、PK変更UPDATEのundo、generated/identity列(OVERRIDING SYSTEM VALUE)、PK無しテーブルの全行一致undo、非publicスキーマ、複数テーブル横断apply、空ウィンドウ、undo-of-undo、非特権ユーザーの履歴閲覧拒否、ごみ箱(引用符名/スキーマ/FK被参照の意味論) |
 | TAP `001_undo_basic` | スロット存在、**サーバ再起動を跨いだ無重複+継続キャプチャ**、xid指定undoの復元一致 |
-| TAP `002_spill` | 1MB閾値×4.5MBトランザクション → スピル発生(ログ確認)、全件キャプチャ、undo往復、残骸ゼロ |
+| TAP `002_spill` | 1MB閾値超トランザクション → スピル発生(ログ確認)、全件キャプチャ、**old/new両イメージの往復**(UPDATEスピル)、残骸ゼロ |
+| TAP `003_janitor` | フェイルセーフpause(pause中の履歴凍結+slot前進継続)、retention GCと自動再開、**immediateシャットダウン(クラッシュ)後の無重複継続**、trash GC |
 
 エラーメッセージは regress の決定性のため、タイムスタンプ・xid 等の可変値を
 含めない(実装時に修正済み)。
@@ -450,6 +467,8 @@ shutdown をチェックする。エラー時はワーカーごと死んで `bgw
 - ストリーミングコールバック(`stream_*`)対応による in-progress デコード
   (スピルと組み合わせればさらに早期にメモリを解放できる)
 - flush の `SPI_prepare` 化 / COPY 化(現状は行ごとに parse)
+- `undo.apply` の高速化(現状は行ごとに動的SQL2本で〜10ms/行。大量undoでは
+  逆操作の一括生成・一括実行にする余地がある)
 - `pg_undo_admin` ロールと非特権向け権限モデル
 - 履歴のパーティション化(GC を DROP PARTITION に)
 - マネージド環境向けのトリガーベース・フォールバック

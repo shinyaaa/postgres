@@ -25,6 +25,7 @@
 #include <unistd.h>
 
 #include "access/htup_details.h"
+#include "catalog/pg_type.h"
 #include "replication/logical.h"
 #include "replication/output_plugin.h"
 #include "storage/fd.h"
@@ -174,7 +175,18 @@ undo_tuple_to_json(TupleDesc tupdesc, HeapTuple tuple, HeapTuple toast_fallback)
 			if (typisvarlena)
 				val = PointerGetDatum(PG_DETOAST_DATUM(val));
 			outstr = OidOutputFunctionCall(typoutput, val);
-			escape_json(&buf, outstr);
+
+			/*
+			 * json/jsonb values are embedded as-is: jsonb_populate_record
+			 * assigns JSON values to json/jsonb columns without going
+			 * through the type input function, so string-encoding them
+			 * (like every other type) would turn objects into string
+			 * scalars on restore.
+			 */
+			if (attr->atttypid == JSONBOID || attr->atttypid == JSONOID)
+				appendStringInfoString(&buf, outstr);
+			else
+				escape_json(&buf, outstr);
 		}
 	}
 
