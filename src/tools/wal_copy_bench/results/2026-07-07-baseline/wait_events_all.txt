@@ -1,0 +1,123 @@
+== narrow_logical_j1
+     43 CPU/Running
+      5 IO:WalWrite
+      5 IO:WalSync
+      3 IO:DataFileWrite
+      1 LWLock:WALWrite
+      1 IO:CopyFromRead
+== narrow_minimal_existing_j1
+     40 CPU/Running
+     10 IO:WalSync
+      5 IO:DataFileWrite
+      1 IO:WalWrite
+      1 IO:CopyFromRead
+== narrow_minimal_newrel_j1
+     41 CPU/Running
+     25 IO:DataFileImmediateSync
+      1 IO:DataFileWrite
+      1 IO:CopyFromRead
+== narrow_replica_freeze_j1
+     44 CPU/Running
+      7 IO:WalSync
+      2 IO:WalWrite
+      2 IO:DataFileWrite
+== narrow_replica_j1
+     45 CPU/Running
+      6 IO:WalSync
+      2 IO:DataFileWrite
+      1 LWLock:WALWrite
+      1 IO:WalWrite
+      1 IO:CopyFromRead
+== narrow_replica_j2
+     43 CPU/Running
+      9 IO:DataFileWrite
+      8 LWLock:WALWrite
+      4 IO:WalSync
+      1 IO:WalWrite
+== narrow_replica_j4
+     52 LWLock:WALWrite
+     30 CPU/Running
+      8 IO:WalSync
+      5 Buffer:BufferExclusive
+      3 IO:DataFileWrite
+      2 Lock:extend
+      2 IO:CopyFromRead
+      1 LWLock:CheckpointerComm
+      1 IO:WalWrite
+      1 IO:DataFileExtend
+== narrow_replica_j4_wb256
+     32 LWLock:WALWrite
+     32 CPU/Running
+     10 IO:WalSync
+      6 Lock:extend
+      4 IO:WalWrite
+      4 IO:DataFileWrite
+      3 LWLock:CheckpointerComm
+      3 Buffer:BufferExclusive
+      1 LWLock:LockManager
+      1 IO:CopyFromRead
+== narrow_replica_lz4_j1
+     42 CPU/Running
+     12 IO:WalSync
+      2 IO:WalWrite
+      2 IO:DataFileWrite
+      2 IO:CopyFromRead
+      1 LWLock:WALWrite
+== narrow_unlogged_j1
+     41 CPU/Running
+      1 IO:DataFileWrite
+      1 IO:CopyFromRead
+== narrow_unlogged_j4
+     41 CPU/Running
+      6 Lock:extend
+      6 IO:DataFileWrite
+      1 IO:CopyFromRead
+== wide_minimal_newrel_j1
+     41 IO:DataFileImmediateSync
+     15 CPU/Running
+      5 IO:DataFileWrite
+      2 IO:DataFileExtend
+      2 IO:CopyFromRead
+== wide_replica_freeze_j1
+     28 CPU/Running
+     17 IO:WalSync
+      4 IO:WalWrite
+      2 IO:DataFileWrite
+      1 IO:CopyFromRead
+== wide_replica_j1
+     25 CPU/Running
+     21 IO:WalSync
+      3 IO:CopyFromRead
+      2 IO:DataFileWrite
+      1 LWLock:WALWrite
+      1 IO:WalWrite
+== wide_replica_j1_wb256
+     25 IO:WalSync
+     20 CPU/Running
+      4 IO:DataFileWrite
+      1 LWLock:WALWrite
+      1 IO:CopyFromRead
+== wide_replica_j4
+     99 LWLock:WALWrite
+     36 CPU/Running
+     15 IO:WalSync
+      9 Buffer:BufferExclusive
+      8 IO:WalWrite
+      6 IO:DataFileWrite
+      4 Lock:extend
+      2 LWLock:CheckpointerComm
+      2 IO:CopyFromRead
+      1 LWLock:LockManager
+== wide_replica_j4_wb256
+     71 LWLock:WALWrite
+     30 CPU/Running
+     16 IO:WalSync
+     10 Buffer:BufferExclusive
+      8 Lock:extend
+      8 IO:WalWrite
+      7 IO:DataFileWrite
+      1 LWLock:CheckpointerComm
+== wide_unlogged_j1
+     16 CPU/Running
+      6 IO:DataFileWrite
+      2 IO:CopyFromRead
