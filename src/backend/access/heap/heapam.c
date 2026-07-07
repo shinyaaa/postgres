@@ -57,6 +57,9 @@
 #include "utils/syscache.h"
 
 
+/* GUC: log page images instead of tuple data for filled multi-insert pages */
+bool		debug_multi_insert_page_images = false;
+
 static HeapTuple heap_prepare_insert(Relation relation, HeapTuple tup,
 									 TransactionId xid, CommandId cid, uint32 options);
 static XLogRecPtr log_heap_update(Relation reln, Buffer oldbuf,
@@ -2477,11 +2480,27 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 			bool		init;
 			int			bufflags = 0;
 
+			bool		use_image;
+
 			/*
 			 * If the page was previously empty, we can reinit the page
 			 * instead of restoring the whole thing.
 			 */
 			init = starting_with_empty_page;
+
+			/*
+			 * Log a full image of the page instead of the tuple data when
+			 * so requested.  That is only legal when the tuple data is not
+			 * needed by logical decoding, and only worthwhile when no later
+			 * record will add tuples to this page — otherwise that record
+			 * would have to image the whole page again.  The tuple loop
+			 * above stopped early iff the page had no room for the next
+			 * tuple, so use that as the "page is full" test; the final,
+			 * partially-filled page of a batch keeps the per-tuple format.
+			 */
+			use_image = debug_multi_insert_page_images &&
+				init && !need_tuple_data && !need_cids &&
+				ndone + nthispage < ntuples;
 
 			/* allocate xl_heap_multi_insert struct from the scratch area */
 			xlrec = (xl_heap_multi_insert *) scratchptr;
@@ -2518,9 +2537,10 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 
 			/*
 			 * Write out an xl_multi_insert_tuple and the tuple data itself
-			 * for each tuple.
+			 * for each tuple.  A page-image record carries no tuple data at
+			 * all: recovery restores the page from the image.
 			 */
-			for (i = 0; i < nthispage; i++)
+			for (i = 0; !use_image && i < nthispage; i++)
 			{
 				HeapTuple	heaptup = heaptuples[ndone + i];
 				xl_multi_insert_tuple *tuphdr;
@@ -2558,7 +2578,18 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 			if (ndone + nthispage == ntuples)
 				xlrec->flags |= XLH_INSERT_LAST_IN_MULTI;
 
-			if (init)
+			if (use_image)
+			{
+				/*
+				 * REGBUF_FORCE_IMAGE guarantees that the image is both
+				 * included and marked for apply, so redo always restores
+				 * the page (BLK_RESTORED) and never looks at ntuples or
+				 * the (absent) tuple data.  XLOG_HEAP_INIT_PAGE must not
+				 * be set: there is nothing to replay incrementally.
+				 */
+				bufflags |= REGBUF_FORCE_IMAGE;
+			}
+			else if (init)
 			{
 				info |= XLOG_HEAP_INIT_PAGE;
 				bufflags |= REGBUF_WILL_INIT;
@@ -2577,7 +2608,8 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 			if (all_frozen_set)
 				XLogRegisterBuffer(1, vmbuffer, 0);
 
-			XLogRegisterBufData(0, tupledata, totaldatalen);
+			if (!use_image)
+				XLogRegisterBufData(0, tupledata, totaldatalen);
 
 			/* filtering by origin on a row level is much more efficient */
 			XLogSetRecordFlags(XLOG_INCLUDE_ORIGIN);
