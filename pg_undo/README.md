@@ -99,6 +99,7 @@ Restart, then `CREATE EXTENSION pg_undo;` in that database.
 | `pg_undo.naptime` | `1s` | Capture cycle interval |
 | `pg_undo.retention` | `24 hours` | How long history is kept |
 | `pg_undo.max_history_size` | `10240` (MB) | Failsafe pause threshold |
+| `pg_undo.spill_threshold` | `256` (MB) | Per-transaction capture buffer before spilling to disk |
 | `pg_undo.janitor_interval` | `60s` | GC / failsafe check interval |
 | `pg_undo.recycle_bin` | `on` | Divert `DROP TABLE` to the bin (superuser-settable) |
 | `pg_undo.trash_retention` | `7 days` | How long dropped tables stay restorable |
@@ -137,7 +138,10 @@ Restart, then `CREATE EXTENSION pg_undo;` in that database.
   until it is purged.  Trashed tables are also included in `pg_dump`.
 - On restore, index and sequence names keep their oid suffix
   (cosmetic; constraints and serial defaults keep working).
-- Undoing a very large transaction buffers it in worker memory.
+- Transactions larger than `pg_undo.spill_threshold` (default 256MB)
+  are spilled to disk during capture, so worker memory stays bounded;
+  the spill files live under `base/pgsql_tmp` and are cleaned up
+  automatically (also after a crash).
 - `undo.as_of` reconstructs data, not schema: columns added since the
   requested time show NULL in reconstructed rows, and a time inside the
   last `pg_undo.naptime` may reflect slightly newer state (capture lag).

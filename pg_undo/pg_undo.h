@@ -43,8 +43,25 @@ typedef struct UndoBufferedTxn
 	TransactionId xid;
 	XLogRecPtr	commit_end_lsn;
 	TimestampTz commit_time;
-	List	   *changes;		/* list of UndoBufferedChange * */
+	List	   *changes;		/* in-memory changes (after any spill) */
+	Size		nbytes;			/* approximate size of "changes" */
+	bool		spilled;		/* a spill file exists for this xid */
+	int64		nspilled;		/* number of changes in the spill file */
 } UndoBufferedTxn;
+
+/*
+ * Spill files live in base/pgsql_tmp with a PG_TEMP_FILE_PREFIX name, so
+ * leftovers are removed at every server start; the worker sweeps them at
+ * runtime.  Serialized record layout (packed, host byte order):
+ *	 Oid relid, char op, XLogRecPtr change_lsn,
+ *	 int32 old_len (-1 = NULL), int32 new_len (-1 = NULL),
+ *	 old bytes, new bytes
+ */
+#define UNDO_SPILL_DIR			"base/pgsql_tmp"
+#define UNDO_SPILL_FILE_PREFIX	"pgsql_tmp.pg_undo."
+
+extern void undo_spill_path(char *path, size_t len, TransactionId xid);
+extern void undo_spill_txn(UndoBufferedTxn *utxn);
 
 /* GUCs (defined in pg_undo.c) */
 extern char *pg_undo_database;
@@ -53,6 +70,7 @@ extern int	pg_undo_naptime;
 extern int	pg_undo_janitor_interval;
 extern char *pg_undo_retention;
 extern int	pg_undo_max_history_size;
+extern int	pg_undo_spill_threshold;
 extern bool pg_undo_recycle_bin;
 extern char *pg_undo_trash_retention;
 

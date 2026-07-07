@@ -24,6 +24,9 @@
  */
 #include "postgres.h"
 
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xlogreader.h"
@@ -37,6 +40,7 @@
 #include "replication/decode.h"
 #include "replication/logical.h"
 #include "replication/slot.h"
+#include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/proc.h"
@@ -309,6 +313,135 @@ insert_history_row(UndoBufferedTxn *utxn, UndoBufferedChange *chg)
 		elog(ERROR, "pg_undo: could not insert into undo.history");
 }
 
+/* read exactly len bytes; 0 = clean EOF at a record boundary */
+static bool
+undo_spill_read(int fd, const char *path, void *buf, Size len, bool eof_ok)
+{
+	ssize_t		nread = read(fd, buf, len);
+
+	if (nread == 0 && eof_ok)
+		return false;
+	if (nread != (ssize_t) len)
+	{
+		int			save_errno = errno;
+
+		CloseTransientFile(fd);
+		errno = save_errno;
+		if (nread < 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("pg_undo: could not read spill file \"%s\": %m",
+							path)));
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("pg_undo: unexpected end of spill file \"%s\"", path)));
+	}
+	return true;
+}
+
+/*
+ * Insert the disk-spilled part of a transaction into undo.history.
+ * Runs inside the flush transaction's SPI session; the file descriptor
+ * is closed again before that transaction ends.
+ */
+static void
+undo_flush_spill_file(UndoBufferedTxn *utxn)
+{
+	char		path[MAXPGPATH];
+	int			fd;
+	int64		nread_changes = 0;
+
+	undo_spill_path(path, sizeof(path), utxn->xid);
+
+	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
+	if (fd < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("pg_undo: could not open spill file \"%s\": %m",
+						path)));
+
+	for (;;)
+	{
+		UndoBufferedChange chg;
+		int32		old_len;
+		int32		new_len;
+
+		memset(&chg, 0, sizeof(chg));
+		if (!undo_spill_read(fd, path, &chg.relid, sizeof(Oid), true))
+			break;
+		undo_spill_read(fd, path, &chg.op, 1, false);
+		undo_spill_read(fd, path, &chg.change_lsn, sizeof(XLogRecPtr), false);
+		undo_spill_read(fd, path, &old_len, sizeof(int32), false);
+		undo_spill_read(fd, path, &new_len, sizeof(int32), false);
+
+		if (old_len >= 0)
+		{
+			chg.old_row = palloc(old_len + 1);
+			undo_spill_read(fd, path, chg.old_row, old_len, false);
+			chg.old_row[old_len] = '\0';
+		}
+		if (new_len >= 0)
+		{
+			chg.new_row = palloc(new_len + 1);
+			undo_spill_read(fd, path, chg.new_row, new_len, false);
+			chg.new_row[new_len] = '\0';
+		}
+
+		insert_history_row(utxn, &chg);
+		nread_changes++;
+
+		if (chg.old_row)
+			pfree(chg.old_row);
+		if (chg.new_row)
+			pfree(chg.new_row);
+		CHECK_FOR_INTERRUPTS();
+	}
+
+	if (CloseTransientFile(fd) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("pg_undo: could not close spill file \"%s\": %m",
+						path)));
+
+	if (nread_changes != utxn->nspilled)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("pg_undo: spill file \"%s\" contained %lld changes, expected %lld",
+						path, (long long) nread_changes,
+						(long long) utxn->nspilled)));
+}
+
+/*
+ * Remove leftover spill files.  Run at worker start (crash leftovers)
+ * and at the end of each capture cycle: everything completed has been
+ * flushed and unlinked by then, and files of transactions that were
+ * still in flight will be regenerated when the next cycle re-decodes
+ * from restart_lsn.
+ */
+static void
+undo_spill_sweep(void)
+{
+	DIR		   *dir;
+	struct dirent *de;
+
+	dir = AllocateDir(UNDO_SPILL_DIR);
+	if (dir == NULL)
+		return;					/* directory does not exist yet */
+
+	while ((de = ReadDirExtended(dir, UNDO_SPILL_DIR, DEBUG1)) != NULL)
+	{
+		char		path[MAXPGPATH];
+
+		if (strncmp(de->d_name, UNDO_SPILL_FILE_PREFIX,
+					strlen(UNDO_SPILL_FILE_PREFIX)) != 0)
+			continue;
+		snprintf(path, sizeof(path), UNDO_SPILL_DIR "/%s", de->d_name);
+		if (unlink(path) == 0)
+			elog(DEBUG1, "pg_undo: removed leftover spill file \"%s\"", path);
+	}
+	FreeDir(dir);
+}
+
 /*
  * Apply all buffered completed transactions to undo.history in one
  * ordinary transaction, then confirm the slot up to the newest applied
@@ -344,6 +477,10 @@ flush_completed_txns(void)
 		if (!undo_capture_paused)
 		{
 			ListCell   *lc2;
+
+			/* the disk-spilled prefix of the transaction comes first */
+			if (utxn->spilled)
+				undo_flush_spill_file(utxn);
 
 			foreach(lc2, utxn->changes)
 				insert_history_row(utxn, (UndoBufferedChange *) lfirst(lc2));
@@ -381,6 +518,19 @@ flush_completed_txns(void)
 	{
 		UndoBufferedTxn *utxn = (UndoBufferedTxn *) lfirst(lc);
 		ListCell   *lc2;
+
+		/*
+		 * Drop the spill file whether it was applied, deduplicated or
+		 * skipped while paused; anything missed here is caught by the
+		 * sweeps.
+		 */
+		if (utxn->spilled)
+		{
+			char		path[MAXPGPATH];
+
+			undo_spill_path(path, sizeof(path), utxn->xid);
+			(void) unlink(path);
+		}
 
 		foreach(lc2, utxn->changes)
 		{
@@ -531,6 +681,9 @@ run_capture_cycle(void)
 	undo_completed_txns = NIL;
 	undo_buffered_rows = 0;
 	MemoryContextReset(undo_buffer_cxt);
+
+	/* spill files of transactions that were still in flight */
+	undo_spill_sweep();
 }
 
 /*
@@ -708,6 +861,7 @@ pg_undo_worker_main(Datum main_arg)
 			(errmsg("pg_undo: capture worker started (database \"%s\")",
 					pg_undo_database)));
 
+	undo_spill_sweep();			/* leftovers from a previous crash */
 	ensure_extension_ready();
 	ensure_slot();
 

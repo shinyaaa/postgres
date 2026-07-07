@@ -27,6 +27,7 @@ int			pg_undo_naptime = 1;
 int			pg_undo_janitor_interval = 60;
 char	   *pg_undo_retention = NULL;
 int			pg_undo_max_history_size = 10240;
+int			pg_undo_spill_threshold = 256;
 bool		pg_undo_recycle_bin = true;
 char	   *pg_undo_trash_retention = NULL;
 
@@ -101,6 +102,17 @@ _PG_init(void)
 							10240,
 							1,
 							INT_MAX,
+							PGC_SIGHUP,
+							GUC_UNIT_MB,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("pg_undo.spill_threshold",
+							"Per-transaction in-memory capture buffer limit.",
+							"Changes of a transaction exceeding this are spilled to disk.",
+							&pg_undo_spill_threshold,
+							256,
+							1,
+							INT_MAX / 2,
 							PGC_SIGHUP,
 							GUC_UNIT_MB,
 							NULL, NULL, NULL);

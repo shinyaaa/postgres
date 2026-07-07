@@ -21,9 +21,13 @@
  */
 #include "postgres.h"
 
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include "access/htup_details.h"
 #include "replication/logical.h"
 #include "replication/output_plugin.h"
+#include "storage/fd.h"
 #include "utils/json.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -43,6 +47,8 @@ static void undo_truncate_cb(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 static void undo_commit_cb(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 						   XLogRecPtr commit_lsn);
 static void undo_shutdown_cb(LogicalDecodingContext *ctx);
+static void undo_track_change_size(UndoBufferedTxn *utxn,
+								   UndoBufferedChange *chg);
 
 void
 _PG_output_plugin_init(OutputPluginCallbacks *cb)
@@ -232,6 +238,7 @@ undo_change_cb(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 
 	utxn->changes = lappend(utxn->changes, uchg);
 	undo_buffered_rows++;
+	undo_track_change_size(utxn, uchg);
 
 	MemoryContextSwitchTo(oldcxt);
 }
@@ -263,6 +270,7 @@ undo_truncate_cb(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 		uchg->change_lsn = change->lsn;
 		utxn->changes = lappend(utxn->changes, uchg);
 		undo_buffered_rows++;
+		undo_track_change_size(utxn, uchg);
 	}
 
 	MemoryContextSwitchTo(oldcxt);
@@ -298,4 +306,145 @@ static void
 undo_shutdown_cb(LogicalDecodingContext *ctx)
 {
 	/* nothing to do */
+}
+
+/*
+ * Disk spill of an in-flight transaction's buffered changes.
+ *
+ * This runs inside decoding callbacks, i.e. inside a transaction that is
+ * deliberately aborted afterwards, so only resources that survive an
+ * abort may be used: named files opened with OpenTransientFile and fully
+ * closed before returning (the fd would merely be closed at abort, the
+ * file itself survives).  Resource-owner-tracked temporary files
+ * (OpenTemporaryFile/BufFile) would be deleted by that abort.
+ */
+
+void
+undo_spill_path(char *path, size_t len, TransactionId xid)
+{
+	/*
+	 * The PG_TEMP_FILE_PREFIX-style name makes the server itself remove
+	 * leftovers at every normal start.
+	 */
+	snprintf(path, len, UNDO_SPILL_DIR "/" UNDO_SPILL_FILE_PREFIX "xid-%u.spill",
+			 xid);
+}
+
+/* flush the serialization buffer to fd */
+static void
+undo_spill_write(int fd, const char *path, StringInfo buf)
+{
+	if (buf->len == 0)
+		return;
+
+	errno = 0;
+	if (write(fd, buf->data, buf->len) != buf->len)
+	{
+		int			save_errno = errno;
+
+		CloseTransientFile(fd);
+		errno = save_errno ? save_errno : ENOSPC;
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("pg_undo: could not write to spill file \"%s\": %m",
+						path)));
+	}
+	resetStringInfo(buf);
+}
+
+/*
+ * Append utxn's buffered changes to its spill file and release the
+ * memory.  Called from the change callbacks when the per-transaction
+ * buffer exceeds pg_undo.spill_threshold.
+ */
+void
+undo_spill_txn(UndoBufferedTxn *utxn)
+{
+	char		path[MAXPGPATH];
+	int			fd;
+	int64		nchanges = 0;
+	StringInfoData buf;
+	ListCell   *lc;
+
+	/* base/pgsql_tmp may not exist on a cluster that never used it */
+	if (MakePGDirectory(UNDO_SPILL_DIR) < 0 && errno != EEXIST)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("pg_undo: could not create directory \"%s\": %m",
+						UNDO_SPILL_DIR)));
+
+	undo_spill_path(path, sizeof(path), utxn->xid);
+
+	fd = OpenTransientFile(path, O_CREAT | O_WRONLY | O_APPEND | PG_BINARY);
+	if (fd < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("pg_undo: could not open spill file \"%s\": %m",
+						path)));
+
+	if (!utxn->spilled)
+		ereport(LOG,
+				(errmsg("pg_undo: spilling transaction %u to disk",
+						utxn->xid)));
+	else
+		elog(DEBUG1, "pg_undo: spilling more of transaction %u to disk",
+			 utxn->xid);
+
+	initStringInfo(&buf);
+
+	foreach(lc, utxn->changes)
+	{
+		UndoBufferedChange *chg = (UndoBufferedChange *) lfirst(lc);
+		int32		old_len = chg->old_row ? (int32) strlen(chg->old_row) : -1;
+		int32		new_len = chg->new_row ? (int32) strlen(chg->new_row) : -1;
+
+		appendBinaryStringInfo(&buf, (char *) &chg->relid, sizeof(Oid));
+		appendBinaryStringInfo(&buf, &chg->op, 1);
+		appendBinaryStringInfo(&buf, (char *) &chg->change_lsn, sizeof(XLogRecPtr));
+		appendBinaryStringInfo(&buf, (char *) &old_len, sizeof(int32));
+		appendBinaryStringInfo(&buf, (char *) &new_len, sizeof(int32));
+		if (old_len >= 0)
+			appendBinaryStringInfo(&buf, chg->old_row, old_len);
+		if (new_len >= 0)
+			appendBinaryStringInfo(&buf, chg->new_row, new_len);
+
+		if (buf.len >= 1024 * 1024)
+			undo_spill_write(fd, path, &buf);
+		nchanges++;
+
+		if (chg->old_row)
+			pfree(chg->old_row);
+		if (chg->new_row)
+			pfree(chg->new_row);
+		pfree(chg);
+	}
+	undo_spill_write(fd, path, &buf);
+	pfree(buf.data);
+
+	if (CloseTransientFile(fd) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("pg_undo: could not close spill file \"%s\": %m",
+						path)));
+
+	list_free(utxn->changes);
+	utxn->changes = NIL;
+	undo_buffered_rows -= nchanges;
+	utxn->nbytes = 0;
+	utxn->spilled = true;
+	utxn->nspilled += nchanges;
+}
+
+/* account for a newly buffered change; spill when over the threshold */
+static void
+undo_track_change_size(UndoBufferedTxn *utxn, UndoBufferedChange *chg)
+{
+	utxn->nbytes += sizeof(UndoBufferedChange) + 32; /* struct + list slop */
+	if (chg->old_row)
+		utxn->nbytes += strlen(chg->old_row);
+	if (chg->new_row)
+		utxn->nbytes += strlen(chg->new_row);
+
+	if (utxn->nbytes >= (Size) pg_undo_spill_threshold * 1024 * 1024)
+		undo_spill_txn(utxn);
 }
