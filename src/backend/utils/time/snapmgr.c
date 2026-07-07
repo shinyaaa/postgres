@@ -1855,6 +1855,8 @@ RestoreTransactionSnapshot(Snapshot snapshot, PGPROC *source_pgproc)
 	SetTransactionSnapshot(snapshot, NULL, InvalidPid, source_pgproc);
 }
 
+static bool XidInMVCCSnapshotXip(TransactionId xid, Snapshot snapshot);
+
 /*
  * XidInMVCCSnapshot
  *		Is the given XID still-in-progress according to the snapshot?
@@ -1864,6 +1866,11 @@ RestoreTransactionSnapshot(Snapshot snapshot, PGPROC *source_pgproc)
  * by this function.  This is OK for current uses, because we always check
  * TransactionIdIsCurrentTransactionId first, except when it's known the
  * XID could not be ours anyway.
+ *
+ * This is the sole entry point for snapshot-based in-progress checks; the
+ * actual membership test is delegated to helper functions so that
+ * alternative snapshot representations can be plugged in behind this
+ * interface.
  */
 bool
 XidInMVCCSnapshot(TransactionId xid, Snapshot snapshot)
@@ -1883,6 +1890,21 @@ XidInMVCCSnapshot(TransactionId xid, Snapshot snapshot)
 	if (TransactionIdFollowsOrEquals(xid, snapshot->xmax))
 		return true;
 
+	return XidInMVCCSnapshotXip(xid, snapshot);
+}
+
+/*
+ * XidInMVCCSnapshotXip
+ *		Check the snapshot's xip/subxip arrays for the given XID.
+ *
+ * This implements the classical snapshot representation: an enumeration of
+ * the XIDs that were still running when the snapshot was taken, falling
+ * back to pg_subtrans when the enumeration of subtransactions overflowed.
+ * The caller has already eliminated XIDs outside [xmin, xmax).
+ */
+static bool
+XidInMVCCSnapshotXip(TransactionId xid, Snapshot snapshot)
+{
 	/*
 	 * Snapshot information is stored slightly differently in snapshots taken
 	 * during recovery.
