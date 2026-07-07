@@ -1,0 +1,94 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 19K of event 'cycles:Pu'
+# Event count (approx.): 19426897261
+#
+# Children      Self  Command   Shared Object     Symbol                                
+# ........  ........  ........  ................  ......................................
+#
+    99.94%     0.00%  postgres  libc.so.6         [.] __libc_start_call_main
+    99.94%     0.00%  postgres  postgres          [.] PostgresMain
+    99.94%     0.00%  postgres  postgres          [.] PostmasterMain
+    99.94%     0.00%  postgres  postgres          [.] ServerLoop.isra.0
+    99.94%     0.00%  postgres  postgres          [.] exec_simple_query
+    99.94%     0.00%  postgres  postgres          [.] main
+    99.94%     0.00%  postgres  postgres          [.] postmaster_child_launch
+    99.94%     0.00%  postgres  postgres          [.] 0x00000000008c6fbf
+    99.94%     0.00%  postgres  postgres          [.] DoCopy
+    99.94%     0.00%  postgres  postgres          [.] PortalRun
+    99.94%     0.00%  postgres  postgres          [.] PortalRunMulti
+    99.94%     0.00%  postgres  postgres          [.] PortalRunUtility
+    99.94%     0.00%  postgres  postgres          [.] standard_ProcessUtility
+    99.42%     5.60%  postgres  postgres          [.] CopyFrom
+    44.35%     3.05%  postgres  postgres          [.] NextCopyFrom
+    40.62%     6.74%  postgres  postgres          [.] CopyFromTextOneRow
+    26.77%     0.56%  postgres  postgres          [.] CopyMultiInsertBufferFlush
+    21.12%     3.61%  postgres  postgres          [.] heap_multi_insert
+    19.68%     1.42%  postgres  postgres          [.] tts_buffer_heap_materialize
+    17.96%     3.92%  postgres  postgres          [.] heap_form_tuple
+    14.42%    11.39%  postgres  postgres          [.] CopyReadLine
+    11.58%     3.87%  postgres  postgres          [.] InputFunctionCallSafe
+     8.92%     0.13%  postgres  postgres          [.] RelationGetBufferForTuple
+     7.68%     7.46%  postgres  postgres          [.] pg_strtoint64_safe
+     7.67%     7.46%  postgres  postgres          [.] CopyReadAttributesText
+     7.25%     3.38%  postgres  postgres          [.] RelationPutHeapTuple
+     7.22%     3.45%  postgres  postgres          [.] heap_fill_tuple
+     7.07%     0.01%  postgres  postgres          [.] RelationAddBlocks
+     6.01%     0.00%  postgres  postgres          [.] ExtendBufferedRelBy
+     5.98%     0.22%  postgres  postgres          [.] ExtendBufferedRelCommon
+     4.37%     2.41%  postgres  postgres          [.] tts_buffer_heap_clear
+     4.37%     3.85%  postgres  postgres          [.] palloc0
+     4.18%     0.02%  postgres  postgres          [.] GetVictimBuffer
+     4.10%     3.58%  postgres  postgres          [.] fill_val
+     3.28%     3.04%  postgres  postgres          [.] PageAddItemExtended
+     3.12%     0.04%  postgres  postgres          [.] FlushBuffer.constprop.0
+     2.55%     2.41%  postgres  postgres          [.] heap_compute_data_size
+     2.03%     1.69%  postgres  postgres          [.] heap_prepare_insert
+     1.87%     1.13%  postgres  postgres          [.] appendBinaryStringInfo
+     1.76%     1.47%  postgres  postgres          [.] AllocSetFree
+     1.74%     0.02%  postgres  postgres          [.] PageSetChecksum
+     1.73%     1.73%  postgres  postgres          [.] pg_checksum_block_avx2
+     1.56%     1.00%  postgres  libc.so.6         [.] __memset_evex_unaligned
+     1.49%     1.32%  postgres  postgres          [.] MemoryContextReset
+     1.43%     1.41%  postgres  postgres          [.] hash_search_with_hash_value
+     1.38%     0.92%  postgres  libc.so.6         [.] __memset_evex_unaligned_erms
+     1.26%     0.46%  postgres  postgres          [.] memset@plt
+     1.23%     1.23%  postgres  postgres          [.] ResourceOwnerAddToHash
+     1.23%     0.92%  postgres  postgres          [.] ExecFetchSlotHeapTuple
+     1.17%     0.99%  postgres  libc.so.6         [.] __memmove_evex_unaligned_erms
+     1.14%     1.13%  postgres  postgres          [.] ResourceOwnerForget
+     0.91%     0.70%  postgres  postgres          [.] resetStringInfo
+     0.89%     0.75%  postgres  postgres          [.] AllocSetAlloc
+     0.86%     0.04%  postgres  postgres          [.] InvalidateVictimBuffer
+     0.86%     0.03%  postgres  postgres          [.] StartSharedBufferIO
+     0.84%     0.22%  postgres  postgres          [.] int8in
+     0.80%     0.02%  postgres  postgres          [.] ReadBufferExtended
+     0.70%     0.00%  postgres  postgres          [.] BufTableDelete
+     0.70%     0.09%  postgres  postgres          [.] StartReadBuffer
+     0.67%     0.00%  postgres  postgres          [.] ReleaseBuffer
+     0.65%     0.52%  postgres  postgres          [.] enlargeStringInfo
+     0.61%     0.02%  postgres  postgres          [.] fsm_set_and_search
+     0.57%     0.07%  postgres  postgres          [.] TerminateBufferIO
+     0.56%     0.21%  postgres  postgres          [.] BufferGetBlockNumber
+     0.53%     0.01%  postgres  postgres          [.] BufTableInsert
+     0.49%     0.17%  postgres  postgres          [.] memcpy@plt
+     0.47%     0.05%  postgres  postgres          [.] fsm_readbuf
+     0.45%     0.31%  postgres  postgres          [.] ExecStoreVirtualTuple
+     0.44%     0.44%  postgres  postgres          [.] pg_utf8_verifystr
+     0.43%     0.43%  postgres  postgres          [.] MarkBufferDirty
+     0.42%     0.29%  postgres  postgres          [.] pfree
+     0.35%     0.01%  postgres  postgres          [.] smgrwritev
+     0.34%     0.05%  postgres  postgres          [.] mdwritev
+     0.30%     0.23%  postgres  postgres          [.] PageGetHeapFreeSpace
+     0.24%     0.02%  postgres  postgres          [.] BufTableLookup
+     0.24%     0.13%  postgres  postgres          [.] heap_freetuple
+     0.23%     0.10%  postgres  postgres          [.] tts_buffer_heap_get_heap_tuple
+     0.20%     0.20%  postgres  postgres          [.] LWLockAttemptLock
+
+
+#
+# (Tip: Create an archive with symtabs to analyse on other machine: perf archive)
+#

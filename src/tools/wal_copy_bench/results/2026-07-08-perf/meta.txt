@@ -1,0 +1,36 @@
+Host: home0102 (192.168.1.3), 11th Gen Intel Core i5-1135G7 @ 2.40GHz, 8 CPUs,
+      15GB RAM, Rocky Linux 10 (kernel 6.12.0-124.56.1.el10_1), local NVMe/SSD storage
+Build: 20devel @ poc-copy-wal-reduction-fable (ea92d8c583b), gcc 14.3.1
+       ./configure --with-zstd --without-icu CFLAGS='-O2 -fno-omit-frame-pointer -g'
+       (no --with-lz4: lz4-devel not installed on this host; irrelevant for these runs)
+perf:  6.12.0, cycles:Pu (user-only; kernel.perf_event_paranoid=2 forbids kernel
+       samples for unprivileged users), -g --call-graph fp -F 3989, attached with
+       -p <backend pid(s)> before the profiled COPY started
+Cluster: throwaway initdb (data checksums on by default), unix socket only, port 54329
+       wal_level=replica, shared_buffers=2GB, wal_buffers=16MB (default),
+       max_wal_size=16GB, min_wal_size=4GB, checkpoint_timeout=30min,
+       autovacuum=off, track_wal_io_timing=on, fsync=on
+Data:  narrow.csv = 10M rows of "i\t i*7919" (bigint,bigint), 189MB text
+Procedure per case: CREATE TABLE; 3 warmup COPY passes (extends relation,
+       creates WAL segments); TRUNCATE; CHECKPOINT (recycles segments);
+       attach perf to the session backend; 3 profiled COPY passes (30M rows).
+       par4: 4 backends, 1 pass of 10M rows each, single perf attached to all 4.
+
+Captures:
+  logged   3x10M rows, wal_level=replica: passes 2222/2119/1887 ms, wall 6.23 s,
+           20932 samples (= 5.25 CPU-s), 20,183,951,426 cycles (avg ~3.85GHz)
+  unlogged 3x10M rows, UNLOGGED table:    passes 1673/1663/1667 ms, wall 5.00 s,
+           19690 samples (= 4.94 CPU-s), 19,426,897,261 cycles
+  par4     4x10M rows, 4 backends:        wall 2.776 s (jobs 2.75-2.77 s),
+           32215 samples (= 8.08 CPU-s of 11.10 available), 27,837,453,493 cycles,
+           wal_buffers_full=100912
+  isolated single logged 10M-row COPY (no perf): 1.86 s; pg_stat_io object='wal':
+           client backend 33 writes/15.0ms + 33 fsyncs/90.0ms, walwriter
+           9 writes/3.7ms + 9 fsyncs/21.2ms; wal_buffers_full=0
+
+WAL stream ground truth (pg_waldump --stats of an exact 10M-row pass LSN range;
+pg_stat_wal record counts in-session were contaminated by verification queries):
+  63,798 records / 245,105,213 bytes per 10M rows = 24.5 WAL bytes/row
+  84.7% Heap2/MULTI_INSERT+INIT (ntuples=185, 4490 B each), 15.3% Heap2/MULTI_INSERT
+  (page-boundary splits), 1.18 records per heap page, record-header overhead ~1.3%
+  Same shape confirmed with perf attached and via fifo-controlled session.

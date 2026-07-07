@@ -1,0 +1,44 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+# symbol: __memmove_evex_unaligned_erms
+#
+# Total Lost Samples: 0
+#
+# Samples: 20K of event 'cycles:Pu'
+# Event count (approx.): 20183951426
+#
+# Overhead  Command   Shared Object
+# ........  ........  .............
+#
+     1.53%  postgres  libc.so.6    
+            |
+            ---__libc_start_call_main
+               main
+               PostmasterMain
+               ServerLoop.isra.0
+               postmaster_child_launch
+               0x8c6fbf
+               PostgresMain
+               exec_simple_query
+               PortalRun
+               PortalRunMulti
+               PortalRunUtility
+               standard_ProcessUtility
+               DoCopy
+               CopyFrom
+               |          
+                --1.32%--CopyMultiInsertBufferFlush
+                          |          
+                          |--0.86%--heap_multi_insert
+                          |          |          
+                          |           --0.51%--RelationPutHeapTuple
+                          |                     |          
+                          |                      --0.31%--__memmove_evex_unaligned_erms
+                          |          
+                           --0.46%--__memmove_evex_unaligned_erms
+
+
+
+#
+# (Tip: Create an archive with symtabs to analyse on other machine: perf archive)
+#
