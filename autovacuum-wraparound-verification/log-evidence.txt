@@ -1,0 +1,32 @@
+# Selected raw log evidence
+
+## W1 - forced wraparound vacuum on autovacuum_enabled=off table
+2026-07-04 23:02:13.510 UTC [22070] LOG:  automatic aggressive vacuum to prevent wraparound of table "postgres.public.frozen_target": index scans: 0
+
+## W1 - the WARNING explaining the pinned horizon
+2026-07-04 23:02:13.084 UTC [22069] WARNING:  cutoff for removing and freezing tuples is far in the past
+2026-07-04 23:02:13.084 UTC [22069] HINT:  Close open transactions soon to avoid wraparound problems.
+--
+
+## W2 - failsafe on fs
+2026-07-04 23:04:36.620 UTC [24159] WARNING:  bypassing nonessential maintenance of table "postgres.public.fs" as a failsafe after 0 index scans
+2026-07-04 23:04:36.620 UTC [24159] DETAIL:  The table's relfrozenxid or relminmxid is too far in the past.
+
+## W3 - wraparound vacuum on aw COMPLETED (index scans:1) - not cancelled
+2026-07-04 23:08:46.323 UTC [27912] LOG:  automatic aggressive vacuum to prevent wraparound of table "postgres.public.aw": index scans: 1
+   canceling-autovacuum-task count in W cluster: 0
+
+## X1 - multi-pass index vacuum under 1MB work_mem
+2026-07-04 23:13:28.914 UTC [32597] LOG:  automatic vacuum of table "postgres.public.mp": index scans: 3
+
+## X2 - normal vacuum cancelled by lock conflict
+2026-07-04 23:14:24.808 UTC [815] ERROR:  canceling autovacuum task
+2026-07-04 23:14:24.808 UTC [815] CONTEXT:  while vacuuming index "cx_b" of relation "public.cx"
+
+## X3 - crash recovery
+2026-07-04 23:10:20.922 UTC [30942] LOG:  database system is ready to accept connections
+2026-07-04 23:17:10.792 UTC [30942] LOG:  autovacuum worker (PID 10120) was terminated by signal 9: Killed
+2026-07-04 23:17:11.447 UTC [10130] LOG:  database system was not properly shut down; automatic recovery in progress
+2026-07-04 23:17:20.020 UTC [10130] LOG:  redo done at 1/81F7C0C8 system usage: CPU: user: 7.72 s, system: 0.84 s, elapsed: 8.57 s
+2026-07-04 23:17:21.578 UTC [30942] LOG:  database system is ready to accept connections
+   memory usage: dead item storage 2.83 MB accumulated across 3 resets (limit 1.00 MB each)
