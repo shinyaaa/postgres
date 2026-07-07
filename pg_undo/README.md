@@ -25,6 +25,9 @@ SELECT * FROM undo.apply(last => '10 minutes', "table" => 'users');
 DROP TABLE users;
 -- NOTICE: pg_undo: moved table "public.users" to the recycle bin
 SELECT undo.restore_dropped('users');
+
+-- and you can just look at the past (v0.3)
+SELECT * FROM undo.as_of(NULL::users, now() - interval '1 hour');
 ```
 
 ## How it works
@@ -47,6 +50,16 @@ never loses or duplicates history (progress-LSN dedupe).
   `undo.history` exceeds `pg_undo.max_history_size`, capture pauses
   (with a WARNING) but the slot keeps advancing so WAL never piles up.
   It resumes automatically once space is reclaimed.
+- **Time travel** (v0.3): `undo.as_of(NULL::mytable, <timestamptz>)`
+  returns the table's rows as they were at that moment, reconstructed
+  from history — rows untouched since then come from the live table,
+  rows changed or deleted afterwards come from their captured old
+  images, and rows inserted afterwards are omitted (primary-key updates
+  are handled as delete+insert).  Needs a primary key and a point in
+  time within the tracked/retained window; a later `TRUNCATE` makes
+  earlier states unreconstructable and is reported as an error.
+  `undo.create_snapshot_view('mytable', <ts>)` wraps it in a temporary
+  view for ad-hoc digging.
 - **Recycle bin** (v0.2): a `ProcessUtility` hook diverts `DROP TABLE`
   into the `undo_trash` schema instead of destroying it — data, indexes,
   sequences, owner and privileges intact (each renamed with an
@@ -97,6 +110,8 @@ Restart, then `CREATE EXTENSION pg_undo;` in that database.
 | `undo.preview(xid, last, since, until, "table")` | Show inverse SQL without executing |
 | `undo.apply(..., on_conflict)` | Execute the inverse operations in one transaction |
 | `undo.status` (view) | Capture progress, slot position, pause state |
+| `undo.as_of(NULL::tbl, ts)` | The table's rows as of a past time |
+| `undo.create_snapshot_view(tbl, ts[, name])` | Temp view over `as_of` |
 | `undo.trash` (view) | Contents of the recycle bin |
 | `undo.restore_dropped(name[, new_name])` | Bring a dropped table back |
 | `undo.purge(name)` / `undo.purge_all()` | Empty the recycle bin for real |
@@ -121,6 +136,9 @@ Restart, then `CREATE EXTENSION pg_undo;` in that database.
 - On restore, index and sequence names keep their oid suffix
   (cosmetic; constraints and serial defaults keep working).
 - Undoing a very large transaction buffers it in worker memory.
+- `undo.as_of` reconstructs data, not schema: columns added since the
+  requested time show NULL in reconstructed rows, and a time inside the
+  last `pg_undo.naptime` may reflect slightly newer state (capture lag).
 - `undo` schema objects are superuser-only by default; anyone can drop
   a table into the bin (ownership required, as with real `DROP`), but
   restore/purge are for superusers unless you `GRANT` otherwise.

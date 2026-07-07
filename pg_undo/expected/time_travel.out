@@ -1,0 +1,169 @@
+--
+-- time travel: undo.as_of reconstructs past table states
+--
+CREATE TABLE tt (id int PRIMARY KEY, v text);
+SELECT undo.track('tt');
+NOTICE:  pg_undo: tracking tt; history capture begins within pg_undo.naptime
+ track 
+-------
+ 
+(1 row)
+
+INSERT INTO tt VALUES (1, 'one'), (2, 'two'), (3, 'three');
+SELECT wait_for_history('tt', 3);
+ wait_for_history 
+------------------
+ t
+(1 row)
+
+SELECT now() AS t0 \gset
+UPDATE tt SET v = 'TWO' WHERE id = 2;
+DELETE FROM tt WHERE id = 3;
+INSERT INTO tt VALUES (4, 'four');
+SELECT wait_for_history('tt', 6);
+ wait_for_history 
+------------------
+ t
+(1 row)
+
+-- current state
+SELECT * FROM tt ORDER BY id;
+ id |  v   
+----+------
+  1 | one
+  2 | TWO
+  4 | four
+(3 rows)
+
+-- state at t0: update reverted, deleted row visible, later insert absent
+SELECT * FROM undo.as_of(NULL::tt, :'t0') ORDER BY id;
+ id |   v   
+----+-------
+  1 | one
+  2 | two
+  3 | three
+(3 rows)
+
+--
+-- primary key updates decompose into gone + born
+--
+SELECT now() AS t1 \gset
+UPDATE tt SET id = 40 WHERE id = 4;
+SELECT wait_for_history('tt', 7);
+ wait_for_history 
+------------------
+ t
+(1 row)
+
+SELECT * FROM undo.as_of(NULL::tt, :'t1') ORDER BY id;
+ id |  v   
+----+------
+  1 | one
+  2 | TWO
+  4 | four
+(3 rows)
+
+SELECT * FROM undo.as_of(NULL::tt, now()) ORDER BY id;
+ id |  v   
+----+------
+  1 | one
+  2 | TWO
+ 40 | four
+(3 rows)
+
+--
+-- snapshot view
+--
+SELECT undo.create_snapshot_view('tt', :'t0', 'tt_at_t0');
+NOTICE:  pg_undo: created temporary view tt_at_t0
+ create_snapshot_view 
+----------------------
+ tt_at_t0
+(1 row)
+
+SELECT * FROM tt_at_t0 ORDER BY id;
+ id |   v   
+----+-------
+  1 | one
+  2 | two
+  3 | three
+(3 rows)
+
+--
+-- guards
+--
+CREATE TABLE tt_untracked (id int PRIMARY KEY);
+SELECT * FROM undo.as_of(NULL::tt_untracked, now());			-- not tracked
+ERROR:  pg_undo: tt_untracked is not tracked
+CONTEXT:  PL/pgSQL function undo._as_of_check(regclass,timestamp with time zone) line 11 at RAISE
+SQL statement "SELECT undo._as_of_check(v_rel, at)"
+PL/pgSQL function undo.as_of(anyelement,timestamp with time zone) line 17 at PERFORM
+SELECT * FROM undo.as_of(NULL::tt, :'t0'::timestamptz - interval '1 day');	-- too early
+ERROR:  pg_undo: history for tt does not reach back to the requested time
+CONTEXT:  PL/pgSQL function undo._as_of_check(regclass,timestamp with time zone) line 14 at RAISE
+SQL statement "SELECT undo._as_of_check(v_rel, at)"
+PL/pgSQL function undo.as_of(anyelement,timestamp with time zone) line 17 at PERFORM
+SELECT * FROM undo.as_of(NULL::tt, NULL::timestamptz);			-- null time
+ERROR:  pg_undo: the point in time must not be NULL
+CONTEXT:  PL/pgSQL function undo._as_of_check(regclass,timestamp with time zone) line 6 at RAISE
+SQL statement "SELECT undo._as_of_check(v_rel, at)"
+PL/pgSQL function undo.as_of(anyelement,timestamp with time zone) line 17 at PERFORM
+CREATE TABLE nopk2 (a int);
+SELECT undo.track('nopk2');
+WARNING:  pg_undo: nopk2 has no primary key; undo will match rows on the full row image
+NOTICE:  pg_undo: tracking nopk2; history capture begins within pg_undo.naptime
+ track 
+-------
+ 
+(1 row)
+
+SELECT * FROM undo.as_of(NULL::nopk2, now());					-- needs a PK
+ERROR:  pg_undo: as_of requires a primary key on nopk2
+CONTEXT:  PL/pgSQL function undo._as_of_check(regclass,timestamp with time zone) line 17 at RAISE
+SQL statement "SELECT undo._as_of_check(v_rel, at)"
+PL/pgSQL function undo.as_of(anyelement,timestamp with time zone) line 17 at PERFORM
+-- a TRUNCATE after the requested time blocks reconstruction
+TRUNCATE tt;
+SELECT wait_for_history('tt', 8);
+ wait_for_history 
+------------------
+ t
+(1 row)
+
+SELECT * FROM undo.as_of(NULL::tt, :'t0');						-- error
+ERROR:  pg_undo: tt was truncated after the requested time; its state cannot be reconstructed
+CONTEXT:  PL/pgSQL function undo._as_of_check(regclass,timestamp with time zone) line 21 at RAISE
+SQL statement "SELECT undo._as_of_check(v_rel, at)"
+PL/pgSQL function undo.as_of(anyelement,timestamp with time zone) line 17 at PERFORM
+-- but times after the TRUNCATE work again
+SELECT now() AS t2 \gset
+INSERT INTO tt VALUES (100, 'after-truncate');
+SELECT wait_for_history('tt', 9);
+ wait_for_history 
+------------------
+ t
+(1 row)
+
+SELECT * FROM undo.as_of(NULL::tt, :'t2') ORDER BY id;
+ id | v 
+----+---
+(0 rows)
+
+SELECT * FROM undo.as_of(NULL::tt, now()) ORDER BY id;
+ id  |       v        
+-----+----------------
+ 100 | after-truncate
+(1 row)
+
+SELECT undo.untrack('tt');
+ untrack 
+---------
+ 
+(1 row)
+
+SELECT undo.untrack('nopk2');
+ untrack 
+---------
+ 
+(1 row)
+
