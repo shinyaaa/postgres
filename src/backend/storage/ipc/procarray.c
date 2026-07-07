@@ -2265,8 +2265,8 @@ GetSnapshotData(Snapshot snapshot)
 	{
 		int			numProcs = arrayP->numProcs;
 		TransactionId *xip = snapshot->xip;
-		int		   *pgprocnos = arrayP->pgprocnos;
-		XidCacheStatus *subxidStates = ProcGlobal->subxidStates;
+		int		   *pgprocnos PG_USED_FOR_ASSERTS_ONLY = arrayP->pgprocnos;
+		XidCacheStatus *subxidStates PG_USED_FOR_ASSERTS_ONLY = ProcGlobal->subxidStates;
 		uint8	   *allStatusFlags = ProcGlobal->statusFlags;
 
 		/*
@@ -2326,6 +2326,8 @@ GetSnapshotData(Snapshot snapshot)
 			/* Add XID to snapshot. */
 			xip[count++] = xid;
 
+#ifdef USE_ASSERT_CHECKING
+
 			/*
 			 * Save subtransaction XIDs if possible (if we've already
 			 * overflowed, there's no point).  Note that the subxact XIDs must
@@ -2340,6 +2342,10 @@ GetSnapshotData(Snapshot snapshot)
 			 * xmax.)
 			 *
 			 * Again, our own XIDs are not included in the snapshot.
+			 *
+			 * Visibility checks no longer read this enumeration - they use
+			 * the snapshot's CSN - so it is collected only in assert-enabled
+			 * builds, to feed the cross-check in XidInMVCCSnapshot().
 			 */
 			if (!suboverflowed)
 			{
@@ -2364,7 +2370,21 @@ GetSnapshotData(Snapshot snapshot)
 					}
 				}
 			}
+#endif							/* USE_ASSERT_CHECKING */
 		}
+
+#ifndef USE_ASSERT_CHECKING
+
+		/*
+		 * Since the subtransaction enumeration was not collected, mark it
+		 * overflowed: the xip representation then remains well-formed for
+		 * any code that still consumes it (a reader has to resolve subxids
+		 * through pg_subtrans, as it always had to for an overflowed
+		 * snapshot).  Visibility checks use the snapshot's CSN and never
+		 * look at this.
+		 */
+		suboverflowed = true;
+#endif
 	}
 	else
 	{

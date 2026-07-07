@@ -1,7 +1,8 @@
 # サブトランザクション64個制限の根本解決 — 設計書
 
 - 対象: PostgreSQL master (20devel)
-- ステータス: Draft
+- ステータス: Phase 0〜4 実装済み（§8 の実装ステータスを参照。§4 の一部は実装中の知見で
+  改訂された — §8.1）
 - 前提: GUC 追加やキャッシュ拡大などの「オーバーフローしにくくする」ワークアラウンドは対象外。
   オーバーフローという概念自体が性能問題を引き起こさないアーキテクチャへの変更を設計する。
 
@@ -143,6 +144,10 @@ PGPROC の 64 固定を可変（DSA 上）にし、スナップショットに�
 ## 4. 採用設計: CSN ベーススナップショット詳細
 
 ### 4.1 中心概念
+
+> **注（実装後の改訂）**: 「CSN = コミットレコード終端 LSN」はプライマリでは成立しない
+> ことが実装検証で判明し、**公開時採番の単調カウンタ**に改訂された。§8.1 を参照。
+> スタンバイ側は本節の記述どおり LSN を用いる。
 
 - **CSN**: 64bit の単調増加値。**コミットレコードの終端 LSN** を CSN として用いる。
   - 専用カウンタ方式に対する利点: プライマリとスタンバイで「コミット順序」が
@@ -347,3 +352,78 @@ subxid→topxid 変換が残って必要な箇所は精査の結果、以下の�
   採用して順序調停を WAL に一元化することで、当時より条件が良くなっている。
 - SLRU バンク化（PG17, commit `bcdfa5f2e2f`）、Simon Riggs / Andrey Borodin の
   subtrans 競合削減パッチ群（2021–2022）は本設計の前提・補完として位置づける。
+
+## 8. 実装ステータスと設計からの変更点
+
+
+Phase 0〜4 を本ブランチで実装済み。各 Phase は独立したコミットになっている。
+
+| Phase | コミット内容 | 状態 |
+|-------|--------------|------|
+| 0 | `XidInMVCCSnapshot()` を唯一の入口に隔離（挙動変更なし） | 済 |
+| 1 | pg_csnlog 新設、コミット/アボート/2PC/redo でのスタンプ、スナップショットへの CSN 格納、assert ビルドでの新旧全件照合（shadow verification） | 済 |
+| 2 | プライマリの可視性判定を CSN に切り替え。シリアライズ（並列ワーカー）・エクスポート/インポートに CSN を追加 | 済 |
+| 3 | ホットスタンバイの可視性判定を CSN に切り替え（`lastOverflowedXid` による全域ペナルティの消滅） | 済 |
+| 4 | 本番ビルドで `GetSnapshotData()` の subxid 列挙を停止（assert ビルドは照合用に維持）、ドキュメント更新 | 済 |
+
+検証: コアリグレッション 245 本・isolation 130 本（subxid-overflow, 2PC 含む）・
+リカバリ TAP（001_stream_rep / 009_twophase / 012_subtransactions）を、全可視性判定で
+新旧表現を突き合わせる shadow verification 有効の assert ビルドでパス。
+suboverflow 状態（100〜150 subxid のトランザクションが open）でのプライマリ/スタンバイ
+双方の read ワークロードで、可視性パスの pg_subtrans アクセスが 0 であることを
+pg_stat_slru で確認。
+
+### 8.1 実装中の知見による設計改訂
+
+**CSN の定義（§4.1, §4.3 を改訂）**: 当初設計の「CSN = コミットレコード終端 LSN」は
+正しくない。Phase 1 の shadow verification が即座に反例を検出した: WAL 挿入順と
+可視性の公開順（`ProcArrayEndTransaction()` が xid を外す順）は一致しない。
+遅いコミッタ T (LSN=L1) が flush 中に、後から来たコミッタ U (LSN=L2>L1) が先に公開
+されると、`スナップショット CSN ≥ L1 なのに T はまだ「実行中」` という矛盾が生じ、
+LSN ベースの CSN では T が誤って可視になる。
+
+改訂後の定義: **CSN はノードローカルな単調カウンタ**（`TransamVariables->lastCommitSeqNo`）
+で、**公開の瞬間に ProcArrayLock 下で採番**する。これにより CSN 順 ≡ 可視化順が構成的に
+成立する。手順:
+
+1. `RecordTransactionCommit()` は WAL 挿入・flush・clog 更新後、ツリー（全 subxid 込み）を
+   staging に登録するだけ（この時点では csnlog は `IN_PROGRESS` のまま = 不可視）。
+2. `ProcArrayEndTransaction()` が critical section 内で (a) ツリーを `COMMITTING` に
+   マーク → (b) ProcArrayLock 下で xid 除去と同時に `++lastCommitSeqNo` を採番
+   （グループ XID クリア時はリーダーがメンバー分を採番し `PGPROC->commitCSN` で受け渡し）
+   → (c) ロック解放後にツリーへ CSN をスタンプ。
+3. 読者が `COMMITTING` を見るのは (a)〜(c) の間だけで、この窓に I/O 待ち
+   （flush・同期レプリケーション）は含まれないため、スピン待ちで十分。
+
+スタンバイでは公開順 ≡ リプレイ順 ≡ WAL 順なので、当初設計どおりコミットレコード
+終端 LSN をそのまま CSN に使う。カウンタは起動時に checkpoint redo LSN でシード、
+リカバリ終了時に EndOfLog へ引き上げるため、プライマリ⇔スタンバイの役割遷移をまたいで
+も両系列の単調性が保たれる（コミットは 1 件あたり最低でも数十バイトの WAL を書くので、
+「+1/コミット」のカウンタが LSN を追い越すことはない）。
+
+**PGPROC の subxid キャッシュは削除しない（§4.9 を改訂）**: `TransactionIdIsInProgress()`
+（更新競合パスで使用）は「実行中か今この瞬間か」を答える必要があり、csnlog の
+`IN_PROGRESS` はクラッシュしたトランザクションと区別できないため置き換え不可。
+キャッシュを消すと 64 個以下のワークロードで書き込みパスが常に pg_subtrans 参照に
+退化する。よってキャッシュは write パス用の高速化として残す。**ただしスナップショット
+可視性はもはや一切参照しない**ので、オーバーフローの全域ペナルティは存在しない。
+
+**KnownAssignedXids / lastOverflowedXid も削除ではなく降格（§4.6 を改訂）**: xmin 水平線・
+リカバリコンフリクト・`XLOG_RUNNING_XACTS` の発行に引き続き必要なため維持する。
+可視性判定はこれらを読まなくなった（当初見積りの「約 1,500 行削除」は独立した
+後続クリーンアップとして残課題）。
+
+**snapshot->subxip / suboverflowed フィールドは当面維持**: 本番ビルドでは
+`GetSnapshotData()` が subxid を列挙しなくなった（`suboverflowed = true` を立てて
+xip 表現の整合性だけ保つ）。assert ビルドでは従来どおり列挙し、全可視性判定で
+CSN の答えと xip 表現の答えを突き合わせる。フィールド自体の削除は logical decoding
+（historic snapshot が subxip を別意味で使う）との絡みがあるため後続課題。
+
+### 8.2 残課題
+
+- csnlog エントリのロックフリー読み（現状は SLRU の共有バンクロック経由。
+  clog と同等のコストであり律速ではないが、§4.2 の元設計に沿った最適化余地）
+- `SubTransSetParent()` の遅延化（§4.5 のオプション最適化）
+- KnownAssignedXids の縮退・削除（スタンバイの xmin 追跡を CSN ベースに再設計）
+- logical decoding の CSN 化（§4.7）と snapshot 構造体からの subxip 系フィールド削除
+- 大規模ベンチマーク（§6 の性能実証シナリオ 1〜3 の本格計測）

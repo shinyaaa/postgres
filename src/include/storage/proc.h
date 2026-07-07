@@ -29,14 +29,21 @@ typedef int XidStatus;
 
 /*
  * Each backend advertises up to PGPROC_MAX_CACHED_SUBXIDS TransactionIds
- * for non-aborted subtransactions of its current top transaction.  These
- * have to be treated as running XIDs by other backends.
+ * for non-aborted subtransactions of its current top transaction.
  *
  * We also keep track of whether the cache overflowed (ie, the transaction has
  * generated at least one subtransaction that didn't fit in the cache).
  * If none of the caches have overflowed, we can assume that an XID that's not
  * listed anywhere in the PGPROC array is not a running transaction.  Else we
  * have to look at pg_subtrans.
+ *
+ * Note that MVCC snapshot visibility does NOT depend on this cache anymore:
+ * snapshots resolve subtransactions through pg_csnlog (see csnlog.c), so
+ * overflowing this cache no longer penalizes other sessions' visibility
+ * checks.  The cache remains as a fast path for TransactionIdIsInProgress()
+ * (update-conflict handling and similar write paths), and in assert-enabled
+ * builds it feeds the snapshot representation that cross-checks the CSN
+ * answers.
  *
  * See src/test/isolation/specs/subxid-overflow.spec if you change this.
  */
