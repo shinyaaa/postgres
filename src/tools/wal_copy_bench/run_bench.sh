@@ -32,7 +32,7 @@
 #   CASES_FILE    file with case definitions to override the built-in matrix
 #
 # Case definition format (one per line, '#' comments allowed):
-#   name|wal_level|mode|wal_compression|width|jobs
+#   name|wal_level|mode|wal_compression|width|jobs[|wal_buffers]
 #     wal_level:  minimal | replica | logical
 #     mode:       existing      COPY into a pre-committed regular table
 #                 unlogged      COPY into a pre-committed UNLOGGED table (no-WAL
@@ -43,6 +43,7 @@
 #     wal_compression: off | pglz | lz4 | zstd
 #     width:      narrow (2x bigint) | wide (bigint + 1000-char text)
 #     jobs:       number of concurrent COPY sessions (<= MAX_JOBS)
+#     wal_buffers: optional, defaults to 16MB (the auto-tuned cap)
 
 set -euo pipefail
 
@@ -118,13 +119,31 @@ server_stop()
 
 server_start_for_case()
 {
-	local wal_level=$1 wal_compression=$2
+	local wal_level=$1 wal_compression=$2 wal_buffers=${3:-16MB}
 
 	cat > "$PGDATA/bench_case.conf" <<-EOF
 		wal_level = $wal_level
 		wal_compression = $wal_compression
+		wal_buffers = $wal_buffers
 	EOF
 	"$PGBIN/pg_ctl" -D "$PGDATA" -w -l "$OUTDIR/server.log" start > /dev/null
+}
+
+# Pre-allocate WAL segments by running the largest load once, untimed.
+# Without this, the first case pays for zero-filling fresh 16MB segments
+# (IO:WalInitWrite) that every later case gets back recycled.
+warmup()
+{
+	local c
+
+	log "warmup: pre-allocating WAL segments (untimed wide load)"
+	server_start_for_case replica off
+	ddl_for_width wide warmup_tbl | $PSQL > /dev/null
+	for ((c = 0; c < MAX_JOBS; c++))
+	do
+		$PSQL -c "COPY warmup_tbl FROM '$DATADIR/wide.$c.dat';" > /dev/null
+	done
+	$PSQL -c "DROP TABLE warmup_tbl; CHECKPOINT;" > /dev/null
 }
 
 init_cluster()
@@ -196,14 +215,15 @@ job_sql()
 run_case()
 {
 	local name=$1 wal_level=$2 mode=$3 compression=$4 width=$5 jobs=$6
+	local wal_buffers=${7:-16MB}
 	local detail=$OUTDIR/$name expected_rows total_rows actual_rows
 	local start_lsn end_lsn t0 t1 elapsed sampler_pid j
 
 	mkdir -p "$detail"
-	log "=== case $name (wal_level=$wal_level mode=$mode compression=$compression width=$width jobs=$jobs)"
+	log "=== case $name (wal_level=$wal_level mode=$mode compression=$compression width=$width jobs=$jobs wal_buffers=$wal_buffers)"
 
 	server_stop
-	server_start_for_case "$wal_level" "$compression"
+	server_start_for_case "$wal_level" "$compression" "$wal_buffers"
 
 	# fresh state
 	$PSQL -c "DROP TABLE IF EXISTS bench_tbl;" > /dev/null
@@ -313,6 +333,7 @@ run_case()
 	awk -v OFS=',' \
 		-v name="$name" -v wal_level="$wal_level" -v mode="$mode" \
 		-v compression="$compression" -v width="$width" -v jobs="$jobs" \
+		-v walbuf="$wal_buffers" \
 		-v rows="$actual_rows" -v elapsed="$elapsed" -v heap="$heap_bytes" \
 		-v recs="$wal_records" -v fpi="$wal_fpi" -v bytes="$wal_bytes" \
 		-v fpib="$wal_fpi_bytes" -v bfull="$wal_buffers_full" \
@@ -323,7 +344,7 @@ run_case()
 			wal_mbps = (elapsed > 0) ? bytes / elapsed / 1048576 : 0;
 			bpr = (rows > 0) ? bytes / rows : 0;
 			ratio = (heap > 0) ? bytes / heap : 0;
-			print name, wal_level, mode, compression, width, jobs,
+			print name, wal_level, mode, compression, width, jobs, walbuf,
 				rows, elapsed, int(rps),
 				recs, fpi, bytes, fpib, sprintf("%.1f", bpr),
 				sprintf("%.2f", ratio), sprintf("%.1f", wal_mbps),
@@ -358,6 +379,11 @@ default_cases()
 		# --- compression and logical decoding overheads
 		narrow_replica_lz4_j1|replica|existing|lz4|narrow|1
 		narrow_logical_j1|logical|existing|off|narrow|1
+		# --- wal_buffers sensitivity: is parallel COPY WALWrite-bound only
+		#     because the default 16MB wal_buffers wraps?
+		narrow_replica_j4_wb256|replica|existing|off|narrow|4|256MB
+		wide_replica_j4_wb256|replica|existing|off|wide|4|256MB
+		wide_replica_j1_wb256|replica|existing|off|wide|1|256MB
 	EOF
 }
 
@@ -381,8 +407,9 @@ gen_data wide "$SCALE_WIDE"
 
 trap server_stop EXIT
 init_cluster
+warmup
 
-echo "name,wal_level,mode,compression,width,jobs,rows,elapsed_s,rows_per_s,wal_records,wal_fpi,wal_bytes,wal_fpi_bytes,wal_bytes_per_row,wal_to_heap_ratio,wal_MB_per_s,wal_buffers_full,wal_io_writes,wal_io_write_time_ms,wal_io_fsyncs,wal_io_fsync_time_ms,heap_bytes" \
+echo "name,wal_level,mode,compression,width,jobs,wal_buffers,rows,elapsed_s,rows_per_s,wal_records,wal_fpi,wal_bytes,wal_fpi_bytes,wal_bytes_per_row,wal_to_heap_ratio,wal_MB_per_s,wal_buffers_full,wal_io_writes,wal_io_write_time_ms,wal_io_fsyncs,wal_io_fsync_time_ms,heap_bytes" \
 	> "$OUTDIR/summary.csv"
 
 if [ -n "${CASES_FILE:-}" ]; then
@@ -391,9 +418,9 @@ else
 	cases=$(default_cases | grep -v '^\s*#' | grep -v '^\s*$' | sed 's/^\s*//')
 fi
 
-while IFS='|' read -r name wal_level mode compression width jobs
+while IFS='|' read -r name wal_level mode compression width jobs walbuf
 do
-	run_case "$name" "$wal_level" "$mode" "$compression" "$width" "$jobs"
+	run_case "$name" "$wal_level" "$mode" "$compression" "$width" "$jobs" "${walbuf:-16MB}"
 done <<< "$cases"
 
 server_stop
