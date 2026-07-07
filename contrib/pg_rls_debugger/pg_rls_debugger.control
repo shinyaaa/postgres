@@ -1,0 +1,6 @@
+# pg_rls_debugger extension
+comment = 'debugger for row-level security (RLS) policies'
+default_version = '1.0'
+relocatable = false
+trusted = true
+requires = 'plpgsql'
