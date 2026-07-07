@@ -44,6 +44,7 @@ per case with the case's `wal_level` / `wal_compression`.
 | WAL-skip bound | `*_minimal_newrel_*` | the existing wal_level=minimal skip = what "no per-tuple WAL" buys end-to-end |
 | FREEZE/init-page | `*_replica_freeze_*` | all-new-pages variant, closest existing shape to Phase 2's page-image logging |
 | levers | `*_lz4_*`, `*_logical_*` | FPI compression effect; logical decoding tuple-data overhead |
+| Phase 2 prototype | `*_img_*` | page-image multi-insert records (`debug_multi_insert_page_images=on`, needs patched build; skipped on unpatched servers) alone and combined with `wal_compression=zstd` |
 
 Fixed server settings: `shared_buffers=2GB`, `max_wal_size=16GB`,
 `checkpoint_timeout=30min` (no checkpoints mid-case → no FPI noise),

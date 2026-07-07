@@ -32,7 +32,7 @@
 #   CASES_FILE    file with case definitions to override the built-in matrix
 #
 # Case definition format (one per line, '#' comments allowed):
-#   name|wal_level|mode|wal_compression|width|jobs[|wal_buffers]
+#   name|wal_level|mode|wal_compression|width|jobs[|wal_buffers[|images]]
 #     wal_level:  minimal | replica | logical
 #     mode:       existing      COPY into a pre-committed regular table
 #                 unlogged      COPY into a pre-committed UNLOGGED table (no-WAL
@@ -44,6 +44,9 @@
 #     width:      narrow (2x bigint) | wide (bigint + 1000-char text)
 #     jobs:       number of concurrent COPY sessions (<= MAX_JOBS)
 #     wal_buffers: optional, defaults to 16MB (the auto-tuned cap)
+#     images:     optional on|off (default off); sets the Phase 2 prototype
+#                 GUC debug_multi_insert_page_images (needs a patched build;
+#                 cases are skipped gracefully on an unpatched server)
 
 set -euo pipefail
 
@@ -119,13 +122,16 @@ server_stop()
 
 server_start_for_case()
 {
-	local wal_level=$1 wal_compression=$2 wal_buffers=${3:-16MB}
+	local wal_level=$1 wal_compression=$2 wal_buffers=${3:-16MB} images=${4:-off}
 
 	cat > "$PGDATA/bench_case.conf" <<-EOF
 		wal_level = $wal_level
 		wal_compression = $wal_compression
 		wal_buffers = $wal_buffers
 	EOF
+	if [ "$images" = on ]; then
+		echo "debug_multi_insert_page_images = on" >> "$PGDATA/bench_case.conf"
+	fi
 	"$PGBIN/pg_ctl" -D "$PGDATA" -w -l "$OUTDIR/server.log" start > /dev/null
 }
 
@@ -215,15 +221,23 @@ job_sql()
 run_case()
 {
 	local name=$1 wal_level=$2 mode=$3 compression=$4 width=$5 jobs=$6
-	local wal_buffers=${7:-16MB}
+	local wal_buffers=${7:-16MB} images=${8:-off}
 	local detail=$OUTDIR/$name expected_rows total_rows actual_rows
 	local start_lsn end_lsn t0 t1 elapsed sampler_pid j
 
 	mkdir -p "$detail"
-	log "=== case $name (wal_level=$wal_level mode=$mode compression=$compression width=$width jobs=$jobs wal_buffers=$wal_buffers)"
+	log "=== case $name (wal_level=$wal_level mode=$mode compression=$compression width=$width jobs=$jobs wal_buffers=$wal_buffers images=$images)"
 
 	server_stop
-	server_start_for_case "$wal_level" "$compression" "$wal_buffers"
+	if ! server_start_for_case "$wal_level" "$compression" "$wal_buffers" "$images"
+	then
+		log "    SKIPPED: server failed to start (unsupported wal_compression or GUC on this build?)"
+		rm -f "$PGDATA/bench_case.conf.bad"
+		mv "$PGDATA/bench_case.conf" "$PGDATA/bench_case.conf.bad" 2> /dev/null || true
+		echo "wal_level = replica" > "$PGDATA/bench_case.conf"
+		echo "wal_compression = off" >> "$PGDATA/bench_case.conf"
+		return 0
+	fi
 
 	# fresh state
 	$PSQL -c "DROP TABLE IF EXISTS bench_tbl;" > /dev/null
@@ -333,7 +347,7 @@ run_case()
 	awk -v OFS=',' \
 		-v name="$name" -v wal_level="$wal_level" -v mode="$mode" \
 		-v compression="$compression" -v width="$width" -v jobs="$jobs" \
-		-v walbuf="$wal_buffers" \
+		-v walbuf="$wal_buffers" -v images="$images" \
 		-v rows="$actual_rows" -v elapsed="$elapsed" -v heap="$heap_bytes" \
 		-v recs="$wal_records" -v fpi="$wal_fpi" -v bytes="$wal_bytes" \
 		-v fpib="$wal_fpi_bytes" -v bfull="$wal_buffers_full" \
@@ -344,7 +358,7 @@ run_case()
 			wal_mbps = (elapsed > 0) ? bytes / elapsed / 1048576 : 0;
 			bpr = (rows > 0) ? bytes / rows : 0;
 			ratio = (heap > 0) ? bytes / heap : 0;
-			print name, wal_level, mode, compression, width, jobs, walbuf,
+			print name, wal_level, mode, compression, width, jobs, walbuf, images,
 				rows, elapsed, int(rps),
 				recs, fpi, bytes, fpib, sprintf("%.1f", bpr),
 				sprintf("%.2f", ratio), sprintf("%.1f", wal_mbps),
@@ -384,6 +398,17 @@ default_cases()
 		narrow_replica_j4_wb256|replica|existing|off|narrow|4|256MB
 		wide_replica_j4_wb256|replica|existing|off|wide|4|256MB
 		wide_replica_j1_wb256|replica|existing|off|wide|1|256MB
+		# --- Phase 2 prototype: page-image multi-insert records.
+		#     Controls are the corresponding cases above (images default off)
+		#     plus the zstd-without-images case here.
+		narrow_img_j1|replica|existing|off|narrow|1|16MB|on
+		narrow_img_zstd_j1|replica|existing|zstd|narrow|1|16MB|on
+		narrow_img_zstd_j4|replica|existing|zstd|narrow|4|16MB|on
+		wide_img_j1|replica|existing|off|wide|1|16MB|on
+		wide_zstd_j1|replica|existing|zstd|wide|1|16MB|off
+		wide_img_zstd_j1|replica|existing|zstd|wide|1|16MB|on
+		wide_img_zstd_j4|replica|existing|zstd|wide|4|16MB|on
+		wide_img_zstd_j4_wb256|replica|existing|zstd|wide|4|256MB|on
 	EOF
 }
 
@@ -409,7 +434,7 @@ trap server_stop EXIT
 init_cluster
 warmup
 
-echo "name,wal_level,mode,compression,width,jobs,wal_buffers,rows,elapsed_s,rows_per_s,wal_records,wal_fpi,wal_bytes,wal_fpi_bytes,wal_bytes_per_row,wal_to_heap_ratio,wal_MB_per_s,wal_buffers_full,wal_io_writes,wal_io_write_time_ms,wal_io_fsyncs,wal_io_fsync_time_ms,heap_bytes" \
+echo "name,wal_level,mode,compression,width,jobs,wal_buffers,images,rows,elapsed_s,rows_per_s,wal_records,wal_fpi,wal_bytes,wal_fpi_bytes,wal_bytes_per_row,wal_to_heap_ratio,wal_MB_per_s,wal_buffers_full,wal_io_writes,wal_io_write_time_ms,wal_io_fsyncs,wal_io_fsync_time_ms,heap_bytes" \
 	> "$OUTDIR/summary.csv"
 
 if [ -n "${CASES_FILE:-}" ]; then
@@ -418,9 +443,10 @@ else
 	cases=$(default_cases | grep -v '^\s*#' | grep -v '^\s*$' | sed 's/^\s*//')
 fi
 
-while IFS='|' read -r name wal_level mode compression width jobs walbuf
+while IFS='|' read -r name wal_level mode compression width jobs walbuf images
 do
-	run_case "$name" "$wal_level" "$mode" "$compression" "$width" "$jobs" "${walbuf:-16MB}"
+	run_case "$name" "$wal_level" "$mode" "$compression" "$width" "$jobs" \
+		"${walbuf:-16MB}" "${images:-off}"
 done <<< "$cases"
 
 server_stop
