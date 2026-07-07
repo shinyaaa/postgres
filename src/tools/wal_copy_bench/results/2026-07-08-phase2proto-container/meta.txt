@@ -1,0 +1,5 @@
+PostgreSQL 20devel
+SCALE_NARROW=10000000 SCALE_WIDE=600000 MAX_JOBS=4 FSYNC=on
+Linux vm 6.18.5 #1 SMP PREEMPT_DYNAMIC @0 x86_64 x86_64 x86_64 GNU/Linux
+model name	: Intel(R) Xeon(R) Processor @ 2.80GHz
+nproc=4
