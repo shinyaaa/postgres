@@ -27,6 +27,8 @@ int			pg_undo_naptime = 1;
 int			pg_undo_janitor_interval = 60;
 char	   *pg_undo_retention = NULL;
 int			pg_undo_max_history_size = 10240;
+bool		pg_undo_recycle_bin = true;
+char	   *pg_undo_trash_retention = NULL;
 
 void		_PG_init(void);
 
@@ -103,7 +105,27 @@ _PG_init(void)
 							GUC_UNIT_MB,
 							NULL, NULL, NULL);
 
+	DefineCustomBoolVariable("pg_undo.recycle_bin",
+							 "Divert DROP TABLE into the undo_trash recycle bin.",
+							 "Only superusers can turn this off to drop tables for real; DROP TABLE ... CASCADE always bypasses the bin.",
+							 &pg_undo_recycle_bin,
+							 true,
+							 PGC_SUSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomStringVariable("pg_undo.trash_retention",
+							   "How long dropped tables are kept in the recycle bin.",
+							   "Must be a valid interval value.",
+							   &pg_undo_trash_retention,
+							   "7 days",
+							   PGC_SIGHUP,
+							   0,
+							   NULL, NULL, NULL);
+
 	MarkGUCPrefixReserved("pg_undo");
+
+	pg_undo_drop_init();
 
 	memset(&worker, 0, sizeof(worker));
 	worker.bgw_flags = BGWORKER_SHMEM_ACCESS |

@@ -568,6 +568,80 @@ maybe_run_janitor(void)
 			 pg_undo_retention, (uint64) SPI_processed);
 	}
 
+	/* recycle bin GC (0.2 objects may not exist yet after an upgrade) */
+	if (SPI_execute("SELECT pg_catalog.to_regclass('undo.trash_meta') IS NOT NULL",
+					true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+	{
+		bool		isnull;
+		Datum		d;
+
+		d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc,
+						  1, &isnull);
+		if (!isnull && DatumGetBool(d))
+		{
+			Oid			argtypes[1] = {TEXTOID};
+			Datum		values[1];
+			int			nexpired = 0;
+			Oid		   *expired_oids = NULL;
+			char	  **expired_names = NULL;
+
+			elog(DEBUG1, "pg_undo janitor: trash GC entered, trash_retention=%s",
+				 pg_undo_trash_retention);
+			values[0] = CStringGetTextDatum(pg_undo_trash_retention);
+			if (SPI_execute_with_args("SELECT m.trash_relid::pg_catalog.oid,"
+									  " m.trash_relid::pg_catalog.text"
+									  " FROM undo.trash_meta m"
+									  " WHERE m.dropped_at < pg_catalog.now() - $1::pg_catalog.interval",
+									  1, argtypes, values, NULL,
+									  true, 0) == SPI_OK_SELECT &&
+				SPI_processed > 0)
+			{
+				nexpired = (int) SPI_processed;
+				expired_oids = palloc(nexpired * sizeof(Oid));
+				expired_names = palloc(nexpired * sizeof(char *));
+				for (int i = 0; i < nexpired; i++)
+				{
+					bool		oidnull;
+
+					expired_oids[i] =
+						DatumGetObjectId(SPI_getbinval(SPI_tuptable->vals[i],
+													   SPI_tuptable->tupdesc,
+													   1, &oidnull));
+					expired_names[i] = SPI_getvalue(SPI_tuptable->vals[i],
+													SPI_tuptable->tupdesc, 2);
+				}
+			}
+
+			for (int i = 0; i < nexpired; i++)
+			{
+				StringInfoData sql;
+				Oid			dargtypes[1] = {OIDOID};
+				Datum		dvalues[1];
+
+				initStringInfo(&sql);
+				appendStringInfo(&sql, "DROP TABLE IF EXISTS %s CASCADE",
+								 expired_names[i]);
+				(void) SPI_execute(sql.data, false, 0);
+				pfree(sql.data);
+
+				dvalues[0] = ObjectIdGetDatum(expired_oids[i]);
+				(void) SPI_execute_with_args("DELETE FROM undo.trash_meta"
+											 " WHERE trash_relid = $1::pg_catalog.regclass",
+											 1, dargtypes, dvalues, NULL,
+											 false, 0);
+				ereport(LOG,
+						(errmsg("pg_undo: purged expired table %s from the recycle bin",
+								expired_names[i])));
+			}
+
+			/* forget entries whose table disappeared some other way */
+			(void) SPI_execute("DELETE FROM undo.trash_meta"
+							   " WHERE trash_relid::pg_catalog.oid NOT IN"
+							   " (SELECT oid FROM pg_catalog.pg_class)",
+							   false, 0);
+		}
+	}
+
 	/* size failsafe */
 	if (SPI_execute("SELECT pg_catalog.pg_total_relation_size('undo.history'::pg_catalog.regclass)",
 					true, 1) == SPI_OK_SELECT && SPI_processed > 0)

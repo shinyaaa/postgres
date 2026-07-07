@@ -4,14 +4,15 @@ MODULE_big = pg_undo
 OBJS = \
 	$(WIN32RES) \
 	pg_undo.o \
+	pg_undo_drop.o \
 	pg_undo_plugin.o \
 	pg_undo_worker.o
 
 EXTENSION = pg_undo
-DATA = pg_undo--0.1.sql
+DATA = pg_undo--0.1.sql pg_undo--0.1--0.2.sql
 PGFILEDESC = "pg_undo - undo accidental DML using logical decoding"
 
-REGRESS = pg_undo
+REGRESS = pg_undo recycle_bin
 REGRESS_OPTS = --temp-config $(CURDIR)/pg_undo.conf
 # shared_preload_libraries and wal_level cannot be applied to a running
 # server, so installcheck is not supported.

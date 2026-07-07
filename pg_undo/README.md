@@ -20,6 +20,11 @@ SELECT * FROM undo.apply(last => '10 minutes', "table" => 'users');
 --  applied | skipped | conflicts
 -- ---------+---------+-----------
 --    48213 |       0 |         0
+
+-- even DROP TABLE goes to a recycle bin (v0.2)
+DROP TABLE users;
+-- NOTICE: pg_undo: moved table "public.users" to the recycle bin
+SELECT undo.restore_dropped('users');
 ```
 
 ## How it works
@@ -42,6 +47,17 @@ never loses or duplicates history (progress-LSN dedupe).
   `undo.history` exceeds `pg_undo.max_history_size`, capture pauses
   (with a WARNING) but the slot keeps advancing so WAL never piles up.
   It resumes automatically once space is reclaimed.
+- **Recycle bin** (v0.2): a `ProcessUtility` hook diverts `DROP TABLE`
+  into the `undo_trash` schema instead of destroying it — data, indexes,
+  sequences, owner and privileges intact (each renamed with an
+  oid-suffix so same-named tables can coexist in the bin).
+  `undo.restore_dropped(name[, new_name])` brings it back;
+  `undo.purge(name)` / `undo.purge_all()` destroy for real; the janitor
+  purges entries older than `pg_undo.trash_retention`.  Escape hatches:
+  `DROP TABLE ... CASCADE` always bypasses the bin, and superusers can
+  `SET pg_undo.recycle_bin = off`.  Temporary tables, partitions,
+  extension-owned tables and multi-target drops that include any of
+  those fall through to the regular `DROP`.
 
 ## Installation
 
@@ -69,6 +85,8 @@ Restart, then `CREATE EXTENSION pg_undo;` in that database.
 | `pg_undo.retention` | `24 hours` | How long history is kept |
 | `pg_undo.max_history_size` | `10240` (MB) | Failsafe pause threshold |
 | `pg_undo.janitor_interval` | `60s` | GC / failsafe check interval |
+| `pg_undo.recycle_bin` | `on` | Divert `DROP TABLE` to the bin (superuser-settable) |
+| `pg_undo.trash_retention` | `7 days` | How long dropped tables stay restorable |
 
 ## SQL API
 
@@ -79,6 +97,10 @@ Restart, then `CREATE EXTENSION pg_undo;` in that database.
 | `undo.preview(xid, last, since, until, "table")` | Show inverse SQL without executing |
 | `undo.apply(..., on_conflict)` | Execute the inverse operations in one transaction |
 | `undo.status` (view) | Capture progress, slot position, pause state |
+| `undo.trash` (view) | Contents of the recycle bin |
+| `undo.restore_dropped(name[, new_name])` | Bring a dropped table back |
+| `undo.purge(name)` / `undo.purge_all()` | Empty the recycle bin for real |
+| `undo.ready()` | Has capture started (slot exists)? |
 
 ## Honest limitations (v0.1)
 
@@ -88,11 +110,20 @@ Restart, then `CREATE EXTENSION pg_undo;` in that database.
 - History lives in the same database and consumes disk in proportion to
   write volume × retention. This is **not a backup**: it protects
   against logical mistakes, not media failure.
-- `changed_by` is NULL: WAL does not record the acting role.
-- `TRUNCATE` is recorded but cannot be undone; DDL is out of scope
-  (a recycle bin for `DROP TABLE` is on the roadmap).
+- `changed_by` in `undo.history` is NULL: WAL does not record the
+  acting role (`undo.trash.dropped_by` is recorded, though).
+- `TRUNCATE` is recorded but cannot be undone; DDL other than
+  `DROP TABLE` is out of scope.
+- A binned `DROP TABLE` does not raise the usual RESTRICT dependency
+  error and does not fire drop event triggers: dependent objects (views,
+  foreign keys) simply follow the table into the bin and keep working
+  until it is purged.  Trashed tables are also included in `pg_dump`.
+- On restore, index and sequence names keep their oid suffix
+  (cosmetic; constraints and serial defaults keep working).
 - Undoing a very large transaction buffers it in worker memory.
-- `undo` schema objects are superuser-only by default.
+- `undo` schema objects are superuser-only by default; anyone can drop
+  a table into the bin (ownership required, as with real `DROP`), but
+  restore/purge are for superusers unless you `GRANT` otherwise.
 
 ## Tests
 

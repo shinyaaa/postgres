@@ -53,6 +53,8 @@ extern int	pg_undo_naptime;
 extern int	pg_undo_janitor_interval;
 extern char *pg_undo_retention;
 extern int	pg_undo_max_history_size;
+extern bool pg_undo_recycle_bin;
+extern char *pg_undo_trash_retention;
 
 /*
  * Capture buffer state (owned by pg_undo_worker.c, filled by the output
@@ -69,5 +71,8 @@ extern long undo_buffered_rows;
 extern HTAB *undo_tracked_rels; /* Oid -> (present); may be NULL */
 
 extern PGDLLEXPORT void pg_undo_worker_main(Datum main_arg);
+
+/* pg_undo_drop.c */
+extern void pg_undo_drop_init(void);
 
 #endif							/* PG_UNDO_H */

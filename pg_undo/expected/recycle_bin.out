@@ -1,0 +1,207 @@
+--
+-- recycle bin: DROP TABLE is diverted to undo_trash
+--
+CREATE TABLE dt (id serial PRIMARY KEY, v text);
+INSERT INTO dt (v) VALUES ('a'), ('b');
+DROP TABLE dt;
+NOTICE:  pg_undo: moved table "public.dt" to the recycle bin
+HINT:  Restore it with undo.restore_dropped('dt'); DROP TABLE ... CASCADE bypasses the recycle bin.
+SELECT count(*) AS in_public FROM pg_class
+ WHERE relname = 'dt' AND relnamespace = 'public'::regnamespace;
+ in_public 
+-----------
+         0
+(1 row)
+
+SELECT original_schema, original_name FROM undo.trash;
+ original_schema | original_name 
+-----------------+---------------
+ public          | dt
+(1 row)
+
+-- restore brings back data, indexes and the owned sequence
+SELECT undo.restore_dropped('dt');
+NOTICE:  pg_undo: restored public.dt
+ restore_dropped 
+-----------------
+ dt
+(1 row)
+
+SELECT * FROM dt ORDER BY id;
+ id | v 
+----+---
+  1 | a
+  2 | b
+(2 rows)
+
+INSERT INTO dt (v) VALUES ('c') RETURNING id;
+ id 
+----
+  3
+(1 row)
+
+--
+-- same-named tables can coexist in the bin (oid-suffixed names)
+--
+DROP TABLE dt;
+NOTICE:  pg_undo: moved table "public.dt" to the recycle bin
+HINT:  Restore it with undo.restore_dropped('dt'); DROP TABLE ... CASCADE bypasses the recycle bin.
+CREATE TABLE dt (id serial PRIMARY KEY, v text);
+INSERT INTO dt (v) VALUES ('second');
+DROP TABLE dt;
+NOTICE:  pg_undo: moved table "public.dt" to the recycle bin
+HINT:  Restore it with undo.restore_dropped('dt'); DROP TABLE ... CASCADE bypasses the recycle bin.
+SELECT count(*) AS dt_in_trash FROM undo.trash_meta WHERE original_name = 'dt';
+ dt_in_trash 
+-------------
+           2
+(1 row)
+
+-- newest first; the older one can be restored under a new name
+SELECT undo.restore_dropped('dt');
+NOTICE:  pg_undo: restored public.dt
+ restore_dropped 
+-----------------
+ dt
+(1 row)
+
+SELECT v FROM dt;
+   v    
+--------
+ second
+(1 row)
+
+SELECT undo.restore_dropped('dt', 'dt_old');
+NOTICE:  pg_undo: restored public.dt_old
+ restore_dropped 
+-----------------
+ dt_old
+(1 row)
+
+SELECT v FROM dt_old ORDER BY v;
+ v 
+---
+ a
+ b
+ c
+(3 rows)
+
+SELECT undo.restore_dropped('dt');	-- error: bin is empty for dt
+ERROR:  pg_undo: no dropped table dt in the recycle bin
+CONTEXT:  PL/pgSQL function undo.restore_dropped(text,text) line 14 at RAISE
+-- IF EXISTS keeps its usual behavior
+DROP TABLE IF EXISTS no_such_table;
+NOTICE:  table "no_such_table" does not exist, skipping
+--
+-- bypasses
+--
+CREATE TABLE gone (id int);
+DROP TABLE gone CASCADE;			-- CASCADE destroys for real
+SELECT count(*) AS gone_in_trash FROM undo.trash_meta WHERE original_name = 'gone';
+ gone_in_trash 
+---------------
+             0
+(1 row)
+
+CREATE TEMP TABLE tt (id int);
+DROP TABLE tt;						-- temp tables are never binned
+SELECT count(*) AS tt_in_trash FROM undo.trash_meta WHERE original_name = 'tt';
+ tt_in_trash 
+-------------
+           0
+(1 row)
+
+-- a multi-object DROP with any non-binnable target bypasses entirely
+CREATE TABLE m1 (id int);
+CREATE TEMP TABLE m2 (id int);
+DROP TABLE m1, m2;
+SELECT count(*) AS m_in_trash FROM undo.trash_meta
+ WHERE original_name IN ('m1', 'm2');
+ m_in_trash 
+------------
+          0
+(1 row)
+
+-- superusers can opt out per session
+CREATE TABLE really_gone (id int);
+SET pg_undo.recycle_bin = off;
+DROP TABLE really_gone;
+RESET pg_undo.recycle_bin;
+SELECT count(*) AS really_gone_in_trash FROM undo.trash_meta
+ WHERE original_name = 'really_gone';
+ really_gone_in_trash 
+----------------------
+                    0
+(1 row)
+
+--
+-- dependent objects follow the table into the bin instead of raising
+-- the usual RESTRICT error
+--
+CREATE TABLE base_t (id int PRIMARY KEY);
+INSERT INTO base_t VALUES (42);
+CREATE VIEW base_v AS SELECT * FROM base_t;
+DROP TABLE base_t;
+NOTICE:  pg_undo: moved table "public.base_t" to the recycle bin
+HINT:  Restore it with undo.restore_dropped('base_t'); DROP TABLE ... CASCADE bypasses the recycle bin.
+SELECT * FROM base_v;				-- still works, reading from the bin
+ id 
+----
+ 42
+(1 row)
+
+SELECT undo.restore_dropped('base_t');
+NOTICE:  pg_undo: restored public.base_t
+ restore_dropped 
+-----------------
+ base_t
+(1 row)
+
+DROP VIEW base_v;
+--
+-- non-superusers: drops are escalated into the bin, but bin management
+-- and the bypass GUC stay privileged
+--
+CREATE ROLE regress_pg_undo_user;
+CREATE TABLE user_t (id int PRIMARY KEY);
+ALTER TABLE user_t OWNER TO regress_pg_undo_user;
+SET SESSION AUTHORIZATION regress_pg_undo_user;
+SET pg_undo.recycle_bin = off;		-- error: superuser-only
+ERROR:  permission denied to set parameter "pg_undo.recycle_bin"
+DROP TABLE user_t;
+NOTICE:  pg_undo: moved table "public.user_t" to the recycle bin
+HINT:  Restore it with undo.restore_dropped('user_t'); DROP TABLE ... CASCADE bypasses the recycle bin.
+SELECT undo.restore_dropped('user_t');	-- error: no execute privilege
+ERROR:  permission denied for schema undo
+LINE 1: SELECT undo.restore_dropped('user_t');
+               ^
+RESET SESSION AUTHORIZATION;
+SELECT original_name, dropped_by FROM undo.trash
+ WHERE original_name = 'user_t';
+ original_name |      dropped_by      
+---------------+----------------------
+ user_t        | regress_pg_undo_user
+(1 row)
+
+--
+-- purge
+--
+SELECT undo.purge('user_t');
+ purge 
+-------
+ 
+(1 row)
+
+SELECT undo.purge_all() AS purged;
+ purged 
+--------
+      0
+(1 row)
+
+SELECT count(*) AS bin_size FROM undo.trash_meta;
+ bin_size 
+----------
+        0
+(1 row)
+
+DROP ROLE regress_pg_undo_user;
