@@ -1,0 +1,103 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 32K of event 'cycles:Pu'
+# Event count (approx.): 27837453493
+#
+# Overhead  Command   Shared Object     Symbol                                     
+# ........  ........  ................  ...........................................
+#
+    10.58%  postgres  postgres          [.] CopyReadLine
+     7.36%  postgres  postgres          [.] pg_strtoint64_safe
+     6.45%  postgres  postgres          [.] CopyFromTextOneRow
+     6.44%  postgres  postgres          [.] CopyReadAttributesText
+     5.52%  postgres  postgres          [.] CopyFrom
+     4.95%  postgres  postgres          [.] heap_multi_insert
+     3.96%  postgres  postgres          [.] heap_form_tuple
+     3.91%  postgres  postgres          [.] palloc0
+     3.62%  postgres  postgres          [.] InputFunctionCallSafe
+     3.33%  postgres  postgres          [.] fill_val
+     3.20%  postgres  postgres          [.] heap_fill_tuple
+     3.14%  postgres  postgres          [.] RelationPutHeapTuple
+     3.08%  postgres  postgres          [.] NextCopyFrom
+     2.80%  postgres  postgres          [.] PageAddItemExtended
+     2.32%  postgres  postgres          [.] heap_compute_data_size
+     2.21%  postgres  postgres          [.] tts_buffer_heap_clear
+     1.71%  postgres  libc.so.6         [.] __memmove_evex_unaligned_erms
+     1.61%  postgres  postgres          [.] heap_prepare_insert
+     1.60%  postgres  postgres          [.] hash_search_with_hash_value
+     1.54%  postgres  postgres          [.] pg_checksum_block_avx2
+     1.47%  postgres  postgres          [.] tts_buffer_heap_materialize
+     1.20%  postgres  postgres          [.] MemoryContextReset
+     1.19%  postgres  postgres          [.] ResourceOwnerForget
+     1.15%  postgres  postgres          [.] AllocSetFree
+     1.08%  postgres  postgres          [.] ResourceOwnerAddToHash
+     0.89%  postgres  postgres          [.] appendBinaryStringInfo
+     0.87%  postgres  libc.so.6         [.] __memset_evex_unaligned_erms
+     0.85%  postgres  postgres          [.] ExecFetchSlotHeapTuple
+     0.83%  postgres  libc.so.6         [.] __memset_evex_unaligned
+     0.77%  postgres  postgres          [.] AllocSetAlloc
+     0.73%  postgres  postgres          [.] pg_comp_crc32c_avx512
+     0.62%  postgres  postgres          [.] resetStringInfo
+     0.53%  postgres  postgres          [.] CopyMultiInsertBufferFlush
+     0.52%  postgres  postgres          [.] LWLockAttemptLock
+     0.52%  postgres  postgres          [.] memset@plt
+     0.50%  postgres  postgres          [.] enlargeStringInfo
+     0.36%  postgres  postgres          [.] pg_utf8_verifystr
+     0.34%  postgres  postgres          [.] memcpy@plt
+     0.31%  postgres  postgres          [.] LWLockRelease
+     0.31%  postgres  postgres          [.] MarkBufferDirty
+     0.29%  postgres  postgres          [.] ExecStoreVirtualTuple
+     0.29%  postgres  postgres          [.] pfree
+     0.27%  postgres  postgres          [.] int8in
+     0.24%  postgres  postgres          [.] ExtendBufferedRelCommon
+     0.22%  postgres  postgres          [.] LWLockReleaseClearVar
+     0.20%  postgres  postgres          [.] PageGetHeapFreeSpace
+     0.20%  postgres  postgres          [.] RelationGetBufferForTuple
+     0.19%  postgres  postgres          [.] BufferGetBlockNumber
+     0.19%  postgres  postgres          [.] GetVictimBuffer
+     0.19%  postgres  postgres          [.] XLogInsertRecord
+     0.15%  postgres  postgres          [.] tts_buffer_heap_get_heap_tuple
+     0.15%  postgres  postgres          [.] heap_freetuple
+     0.13%  postgres  postgres          [.] AdvanceXLInsertBuffer
+     0.12%  postgres  postgres          [.] XLogInsert
+     0.12%  postgres  postgres          [.] LockBufHdr
+     0.11%  postgres  postgres          [.] BufferLockAcquire
+     0.11%  postgres  postgres          [.] UnlockReleaseBuffer
+     0.10%  postgres  postgres          [.] PinBuffer
+     0.10%  postgres  postgres          [.] LWLockAcquire
+     0.09%  postgres  postgres          [.] hash_bytes
+     0.08%  postgres  postgres          [.] GetXLogBuffer
+     0.08%  postgres  postgres          [.] StartReadBuffer
+     0.08%  postgres  postgres          [.] ReservePrivateRefCountEntry
+     0.08%  postgres  postgres          [.] TerminateBufferIO
+     0.08%  postgres  postgres          [.] StrategyGetBuffer
+     0.08%  postgres  libc.so.6         [.] __libc_pwrite
+     0.07%  postgres  postgres          [.] StartSharedBufferIO
+     0.06%  postgres  libc.so.6         [.] __memcmp_evex_movbe
+     0.06%  postgres  postgres          [.] ResourceOwnerEnlarge
+     0.06%  postgres  postgres          [.] LWLockUpdateVar
+     0.05%  postgres  postgres          [.] GetPrivateRefCountEntrySlow
+     0.05%  postgres  postgres          [.] ReadBufferExtended
+     0.05%  postgres  postgres          [.] ConditionVariableBroadcast
+     0.05%  postgres  postgres          [.] FlushBuffer.constprop.0
+     0.05%  postgres  postgres          [.] XLogWrite
+     0.04%  postgres  postgres          [.] BufferLockUnlock
+     0.04%  postgres  postgres          [.] UnpinBufferNoOwner
+     0.04%  postgres  postgres          [.] pgstat_count_io_op_time
+     0.04%  postgres  postgres          [.] ForwardSyncRequest
+     0.04%  postgres  libc.so.6         [.] __new_sem_wait_slow64.constprop.0
+     0.03%  postgres  postgres          [.] FileWriteV
+     0.03%  postgres  postgres          [.] pgstat_count_io_op
+     0.03%  postgres  postgres          [.] XLogRegisterData
+     0.03%  postgres  postgres          [.] fsm_set_avail
+     0.03%  postgres  postgres          [.] fsm_readbuf
+     0.03%  postgres  postgres          [.] LockBufferInternal
+     0.03%  postgres  [unknown]         [k] 0xffffffff858001c8
+
+
+#
+# (Tip: Create an archive with symtabs to analyse on other machine: perf archive)
+#

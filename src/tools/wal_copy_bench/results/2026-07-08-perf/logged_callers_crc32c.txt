@@ -1,0 +1,38 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+# symbol: pg_comp_crc32c_avx512
+#
+# Total Lost Samples: 0
+#
+# Samples: 20K of event 'cycles:Pu'
+# Event count (approx.): 20183951426
+#
+# Overhead  Command   Shared Object
+# ........  ........  .............
+#
+     0.68%  postgres  postgres     
+            |
+            ---__libc_start_call_main
+               main
+               PostmasterMain
+               ServerLoop.isra.0
+               postmaster_child_launch
+               0x8c6fbf
+               PostgresMain
+               exec_simple_query
+               PortalRun
+               PortalRunMulti
+               PortalRunUtility
+               standard_ProcessUtility
+               DoCopy
+               CopyFrom
+               CopyMultiInsertBufferFlush
+               heap_multi_insert
+               |          
+                --0.67%--pg_comp_crc32c_avx512
+
+
+
+#
+# (Tip: Create an archive with symtabs to analyse on other machine: perf archive)
+#
