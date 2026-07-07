@@ -520,18 +520,14 @@ SyncRepReleaseWaiters(void)
 	}
 
 	/*
-	 * We're a potential sync standby. Release waiters if there are enough
-	 * sync standbys and we are considered as sync.
-	 */
-	LWLockAcquire(SyncRepLock, LW_EXCLUSIVE);
-
-	/*
-	 * Check whether we are a sync standby or not, and calculate the synced
-	 * positions among all sync standbys.  (Note: although this step does not
-	 * of itself require holding SyncRepLock, it seems like a good idea to do
-	 * it after acquiring the lock.  This ensures that the WAL pointers we use
-	 * to release waiters are newer than any previous execution of this
-	 * routine used.)
+	 * We're a potential sync standby. Check whether we are a sync standby or
+	 * not, and calculate the synced positions among all sync standbys.
+	 *
+	 * This does not require holding SyncRepLock: SyncRepGetSyncRecPtr()
+	 * reads each walsender's position under that walsender's own spinlock,
+	 * and the result is only used below either to take a lock-free fast
+	 * path or, after acquiring SyncRepLock, to advance WalSndCtl->lsn[]
+	 * under the protection of that lock.
 	 */
 	got_recptr = SyncRepGetSyncRecPtr(&writePtr, &flushPtr, &applyPtr, &am_sync);
 
@@ -559,14 +555,45 @@ SyncRepReleaseWaiters(void)
 	 */
 	if (!got_recptr || !am_sync)
 	{
-		LWLockRelease(SyncRepLock);
 		announce_next_takeover = !am_sync;
 		return;
 	}
 
 	/*
+	 * Fast exit if none of the synced positions is ahead of what has
+	 * already been advertised in WalSndCtl->lsn[]: there is no waiter that
+	 * we could release, so avoid taking SyncRepLock altogether.
+	 *
+	 * This is the common case for a standby whose reply does not move the
+	 * aggregate release point, e.g. a nearby standby in a multi-standby
+	 * setup where a more distant standby is the one bounding the release
+	 * point.  Such a standby replies frequently, and without this check
+	 * every reply would take SyncRepLock exclusively only to find nothing
+	 * to do, contending with backends entering the queue in
+	 * SyncRepWaitForLSN().
+	 *
+	 * WalSndCtl->lsn[] only ever moves forward, so a stale (older) read can
+	 * only make us acquire the lock and recheck below unnecessarily; it can
+	 * never make us skip a wakeup that is due.  A value that is already >=
+	 * our position means some other actor has advanced the release point
+	 * that far, and hence has already woken (or is about to wake) every
+	 * waiter we would have released.
+	 */
+	if (writePtr <= pg_atomic_read_u64(&WalSndCtl->lsn[SYNC_REP_WAIT_WRITE]) &&
+		flushPtr <= pg_atomic_read_u64(&WalSndCtl->lsn[SYNC_REP_WAIT_FLUSH]) &&
+		applyPtr <= pg_atomic_read_u64(&WalSndCtl->lsn[SYNC_REP_WAIT_APPLY]))
+		return;
+
+	/*
+	 * At least one position has advanced, so acquire the lock and release
+	 * the waiters that have been reached.
+	 */
+	LWLockAcquire(SyncRepLock, LW_EXCLUSIVE);
+
+	/*
 	 * Set the lsn first so that when we wake backends they will release up to
-	 * this location.
+	 * this location.  Recheck under the lock since another walsender may have
+	 * advanced these values concurrently after our lock-free check above.
 	 */
 	if (pg_atomic_read_u64(&WalSndCtl->lsn[SYNC_REP_WAIT_WRITE]) < writePtr)
 	{
