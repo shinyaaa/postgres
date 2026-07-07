@@ -2417,11 +2417,32 @@ GetSnapshotData(Snapshot snapshot)
 		 * those newly added transaction ids would be filtered away, so we
 		 * need not be concerned about them.
 		 */
+#ifdef USE_ASSERT_CHECKING
+		/*
+		 * Visibility checks answer from the snapshot's CSN and no longer
+		 * read this enumeration; it is collected only in assert-enabled
+		 * builds, to feed the cross-check in XidInMVCCSnapshot().  In
+		 * production builds it suffices to fold the oldest known-assigned
+		 * XID into xmin, which stops at the first valid array entry instead
+		 * of scanning all of KnownAssignedXids.
+		 */
 		subcount = KnownAssignedXidsGetAndSetXmin(snapshot->subxip, &xmin,
 												  xmax);
 
 		if (TransactionIdPrecedesOrEquals(xmin, procArray->lastOverflowedXid))
 			suboverflowed = true;
+#else
+		{
+			TransactionId kaxmin = KnownAssignedXidsGetOldestXmin();
+
+			if (TransactionIdIsValid(kaxmin) &&
+				TransactionIdPrecedes(kaxmin, xmin))
+				xmin = kaxmin;
+		}
+
+		/* See the corresponding non-recovery case above. */
+		suboverflowed = true;
+#endif							/* USE_ASSERT_CHECKING */
 	}
 
 
