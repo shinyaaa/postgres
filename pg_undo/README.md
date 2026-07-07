@@ -1,5 +1,7 @@
 # pg_undo — Ctrl+Z for PostgreSQL
 
+![pg_undo demo: an accidental DELETE and a DROP TABLE, both undone](docs/demo.gif)
+
 **Undo accidental DML with one SQL call.** pg_undo captures old/new row
 images of tracked tables through logical decoding into an in-database
 history, and can generate and apply the inverse operations.
