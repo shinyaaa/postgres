@@ -257,6 +257,7 @@ typedef struct SerializedSnapshotData
 	int32		subxcnt;
 	bool		suboverflowed;
 	bool		takenDuringRecovery;
+	CommitSeqNo snapshotCsn;
 	CommandId	curcid;
 } SerializedSnapshotData;
 
@@ -1205,6 +1206,7 @@ ExportSnapshot(Snapshot snapshot)
 
 	appendStringInfo(&buf, "xmin:%u\n", snapshot->xmin);
 	appendStringInfo(&buf, "xmax:%u\n", snapshot->xmax);
+	appendStringInfo(&buf, "csn:" UINT64_FORMAT "\n", snapshot->snapshotCsn);
 
 	/*
 	 * We must include our own top transaction ID in the top-xid data, since
@@ -1318,6 +1320,31 @@ parseIntFromText(const char *prefix, char **s, const char *filename)
 				 errmsg("invalid snapshot data in file \"%s\"", filename)));
 	ptr += prefixlen;
 	if (sscanf(ptr, "%d", &val) != 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+				 errmsg("invalid snapshot data in file \"%s\"", filename)));
+	ptr = strchr(ptr, '\n');
+	if (!ptr)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+				 errmsg("invalid snapshot data in file \"%s\"", filename)));
+	*s = ptr + 1;
+	return val;
+}
+
+static uint64
+parseUint64FromText(const char *prefix, char **s, const char *filename)
+{
+	char	   *ptr = *s;
+	int			prefixlen = strlen(prefix);
+	uint64		val;
+
+	if (strncmp(ptr, prefix, prefixlen) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+				 errmsg("invalid snapshot data in file \"%s\"", filename)));
+	ptr += prefixlen;
+	if (sscanf(ptr, UINT64_FORMAT, &val) != 1)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 				 errmsg("invalid snapshot data in file \"%s\"", filename)));
@@ -1482,6 +1509,7 @@ ImportSnapshot(const char *idstr)
 
 	snapshot.xmin = parseXidFromText("xmin:", &filebuf, path);
 	snapshot.xmax = parseXidFromText("xmax:", &filebuf, path);
+	snapshot.snapshotCsn = parseUint64FromText("csn:", &filebuf, path);
 
 	snapshot.xcnt = xcnt = parseIntFromText("xcnt:", &filebuf, path);
 
@@ -1748,6 +1776,7 @@ SerializeSnapshot(Snapshot snapshot, char *start_address)
 	serialized_snapshot.subxcnt = snapshot->subxcnt;
 	serialized_snapshot.suboverflowed = snapshot->suboverflowed;
 	serialized_snapshot.takenDuringRecovery = snapshot->takenDuringRecovery;
+	serialized_snapshot.snapshotCsn = snapshot->snapshotCsn;
 	serialized_snapshot.curcid = snapshot->curcid;
 
 	/*
@@ -1820,6 +1849,7 @@ RestoreSnapshot(char *start_address)
 	snapshot->subxcnt = serialized_snapshot.subxcnt;
 	snapshot->suboverflowed = serialized_snapshot.suboverflowed;
 	snapshot->takenDuringRecovery = serialized_snapshot.takenDuringRecovery;
+	snapshot->snapshotCsn = serialized_snapshot.snapshotCsn;
 	snapshot->curcid = serialized_snapshot.curcid;
 	snapshot->snapXactCompletionCount = 0;
 
@@ -1858,6 +1888,7 @@ RestoreTransactionSnapshot(Snapshot snapshot, PGPROC *source_pgproc)
 }
 
 static bool XidInMVCCSnapshotXip(TransactionId xid, Snapshot snapshot);
+static bool XidInMVCCSnapshotByCSN(TransactionId xid, Snapshot snapshot);
 #ifdef USE_ASSERT_CHECKING
 static void AssertCsnVisibilityConsistency(TransactionId xid, Snapshot snapshot,
 										   bool in_snapshot);
@@ -1896,6 +1927,30 @@ XidInMVCCSnapshot(TransactionId xid, Snapshot snapshot)
 	if (TransactionIdFollowsOrEquals(xid, snapshot->xmax))
 		return true;
 
+	/*
+	 * Snapshots built by GetSnapshotData() outside recovery carry a CSN and
+	 * are checked against pg_csnlog: one lookup per XID, with no dependency
+	 * on any backend's subxid-cache overflow state and no pg_subtrans
+	 * access.  Fabricated snapshots (snapshotCsn == InvalidCommitSeqNo,
+	 * e.g. logical decoding's initial snapshots) and recovery snapshots
+	 * still use the xip/subxip representation.
+	 *
+	 * In assert-enabled builds, cross-check the two representations against
+	 * each other; they must always agree.
+	 */
+	if (snapshot->snapshotCsn != InvalidCommitSeqNo &&
+		!snapshot->takenDuringRecovery)
+	{
+		bool		in_snapshot = XidInMVCCSnapshotByCSN(xid, snapshot);
+
+#ifdef USE_ASSERT_CHECKING
+		AssertCsnVisibilityConsistency(xid, snapshot,
+									   XidInMVCCSnapshotXip(xid, snapshot));
+#endif
+
+		return in_snapshot;
+	}
+	else
 	{
 		bool		in_snapshot = XidInMVCCSnapshotXip(xid, snapshot);
 
@@ -1905,6 +1960,34 @@ XidInMVCCSnapshot(TransactionId xid, Snapshot snapshot)
 
 		return in_snapshot;
 	}
+}
+
+/*
+ * XidInMVCCSnapshotByCSN
+ *		Check the given XID against the snapshot's commit sequence number.
+ *
+ * An XID was still in progress at the time the snapshot was taken exactly
+ * when its transaction tree's CSN had not been assigned yet (it is still
+ * unassigned, or it is greater than the snapshot's CSN).  Subtransactions
+ * carry the same CSN as their top-level transaction, so no subxid-to-parent
+ * resolution is needed - this is what eliminates the pg_subtrans lookups
+ * (and with them the "suboverflow" penalty) from the visibility hot path.
+ *
+ * The caller has already eliminated XIDs outside [xmin, xmax).
+ */
+static bool
+XidInMVCCSnapshotByCSN(TransactionId xid, Snapshot snapshot)
+{
+	CommitSeqNo csn = CSNLogGetCommitSeqNoWait(xid);
+
+	if (csn == InvalidCommitSeqNo)
+		return true;			/* still in progress (or crashed) */
+	if (csn == CSN_ABORTED)
+		return false;			/* pg_xact will show it aborted */
+	if (csn == CSN_FROZEN)
+		return false;			/* committed before any snapshot's birth */
+
+	return csn > snapshot->snapshotCsn;
 }
 
 #ifdef USE_ASSERT_CHECKING
