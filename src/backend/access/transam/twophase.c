@@ -77,6 +77,7 @@
 #include <unistd.h>
 
 #include "access/commit_ts.h"
+#include "access/csnlog.h"
 #include "access/htup_details.h"
 #include "access/subtrans.h"
 #include "access/transam.h"
@@ -1511,6 +1512,7 @@ FinishPreparedTransaction(const char *gid, bool isCommit)
 	char	   *bufptr;
 	TwoPhaseFileHeader *hdr;
 	TransactionId latestXid;
+	CommitSeqNo commitCsn = InvalidCommitSeqNo;
 	TransactionId *children;
 	RelFileLocator *commitrels;
 	RelFileLocator *abortrels;
@@ -1590,7 +1592,22 @@ FinishPreparedTransaction(const char *gid, bool isCommit)
 									   abortstats,
 									   gid);
 
-	ProcArrayRemove(proc, latestXid);
+	/*
+	 * On commit, the transaction tree's CSN is assigned by ProcArrayRemove()
+	 * (the 2PC analog of ProcArrayEndTransaction()) and stamped into
+	 * pg_csnlog right afterwards; see ProcArrayEndTransaction() for an
+	 * explanation of the CSN_COMMITTING marker and the critical section.
+	 */
+	if (isCommit)
+	{
+		START_CRIT_SECTION();
+		CSNLogSetCommitting(xid, hdr->nsubxacts, children);
+		ProcArrayRemove(proc, latestXid, &commitCsn);
+		CSNLogSetCommitSeqNo(xid, hdr->nsubxacts, children, commitCsn);
+		END_CRIT_SECTION();
+	}
+	else
+		ProcArrayRemove(proc, latestXid, NULL);
 
 	/*
 	 * In case we fail while running the callbacks, mark the gxact invalid so
@@ -2489,6 +2506,9 @@ RecordTransactionAbortPrepared(TransactionId xid,
 	 * but we may as well do it while we are here.
 	 */
 	TransactionIdAbortTree(xid, nchildren, children);
+
+	/* Mark it aborted in pg_csnlog too */
+	CSNLogSetCommitSeqNo(xid, nchildren, children, CSN_ABORTED);
 
 	END_CRIT_SECTION();
 

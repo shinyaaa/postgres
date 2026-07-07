@@ -394,6 +394,7 @@ typedef struct PgStat_KindInfo
  */
 static const char *const slru_names[] = {
 	"commit_timestamp",
+	"csnlog",
 	"multixact_member",
 	"multixact_offset",
 	"notify",

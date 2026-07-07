@@ -35,6 +35,36 @@
 #define MaxTransactionId			((TransactionId) 0xFFFFFFFF)
 
 /* ----------------
+ *		Commit sequence numbers
+ *
+ * A commit sequence number (CSN) is a node-local monotonic value that
+ * captures the order in which transactions became visible: on a primary it
+ * is assigned from TransamVariables->lastCommitSeqNo under ProcArrayLock
+ * when the transaction is removed from the set of running transactions; on
+ * a standby, where transactions become visible in WAL replay order, the
+ * commit record's end LSN is used.  CSNs are recorded per-XID in pg_csnlog
+ * (see csnlog.c) and are the basis of CSN snapshots: an XID is visible to
+ * a snapshot iff its CSN is a real (committed) value <= the snapshot's
+ * CSN.
+ *
+ * A few small values below any real CSN are reserved as markers; see
+ * csnlog.c for their semantics.
+ * ----------------
+ */
+typedef uint64 CommitSeqNo;
+
+#define InvalidCommitSeqNo		((CommitSeqNo) 0)	/* in progress or crashed */
+#define CSN_ABORTED				((CommitSeqNo) 1)	/* known aborted */
+#define CSN_COMMITTING			((CommitSeqNo) 2)	/* commit record being
+													 * inserted; wait */
+#define CSN_FROZEN				((CommitSeqNo) 3)	/* committed, visible to
+													 * every snapshot */
+#define FirstNormalCommitSeqNo	((CommitSeqNo) 4)
+
+#define COMMITSEQNO_IS_COMMITTED(csn) \
+	((csn) == CSN_FROZEN || (csn) >= FirstNormalCommitSeqNo)
+
+/* ----------------
  *		transaction ID manipulation macros
  * ----------------
  */
@@ -237,6 +267,18 @@ typedef struct TransamVariablesData
 	 */
 	FullTransactionId latestCompletedXid;	/* newest full XID that has
 											 * committed or aborted */
+
+	/*
+	 * The commit sequence number of the transaction that most recently was
+	 * removed from the set of running transactions (on a standby: whose
+	 * commit record was most recently replayed).  On a primary this is the
+	 * monotonic counter CSNs are assigned from; on a standby it is advanced
+	 * to each replayed commit record's end LSN.  It is the value CSN
+	 * snapshots are built from, and it is advanced together with
+	 * latestCompletedXid, under ProcArrayLock, so that the two are always
+	 * mutually consistent within a snapshot.
+	 */
+	CommitSeqNo lastCommitSeqNo;
 
 	/*
 	 * Number of top-level transactions with xids (i.e. which may have

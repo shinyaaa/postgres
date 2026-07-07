@@ -48,6 +48,7 @@
 
 #include "access/clog.h"
 #include "access/commit_ts.h"
+#include "access/csnlog.h"
 #include "access/heaptoast.h"
 #include "access/multixact.h"
 #include "access/rewriteheap.h"
@@ -5515,6 +5516,7 @@ BootStrapXLOG(uint32 data_checksum_version)
 	checkPoint.dataChecksumState = data_checksum_version;
 
 	TransamVariables->nextXid = checkPoint.nextXid;
+	TransamVariables->lastCommitSeqNo = FirstNormalCommitSeqNo;
 	TransamVariables->nextOid = checkPoint.nextOid;
 	TransamVariables->oidCount = 0;
 	MultiXactSetNextMXact(checkPoint.nextMulti, checkPoint.nextMultiOffset);
@@ -5605,6 +5607,7 @@ BootStrapXLOG(uint32 data_checksum_version)
 	BootStrapCLOG();
 	BootStrapCommitTs();
 	BootStrapSUBTRANS();
+	BootStrapCSNLOG();
 	BootStrapMultiXact();
 
 	/*
@@ -5994,6 +5997,8 @@ StartupXLOG(void)
 
 	/* initialize shared memory variables from the checkpoint record */
 	TransamVariables->nextXid = checkPoint.nextXid;
+	TransamVariables->lastCommitSeqNo = Max(FirstNormalCommitSeqNo,
+											checkPoint.redo);
 	TransamVariables->nextOid = checkPoint.nextOid;
 	TransamVariables->oidCount = 0;
 	MultiXactSetNextMXact(checkPoint.nextMulti, checkPoint.nextMultiOffset);
@@ -6230,11 +6235,15 @@ StartupXLOG(void)
 			ProcArrayInitRecovery(XidFromFullTransactionId(TransamVariables->nextXid));
 
 			/*
-			 * Startup subtrans only.  CLOG, MultiXact and commit timestamp
-			 * have already been started up and other SLRUs are not maintained
-			 * during recovery and need not be started yet.
+			 * Startup subtrans and csnlog only.  CLOG, MultiXact and commit
+			 * timestamp have already been started up and other SLRUs are not
+			 * maintained during recovery and need not be started yet.  The
+			 * csnlog is additionally seeded from pg_xact so that standby
+			 * queries can resolve transactions that completed before the
+			 * start of the WAL replay window.
 			 */
 			StartupSUBTRANS(oldestActiveXID);
+			StartupCSNLOG(oldestActiveXID, true);
 
 			/*
 			 * If we're beginning at a shutdown checkpoint, we know that
@@ -6512,14 +6521,26 @@ StartupXLOG(void)
 	LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
 	TransamVariables->latestCompletedXid = TransamVariables->nextXid;
 	FullTransactionIdRetreat(&TransamVariables->latestCompletedXid);
+
+	/*
+	 * Also catch lastCommitSeqNo up to the end of the replayed WAL: every
+	 * replayed commit has a CSN <= EndOfLog, whether or not it was stamped
+	 * (crash recovery does not maintain pg_csnlog; that is fine because
+	 * every pre-recovery XID is below the xmin of any future snapshot).
+	 */
+	if (TransamVariables->lastCommitSeqNo < EndOfLog)
+		TransamVariables->lastCommitSeqNo = EndOfLog;
 	LWLockRelease(ProcArrayLock);
 
 	/*
-	 * Start up subtrans, if not already done for hot standby.  (commit
-	 * timestamps are started below, if necessary.)
+	 * Start up subtrans and csnlog, if not already done for hot standby.
+	 * (commit timestamps are started below, if necessary.)
 	 */
 	if (standbyState == STANDBY_DISABLED)
+	{
 		StartupSUBTRANS(oldestActiveXID);
+		StartupCSNLOG(oldestActiveXID, false);
+	}
 
 	/*
 	 * Perform end of recovery actions for any SLRUs that need it.
@@ -7880,7 +7901,12 @@ CreateCheckPoint(int flags)
 	 * StartupSUBTRANS hasn't been called yet.
 	 */
 	if (!RecoveryInProgress())
-		TruncateSUBTRANS(GetOldestTransactionIdConsideredRunning());
+	{
+		TransactionId oldestXmin = GetOldestTransactionIdConsideredRunning();
+
+		TruncateSUBTRANS(oldestXmin);
+		TruncateCSNLOG(oldestXmin);
+	}
 
 	/* Real work is done; log and update stats. */
 	LogCheckpointEnd(false, flags);
@@ -8061,6 +8087,7 @@ CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
 	CheckPointCLOG();
 	CheckPointCommitTs();
 	CheckPointSUBTRANS();
+	CheckPointCSNLOG();
 	CheckPointMultiXact();
 	CheckPointPredicate();
 	CheckPointBuffers(flags);
@@ -8361,7 +8388,12 @@ CreateRestartPoint(int flags)
 	 * this because StartupSUBTRANS hasn't been called yet.
 	 */
 	if (EnableHotStandby)
-		TruncateSUBTRANS(GetOldestTransactionIdConsideredRunning());
+	{
+		TransactionId oldestXmin = GetOldestTransactionIdConsideredRunning();
+
+		TruncateSUBTRANS(oldestXmin);
+		TruncateCSNLOG(oldestXmin);
+	}
 
 	/* Real work is done; log and update stats. */
 	LogCheckpointEnd(true, flags);

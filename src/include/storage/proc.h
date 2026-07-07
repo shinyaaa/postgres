@@ -254,6 +254,17 @@ typedef struct PGPROC
 									 * ProcGlobal->subxidStates[i] */
 	struct XidCache subxids;	/* cache for subtransaction XIDs */
 
+	/*
+	 * Communication area for commit-sequence-number assignment.  A
+	 * committing backend sets this to CSN_COMMITTING before its XID is
+	 * cleared from the procarray; whoever performs the clearing (the
+	 * backend itself, or the group-XID-clearing leader on its behalf)
+	 * replaces it with a freshly assigned CSN, which the backend then
+	 * stamps into pg_csnlog.  Zero otherwise.  Declared as uint64 rather
+	 * than CommitSeqNo to avoid including access/transam.h here.
+	 */
+	uint64		commitCSN;
+
 
 	/************************************************************************
 	 * Inter-process signaling

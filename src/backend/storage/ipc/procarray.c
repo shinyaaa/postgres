@@ -47,6 +47,7 @@
 
 #include <signal.h>
 
+#include "access/csnlog.h"
 #include "access/subtrans.h"
 #include "access/transam.h"
 #include "access/twophase.h"
@@ -558,7 +559,7 @@ ProcArrayAdd(PGPROC *proc)
  * twophase.c depends on the latter.)
  */
 void
-ProcArrayRemove(PGPROC *proc, TransactionId latestXid)
+ProcArrayRemove(PGPROC *proc, TransactionId latestXid, CommitSeqNo *commitCsn)
 {
 	ProcArrayStruct *arrayP = procArray;
 	int			myoff;
@@ -588,6 +589,13 @@ ProcArrayRemove(PGPROC *proc, TransactionId latestXid)
 
 		/* Same with xactCompletionCount  */
 		TransamVariables->xactCompletionCount++;
+
+		/*
+		 * On commit (the caller passes a non-NULL commitCsn), assign the
+		 * transaction tree's CSN; cf. ProcArrayEndTransactionInternal().
+		 */
+		if (commitCsn != NULL)
+			*commitCsn = ++TransamVariables->lastCommitSeqNo;
 
 		ProcGlobal->xids[myoff] = InvalidTransactionId;
 		ProcGlobal->subxidStates[myoff].overflowed = false;
@@ -664,6 +672,8 @@ ProcArrayEndTransaction(PGPROC *proc, TransactionId latestXid)
 {
 	if (TransactionIdIsValid(latestXid))
 	{
+		bool		isCommit = CSNLogHasStagedCommit(proc->xid);
+
 		/*
 		 * We must lock ProcArrayLock while clearing our advertised XID, so
 		 * that we do not exit the set of "running" transactions while someone
@@ -671,6 +681,28 @@ ProcArrayEndTransaction(PGPROC *proc, TransactionId latestXid)
 		 * src/backend/access/transam/README.
 		 */
 		Assert(TransactionIdIsValid(proc->xid));
+
+		/*
+		 * For a commit, this is also where the transaction tree's CSN is
+		 * assigned and published: mark the tree as "committing" in
+		 * pg_csnlog first, so that a reader whose snapshot could cover the
+		 * CSN we are about to receive waits for the final value; then have
+		 * ProcArrayEndTransactionInternal() assign the CSN from
+		 * lastCommitSeqNo under ProcArrayLock (for group clearing, the
+		 * leader does that on our behalf); and finally stamp the tree.
+		 *
+		 * The critical section makes any failure between publishing the CSN
+		 * and stamping it a PANIC: a reader that has seen CSN_COMMITTING
+		 * busy-waits for the final value, so we must never fail to provide
+		 * it.  (After crash recovery the entries are irrelevant, since no
+		 * snapshot can look at pre-crash XIDs anymore.)
+		 */
+		if (isCommit)
+		{
+			START_CRIT_SECTION();
+			CSNLogSetCommittingStaged();
+			proc->commitCSN = CSN_COMMITTING;	/* request CSN assignment */
+		}
 
 		/*
 		 * If we can immediately acquire ProcArrayLock, we clear our own XID
@@ -684,6 +716,14 @@ ProcArrayEndTransaction(PGPROC *proc, TransactionId latestXid)
 		}
 		else
 			ProcArrayGroupClearXid(proc, latestXid);
+
+		if (isCommit)
+		{
+			Assert(proc->commitCSN >= FirstNormalCommitSeqNo);
+			CSNLogStampStaged(proc->commitCSN);
+			proc->commitCSN = InvalidCommitSeqNo;
+			END_CRIT_SECTION();
+		}
 	}
 	else
 	{
@@ -766,6 +806,21 @@ ProcArrayEndTransactionInternal(PGPROC *proc, TransactionId latestXid)
 
 	/* Same with xactCompletionCount  */
 	TransamVariables->xactCompletionCount++;
+
+	/*
+	 * If the transaction committed, assign its CSN by advancing
+	 * lastCommitSeqNo, making the transaction tree visible to CSN snapshots
+	 * whose CSN is >= that value.  This must happen together with the xid
+	 * removal above, under ProcArrayLock, so that a snapshot's CSN and its
+	 * xip/xmax contents always agree on which transactions have completed;
+	 * this is also why the CSN cannot be assigned any earlier (e.g. WAL
+	 * insertion order can differ from the order in which transactions
+	 * become visible here).  The caller (possibly a group-clearing member
+	 * whose leader executes this function) stamps the assigned value into
+	 * pg_csnlog afterwards.
+	 */
+	if (proc->commitCSN == CSN_COMMITTING)
+		proc->commitCSN = ++TransamVariables->lastCommitSeqNo;
 }
 
 /*
@@ -1231,6 +1286,7 @@ ProcArrayApplyRecoveryInfo(RunningTransactions running)
 	while (TransactionIdPrecedes(latestObservedXid, running->nextXid))
 	{
 		ExtendSUBTRANS(latestObservedXid);
+		ExtendCSNLOG(latestObservedXid);
 		TransactionIdAdvance(latestObservedXid);
 	}
 	TransactionIdRetreat(latestObservedXid);	/* = running->nextXid - 1 */
@@ -2356,6 +2412,14 @@ GetSnapshotData(Snapshot snapshot)
 	 */
 	replication_slot_xmin = procArray->replication_slot_xmin;
 	replication_slot_catalog_xmin = procArray->replication_slot_catalog_xmin;
+
+	/*
+	 * Also fetch the snapshot CSN while ProcArrayLock is held.
+	 * lastCommitSeqNo is advanced together with latestCompletedXid under
+	 * this lock, so the CSN we record here is consistent with the xmax and
+	 * the xip contents computed above.
+	 */
+	snapshot->snapshotCsn = TransamVariables->lastCommitSeqNo;
 
 	if (!TransactionIdIsValid(MyProc->xmin))
 		MyProc->xmin = TransactionXmin = xmin;
@@ -4472,6 +4536,7 @@ RecordKnownAssignedTransactionIds(TransactionId xid)
 		{
 			TransactionIdAdvance(next_expected_xid);
 			ExtendSUBTRANS(next_expected_xid);
+			ExtendCSNLOG(next_expected_xid);
 		}
 		Assert(next_expected_xid == xid);
 
@@ -4510,7 +4575,8 @@ RecordKnownAssignedTransactionIds(TransactionId xid)
  */
 void
 ExpireTreeKnownAssignedTransactionIds(TransactionId xid, int nsubxids,
-									  TransactionId *subxids, TransactionId max_xid)
+									  TransactionId *subxids, TransactionId max_xid,
+									  CommitSeqNo csn)
 {
 	Assert(standbyState >= STANDBY_INITIALIZED);
 
@@ -4526,6 +4592,11 @@ ExpireTreeKnownAssignedTransactionIds(TransactionId xid, int nsubxids,
 
 	/* ... and xactCompletionCount */
 	TransamVariables->xactCompletionCount++;
+
+	/* ... and, for commits, lastCommitSeqNo, making the transaction tree
+	 * visible to CSN snapshots taken on this standby */
+	if (TransamVariables->lastCommitSeqNo < csn)
+		TransamVariables->lastCommitSeqNo = csn;
 
 	LWLockRelease(ProcArrayLock);
 }

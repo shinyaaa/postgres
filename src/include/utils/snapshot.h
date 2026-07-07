@@ -13,6 +13,7 @@
 #ifndef SNAPSHOT_H
 #define SNAPSHOT_H
 
+#include "access/transam.h"
 #include "lib/pairingheap.h"
 
 
@@ -176,6 +177,16 @@ typedef struct SnapshotData
 	TransactionId *subxip;
 	int32		subxcnt;		/* # of xact ids in subxip[] */
 	bool		suboverflowed;	/* has the subxip array overflowed? */
+
+	/*
+	 * The commit sequence number this snapshot was taken at: transactions
+	 * whose CSN is <= snapshotCsn had committed by then, all others had
+	 * not.  Only set for snapshots built by GetSnapshotData();
+	 * InvalidCommitSeqNo in fabricated snapshots (e.g. logical decoding's
+	 * initial snapshots), which are handled by the xip/subxip
+	 * representation alone.
+	 */
+	CommitSeqNo snapshotCsn;
 
 	bool		takenDuringRecovery;	/* recovery-shaped snapshot? */
 	bool		copied;			/* false if it's a static snapshot */

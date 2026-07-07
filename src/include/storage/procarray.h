@@ -20,7 +20,8 @@
 
 
 extern void ProcArrayAdd(PGPROC *proc);
-extern void ProcArrayRemove(PGPROC *proc, TransactionId latestXid);
+extern void ProcArrayRemove(PGPROC *proc, TransactionId latestXid,
+							CommitSeqNo *commitCsn);
 
 extern void ProcArrayEndTransaction(PGPROC *proc, TransactionId latestXid);
 extern void ProcArrayClearTransaction(PGPROC *proc);
@@ -33,7 +34,8 @@ extern void ProcArrayApplyXidAssignment(TransactionId topxid,
 extern void RecordKnownAssignedTransactionIds(TransactionId xid);
 extern void ExpireTreeKnownAssignedTransactionIds(TransactionId xid,
 												  int nsubxids, TransactionId *subxids,
-												  TransactionId max_xid);
+												  TransactionId max_xid,
+												  CommitSeqNo csn);
 extern void ExpireAllKnownAssignedTransactionIds(void);
 extern void ExpireOldKnownAssignedTransactionIds(TransactionId xid);
 extern void KnownAssignedTransactionIdsIdleMaintenance(void);

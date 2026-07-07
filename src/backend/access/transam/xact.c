@@ -21,6 +21,7 @@
 #include <unistd.h>
 
 #include "access/commit_ts.h"
+#include "access/csnlog.h"
 #include "access/multixact.h"
 #include "access/parallel.h"
 #include "access/subtrans.h"
@@ -1510,6 +1511,17 @@ RecordTransactionCommit(void)
 		TransactionTreeSetCommitTsData(xid, nchildren, children,
 									   replorigin_xact_state.origin_timestamp,
 									   replorigin_xact_state.origin);
+
+		/*
+		 * Stage the transaction tree for CSN assignment.  The CSN itself is
+		 * only assigned - and the tree only stamped in pg_csnlog - when
+		 * ProcArrayEndTransaction() removes us from the set of running
+		 * transactions, so that the CSN order matches the order in which
+		 * transactions become visible.  We stage the tree here because this
+		 * is the last point that conveniently knows the full subxid list
+		 * (the PGPROC cache may have overflowed).
+		 */
+		CSNLogStageCommit(xid, nchildren, children);
 	}
 
 	/*
@@ -1891,6 +1903,9 @@ RecordTransactionAbort(bool isSubXact)
 	 * we'd be assumed to have aborted anyway.
 	 */
 	TransactionIdAbortTree(xid, nchildren, children);
+
+	/* Mark it aborted in pg_csnlog too */
+	CSNLogSetCommitSeqNo(xid, nchildren, children, CSN_ABORTED);
 
 	END_CRIT_SECTION();
 
@@ -6245,9 +6260,17 @@ xact_redo_commit(xl_xact_parsed_commit *parsed,
 		TransactionIdAsyncCommitTree(xid, parsed->nsubxacts, parsed->subxacts, lsn);
 
 		/*
+		 * Stamp the transaction tree's CSN.  lsn is the commit record's end
+		 * LSN, i.e. exactly the value the primary stamped, so CSN-based
+		 * visibility decisions on this standby agree with the primary's.
+		 */
+		CSNLogSetCommitSeqNo(xid, parsed->nsubxacts, parsed->subxacts, lsn);
+
+		/*
 		 * We must mark clog before we update the ProcArray.
 		 */
-		ExpireTreeKnownAssignedTransactionIds(xid, parsed->nsubxacts, parsed->subxacts, max_xid);
+		ExpireTreeKnownAssignedTransactionIds(xid, parsed->nsubxacts,
+											  parsed->subxacts, max_xid, lsn);
 
 		/*
 		 * Send any cache invalidations attached to the commit. We must
@@ -6374,10 +6397,16 @@ xact_redo_abort(xl_xact_parsed_abort *parsed, TransactionId xid,
 		/* Mark the transaction aborted in pg_xact, no need for async stuff */
 		TransactionIdAbortTree(xid, parsed->nsubxacts, parsed->subxacts);
 
+		/* Mark it aborted in pg_csnlog too */
+		CSNLogSetCommitSeqNo(xid, parsed->nsubxacts, parsed->subxacts,
+							 CSN_ABORTED);
+
 		/*
 		 * We must update the ProcArray after we have marked clog.
 		 */
-		ExpireTreeKnownAssignedTransactionIds(xid, parsed->nsubxacts, parsed->subxacts, max_xid);
+		ExpireTreeKnownAssignedTransactionIds(xid, parsed->nsubxacts,
+											  parsed->subxacts, max_xid,
+											  InvalidCommitSeqNo);
 
 		/*
 		 * There are no invalidation messages to send or undo.

@@ -15,6 +15,7 @@
 
 #include "access/clog.h"
 #include "access/commit_ts.h"
+#include "access/csnlog.h"
 #include "access/subtrans.h"
 #include "access/transam.h"
 #include "access/xact.h"
@@ -199,6 +200,7 @@ GetNewTransactionId(bool isSubXact)
 	ExtendCLOG(xid);
 	ExtendCommitTs(xid);
 	ExtendSUBTRANS(xid);
+	ExtendCSNLOG(xid);
 
 	/*
 	 * Now advance the nextXid counter.  This must not happen until after we

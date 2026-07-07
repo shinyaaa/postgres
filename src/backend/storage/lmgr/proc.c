@@ -476,6 +476,7 @@ InitProcess(void)
 	MyProc->fpLocalTransactionId = InvalidLocalTransactionId;
 	MyProc->xid = InvalidTransactionId;
 	MyProc->xmin = InvalidTransactionId;
+	MyProc->commitCSN = 0;
 	MyProc->pid = MyProcPid;
 	MyProc->vxid.procNumber = MyProcNumber;
 	MyProc->vxid.lxid = InvalidLocalTransactionId;
@@ -678,6 +679,7 @@ InitAuxiliaryProcess(void)
 	MyProc->fpLocalTransactionId = InvalidLocalTransactionId;
 	MyProc->xid = InvalidTransactionId;
 	MyProc->xmin = InvalidTransactionId;
+	MyProc->commitCSN = 0;
 	MyProc->vxid.procNumber = INVALID_PROC_NUMBER;
 	MyProc->vxid.lxid = InvalidLocalTransactionId;
 	MyProc->databaseId = InvalidOid;
@@ -913,7 +915,7 @@ static void
 RemoveProcFromArray(int code, Datum arg)
 {
 	Assert(MyProc != NULL);
-	ProcArrayRemove(MyProc, InvalidTransactionId);
+	ProcArrayRemove(MyProc, InvalidTransactionId, NULL);
 }
 
 /*

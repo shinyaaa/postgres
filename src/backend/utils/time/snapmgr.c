@@ -107,6 +107,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "access/csnlog.h"
 #include "access/subtrans.h"
 #include "access/transam.h"
 #include "access/xact.h"
@@ -545,6 +546,7 @@ SetTransactionSnapshot(Snapshot sourcesnap, VirtualTransactionId *sourcevxid,
 		memcpy(CurrentSnapshot->subxip, sourcesnap->subxip,
 			   sourcesnap->subxcnt * sizeof(TransactionId));
 	CurrentSnapshot->suboverflowed = sourcesnap->suboverflowed;
+	CurrentSnapshot->snapshotCsn = sourcesnap->snapshotCsn;
 	CurrentSnapshot->takenDuringRecovery = sourcesnap->takenDuringRecovery;
 	/* NB: curcid should NOT be copied, it's a local matter */
 
@@ -1856,6 +1858,10 @@ RestoreTransactionSnapshot(Snapshot snapshot, PGPROC *source_pgproc)
 }
 
 static bool XidInMVCCSnapshotXip(TransactionId xid, Snapshot snapshot);
+#ifdef USE_ASSERT_CHECKING
+static void AssertCsnVisibilityConsistency(TransactionId xid, Snapshot snapshot,
+										   bool in_snapshot);
+#endif
 
 /*
  * XidInMVCCSnapshot
@@ -1890,8 +1896,62 @@ XidInMVCCSnapshot(TransactionId xid, Snapshot snapshot)
 	if (TransactionIdFollowsOrEquals(xid, snapshot->xmax))
 		return true;
 
-	return XidInMVCCSnapshotXip(xid, snapshot);
+	{
+		bool		in_snapshot = XidInMVCCSnapshotXip(xid, snapshot);
+
+#ifdef USE_ASSERT_CHECKING
+		AssertCsnVisibilityConsistency(xid, snapshot, in_snapshot);
+#endif
+
+		return in_snapshot;
+	}
 }
+
+#ifdef USE_ASSERT_CHECKING
+/*
+ * Cross-check the xip-based snapshot answer against pg_csnlog.
+ *
+ * The CSN representation and the xip representation of the same snapshot
+ * must always agree.  For a committed XID that means: it is "still running"
+ * according to the snapshot exactly when its CSN is greater than the
+ * snapshot's CSN.  For an XID whose pg_csnlog entry is still
+ * InvalidCommitSeqNo (not committed to this day), the snapshot must have
+ * seen it as running.  CSN_COMMITTING and CSN_ABORTED entries are
+ * indeterminate here: whether such a transaction was in the snapshot
+ * legitimately depends on timing that the marker doesn't reveal (either
+ * way the tuple ends up invisible, via the snapshot or via pg_xact).
+ */
+static void
+AssertCsnVisibilityConsistency(TransactionId xid, Snapshot snapshot,
+							   bool in_snapshot)
+{
+	CommitSeqNo csn;
+
+	/*
+	 * Only snapshots built by GetSnapshotData() outside recovery carry a
+	 * CSN that is consistent with their xip arrays.  (Recovery snapshots
+	 * gain a meaningful CSN in a later phase.)
+	 */
+	if (snapshot->snapshotCsn == InvalidCommitSeqNo ||
+		snapshot->takenDuringRecovery)
+		return;
+
+	/*
+	 * Our own XIDs are never listed in our snapshots but are "in progress"
+	 * according to pg_csnlog; XidInMVCCSnapshot's contract makes callers
+	 * exclude them, so just skip them here.
+	 */
+	if (TransactionIdIsCurrentTransactionId(xid))
+		return;
+
+	csn = CSNLogGetCommitSeqNo(xid);
+
+	if (csn == InvalidCommitSeqNo)
+		Assert(in_snapshot);
+	else if (csn >= FirstNormalCommitSeqNo)
+		Assert(in_snapshot == (csn > snapshot->snapshotCsn));
+}
+#endif							/* USE_ASSERT_CHECKING */
 
 /*
  * XidInMVCCSnapshotXip
