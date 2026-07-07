@@ -319,7 +319,15 @@ CSNLogGetCommitSeqNo(TransactionId xid)
 	if (!TransactionIdIsNormal(xid))
 		return CSN_FROZEN;
 
-	/* lock is acquired by SimpleLruReadPage_ReadOnly */
+	/*
+	 * Fast path: a lock-free read.  This is the common case - the pages
+	 * consulted by visibility checks are recent and hot - and it means the
+	 * visibility path normally takes no SLRU lock at all.
+	 */
+	if (SimpleLruTryReadUInt64(CSNLogCtl, pageno, entryno, &csn))
+		return csn;
+
+	/* Slow path: lock is acquired by SimpleLruReadPage_ReadOnly */
 
 	slotno = SimpleLruReadPage_ReadOnly(CSNLogCtl, pageno, &xid);
 	csn = ((CommitSeqNo *) CSNLogCtl->shared->page_buffer[slotno])[entryno];

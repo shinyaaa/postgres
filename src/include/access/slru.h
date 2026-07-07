@@ -60,6 +60,17 @@ typedef struct SlruSharedData
 	int64	   *page_number;
 	int		   *page_lru_count;
 
+	/*
+	 * Per-slot change counter, incremented (under the bank lock) whenever a
+	 * slot is claimed for a different page, zeroed, or invalidated - i.e.
+	 * whenever its buffer contents stop corresponding to the page it
+	 * previously held.  Together with page_number/page_status validation
+	 * this allows seqlock-style lock-free reads of individual entries; see
+	 * SimpleLruTryReadUInt64().  Transitions that do not modify the buffer
+	 * contents (write-out begin/end) do not bump the counter.
+	 */
+	pg_atomic_uint32 *page_change_count;
+
 	/* The buffer_locks protects the I/O on each buffer slots */
 	LWLockPadded *buffer_locks;
 
@@ -225,6 +236,8 @@ extern int	SimpleLruReadPage(SlruDesc *ctl, int64 pageno, bool write_ok,
 							  const void *opaque_data);
 extern int	SimpleLruReadPage_ReadOnly(SlruDesc *ctl, int64 pageno,
 									   const void *opaque_data);
+extern bool SimpleLruTryReadUInt64(SlruDesc *ctl, int64 pageno, int entryno,
+								   uint64 *value);
 extern void SimpleLruWritePage(SlruDesc *ctl, int slotno);
 extern void SimpleLruWriteAll(SlruDesc *ctl, bool allow_redirtied);
 #ifdef USE_ASSERT_CHECKING

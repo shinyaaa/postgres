@@ -214,6 +214,7 @@ SimpleLruShmemSize(int nslots, int nlsns)
 	sz += MAXALIGN(nslots * sizeof(bool));	/* page_dirty[] */
 	sz += MAXALIGN(nslots * sizeof(int64)); /* page_number[] */
 	sz += MAXALIGN(nslots * sizeof(int));	/* page_lru_count[] */
+	sz += MAXALIGN(nslots * sizeof(pg_atomic_uint32));	/* page_change_count[] */
 	sz += MAXALIGN(nslots * sizeof(LWLockPadded));	/* buffer_locks[] */
 	sz += MAXALIGN(nbanks * sizeof(LWLockPadded));	/* bank_locks[] */
 	sz += MAXALIGN(nbanks * sizeof(int));	/* bank_cur_lru_count[] */
@@ -316,6 +317,8 @@ shmem_slru_init(void *location, ShmemStructOpts *base_options)
 	offset += MAXALIGN(nslots * sizeof(int64));
 	shared->page_lru_count = (int *) (ptr + offset);
 	offset += MAXALIGN(nslots * sizeof(int));
+	shared->page_change_count = (pg_atomic_uint32 *) (ptr + offset);
+	offset += MAXALIGN(nslots * sizeof(pg_atomic_uint32));
 
 	/* Initialize LWLocks */
 	shared->buffer_locks = (LWLockPadded *) (ptr + offset);
@@ -341,6 +344,7 @@ shmem_slru_init(void *location, ShmemStructOpts *base_options)
 		shared->page_status[slotno] = SLRU_PAGE_EMPTY;
 		shared->page_dirty[slotno] = false;
 		shared->page_lru_count[slotno] = 0;
+		pg_atomic_init_u32(&shared->page_change_count[slotno], 0);
 		ptr += BLCKSZ;
 	}
 
@@ -386,6 +390,23 @@ check_slru_buffers(const char *name, int *newval)
 }
 
 /*
+ * Note that a slot's buffer contents are about to stop corresponding to the
+ * page it previously held (it is being claimed for another page, zeroed, or
+ * invalidated).  Lock-free readers (SimpleLruTryReadUInt64) revalidate this
+ * counter after reading; the write barrier orders the bump before the
+ * subsequent slot-state and content updates.
+ *
+ * Must be called with the slot's bank lock held exclusively.
+ */
+static inline void
+SlruBumpChangeCount(SlruShared shared, int slotno)
+{
+	pg_atomic_write_u32(&shared->page_change_count[slotno],
+						pg_atomic_read_u32(&shared->page_change_count[slotno]) + 1);
+	pg_write_barrier();
+}
+
+/*
  * Initialize (or reinitialize) a page to zeroes.
  *
  * The page is not actually written, just set up in shared memory.
@@ -408,7 +429,14 @@ SimpleLruZeroPage(SlruDesc *ctl, int64 pageno)
 			!shared->page_dirty[slotno]) ||
 		   shared->page_number[slotno] == pageno);
 
-	/* Mark the slot as containing this page */
+	/*
+	 * Mark the slot as containing this page.  Note that the slot is marked
+	 * valid before its contents are zeroed; lock-free readers are not
+	 * confused by this because a just-zeroed page can only cover XIDs that
+	 * no snapshot's [xmin, xmax) window can contain yet (the page is zeroed
+	 * while the XIDs on it are still unassigned/unobserved).
+	 */
+	SlruBumpChangeCount(shared, slotno);
 	shared->page_number[slotno] = pageno;
 	shared->page_status[slotno] = SLRU_PAGE_VALID;
 	shared->page_dirty[slotno] = true;
@@ -517,7 +545,10 @@ SimpleLruWaitIO(SlruDesc *ctl, int slotno)
 		{
 			/* indeed, the I/O must have failed */
 			if (shared->page_status[slotno] == SLRU_PAGE_READ_IN_PROGRESS)
+			{
+				SlruBumpChangeCount(shared, slotno);
 				shared->page_status[slotno] = SLRU_PAGE_EMPTY;
+			}
 			else				/* write_in_progress */
 			{
 				shared->page_status[slotno] = SLRU_PAGE_VALID;
@@ -595,6 +626,7 @@ SimpleLruReadPage(SlruDesc *ctl, int64 pageno, bool write_ok,
 				!shared->page_dirty[slotno]));
 
 		/* Mark the slot read-busy */
+		SlruBumpChangeCount(shared, slotno);
 		shared->page_number[slotno] = pageno;
 		shared->page_status[slotno] = SLRU_PAGE_READ_IN_PROGRESS;
 		shared->page_dirty[slotno] = false;
@@ -618,6 +650,8 @@ SimpleLruReadPage(SlruDesc *ctl, int64 pageno, bool write_ok,
 			   shared->page_status[slotno] == SLRU_PAGE_READ_IN_PROGRESS &&
 			   !shared->page_dirty[slotno]);
 
+		if (!ok)
+			SlruBumpChangeCount(shared, slotno);
 		shared->page_status[slotno] = ok ? SLRU_PAGE_VALID : SLRU_PAGE_EMPTY;
 
 		LWLockRelease(&shared->buffer_locks[slotno].lock);
@@ -684,6 +718,83 @@ SimpleLruReadPage_ReadOnly(SlruDesc *ctl, int64 pageno, const void *opaque_data)
 	LWLockAcquire(banklock, LW_EXCLUSIVE);
 
 	return SimpleLruReadPage(ctl, pageno, true, opaque_data);
+}
+
+/*
+ * SimpleLruTryReadUInt64 --- attempt a lock-free read of one 8-byte entry.
+ *
+ * Returns true and stores the entry's value into *value if the page was
+ * resident and demonstrably stable across the read; returns false if the
+ * caller must fall back to a locked read (SimpleLruReadPage_ReadOnly).
+ * The entry must be an aligned uint64 at index entryno within the page.
+ *
+ * This is a seqlock-style protocol.  The per-slot change counter is bumped
+ * (under the bank lock) before a slot's contents stop corresponding to the
+ * page it held - when the slot is claimed for another page, zeroed, or
+ * invalidated - so if the counter is unchanged across our read and the slot
+ * shows the expected page in a content-stable state at both ends, the value
+ * we read belongs to that page.  A write-out (SLRU_PAGE_WRITE_IN_PROGRESS)
+ * does not modify the buffer, so it is acceptable.  A concurrent in-place
+ * update of the entry itself is fine: 8-byte aligned loads are single-copy
+ * atomic here, so we see either the old or the new value, both of which the
+ * caller must be prepared for anyway (the same is true for a locked read).
+ *
+ * Note the one exception documented at SimpleLruZeroPage(): a slot can be
+ * valid-but-not-yet-zeroed for a brief moment.  Callers' access patterns
+ * must guarantee that entries on a page being zeroed are not yet queried;
+ * all transaction-id-indexed SLRUs satisfy this because pages are zeroed
+ * before the XIDs covering them can appear in anyone's lookup window.
+ */
+bool
+SimpleLruTryReadUInt64(SlruDesc *ctl, int64 pageno, int entryno, uint64 *value)
+{
+#ifdef PG_HAVE_8BYTE_SINGLE_COPY_ATOMICITY
+	SlruShared	shared = ctl->shared;
+	int			bankno = pageno % ctl->nbanks;
+	int			bankstart = bankno * SLRU_BANK_SIZE;
+	int			bankend = bankstart + SLRU_BANK_SIZE;
+
+	Assert(entryno >= 0 && entryno < (int) (BLCKSZ / sizeof(uint64)));
+
+	for (int slotno = bankstart; slotno < bankend; slotno++)
+	{
+		uint32		count_before;
+		uint32		count_after;
+		SlruPageStatus status;
+		uint64		v;
+
+		/* Cheap unlocked scan for the page within its bank. */
+		if (((volatile int64 *) shared->page_number)[slotno] != pageno)
+			continue;
+
+		count_before = pg_atomic_read_u32(&shared->page_change_count[slotno]);
+		pg_read_barrier();
+
+		/* Re-check the slot state under the counter we just sampled. */
+		if (((volatile int64 *) shared->page_number)[slotno] != pageno)
+			return false;
+		status = ((volatile SlruPageStatus *) shared->page_status)[slotno];
+		if (status != SLRU_PAGE_VALID && status != SLRU_PAGE_WRITE_IN_PROGRESS)
+			return false;
+
+		pg_read_barrier();
+
+		v = ((volatile uint64 *) shared->page_buffer[slotno])[entryno];
+
+		pg_read_barrier();
+
+		count_after = pg_atomic_read_u32(&shared->page_change_count[slotno]);
+		if (count_after != count_before)
+			return false;
+
+		pgstat_count_slru_blocks_hit(shared->slru_stats_idx);
+
+		*value = v;
+		return true;
+	}
+#endif							/* PG_HAVE_8BYTE_SINGLE_COPY_ATOMICITY */
+
+	return false;
 }
 
 /*
@@ -1514,6 +1625,7 @@ restart:
 		if (shared->page_status[slotno] == SLRU_PAGE_VALID &&
 			!shared->page_dirty[slotno])
 		{
+			SlruBumpChangeCount(shared, slotno);
 			shared->page_status[slotno] = SLRU_PAGE_EMPTY;
 			continue;
 		}
@@ -1611,6 +1723,7 @@ restart:
 		if (shared->page_status[slotno] == SLRU_PAGE_VALID &&
 			!shared->page_dirty[slotno])
 		{
+			SlruBumpChangeCount(shared, slotno);
 			shared->page_status[slotno] = SLRU_PAGE_EMPTY;
 			continue;
 		}
