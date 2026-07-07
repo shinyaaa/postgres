@@ -1,0 +1,5 @@
+# pg_undo extension
+comment = 'undo accidental DML: history capture via logical decoding with preview/apply of inverse operations'
+default_version = '0.1'
+module_pathname = '$libdir/pg_undo'
+relocatable = false

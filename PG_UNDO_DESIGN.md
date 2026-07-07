@@ -1,5 +1,9 @@
 # pg_undo — Ctrl+Z for PostgreSQL 設計書
 
+> **実装状況**: v0.1 MVP を C 言語で実装済み(本リポジトリ `pg_undo/` ディレクトリ)。
+> **対象バージョンは PostgreSQL 19(19devel/19beta1)に限定**(`pg_undo.h` でコンパイル時に強制)。
+> 実装で判明した設計からの変更点: §3.2 の `changed_by` は WAL にロール情報が載らないため v0.1 では NULL。
+
 **「間違えて DELETE / UPDATE / DROP してしまった」を、SQL 一発で元に戻せる PostgreSQL 拡張**
 
 - ステータス: 設計ドラフト v0.1(2026-07-07)
@@ -145,7 +149,7 @@ CREATE TABLE undo.history (
     change_lsn  pg_lsn       NOT NULL,
     xid         xid8         NOT NULL,
     changed_at  timestamptz  NOT NULL,
-    changed_by  name         NOT NULL,   -- session_authorization
+    changed_by  name,                    -- v0.1ではNULL: WALにロール情報が載らない
     op          "char"       NOT NULL,   -- I / U / D / T(truncate)
     old_row     jsonb,                   -- U, D で使用
     new_row     jsonb                    -- I, U で使用

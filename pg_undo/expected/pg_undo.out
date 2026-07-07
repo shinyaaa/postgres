@@ -1,0 +1,289 @@
+CREATE EXTENSION pg_undo;
+-- capture is asynchronous (bounded by pg_undo.naptime); poll instead of
+-- asserting right after DML
+CREATE FUNCTION wait_for_history(rel regclass, n bigint) RETURNS boolean AS $$
+BEGIN
+	FOR i IN 1..300 LOOP
+		IF (SELECT count(*) FROM undo.history WHERE relid = rel::oid) >= n THEN
+			RETURN true;
+		END IF;
+		PERFORM pg_sleep(0.1);
+	END LOOP;
+	RETURN false;
+END $$ LANGUAGE plpgsql;
+-- capture only covers changes made after the worker created its slot
+CREATE FUNCTION wait_ready() RETURNS boolean AS $$
+BEGIN
+	FOR i IN 1..300 LOOP
+		IF undo.ready() THEN
+			RETURN true;
+		END IF;
+		PERFORM pg_sleep(0.1);
+	END LOOP;
+	RETURN false;
+END $$ LANGUAGE plpgsql;
+SELECT wait_ready();
+ wait_ready 
+------------
+ t
+(1 row)
+
+--
+-- track() validation
+--
+CREATE TABLE t1 (id int PRIMARY KEY, v text, big text);
+SELECT undo.track('t1');
+NOTICE:  pg_undo: tracking t1; history capture begins within pg_undo.naptime
+ track 
+-------
+ 
+(1 row)
+
+SELECT relreplident FROM pg_class WHERE oid = 't1'::regclass;
+ relreplident 
+--------------
+ f
+(1 row)
+
+SELECT undo.track('t1');	-- idempotent
+NOTICE:  pg_undo: tracking t1; history capture begins within pg_undo.naptime
+ track 
+-------
+ 
+(1 row)
+
+CREATE VIEW v1 AS SELECT 1 AS x;
+SELECT undo.track('v1');	-- error: not a table
+ERROR:  pg_undo: v1 is not a regular table
+CONTEXT:  PL/pgSQL function undo.track(regclass) line 15 at RAISE
+CREATE TABLE nopk (a int, b text);
+SELECT undo.track('nopk');	-- warning: no primary key
+WARNING:  pg_undo: nopk has no primary key; undo will match rows on the full row image
+NOTICE:  pg_undo: tracking nopk; history capture begins within pg_undo.naptime
+ track 
+-------
+ 
+(1 row)
+
+--
+-- DML capture, including TOAST handling
+--
+INSERT INTO t1 VALUES (1, 'one', repeat('x', 50000));
+INSERT INTO t1 VALUES (2, 'two', 'small');
+UPDATE t1 SET v = 'TWO' WHERE id = 2;
+DELETE FROM t1 WHERE id = 1;
+SELECT wait_for_history('t1', 4);
+ wait_for_history 
+------------------
+ t
+(1 row)
+
+SELECT op, old_row ->> 'id' AS old_id, old_row ->> 'v' AS old_v,
+	   new_row ->> 'id' AS new_id, new_row ->> 'v' AS new_v
+  FROM undo.history
+ WHERE relid = 't1'::regclass::oid
+ ORDER BY change_lsn;
+ op | old_id | old_v | new_id | new_v 
+----+--------+-------+--------+-------
+ I  |        |       | 1      | one
+ I  |        |       | 2      | two
+ U  | 2      | two   | 2      | TWO
+ D  | 1      | one   |        | 
+(4 rows)
+
+-- the unchanged 50kB TOAST value must be complete in both images
+SELECT length(old_row ->> 'big') AS del_old_big
+  FROM undo.history
+ WHERE relid = 't1'::regclass::oid AND op = 'D';
+ del_old_big 
+-------------
+       50000
+(1 row)
+
+SELECT length(new_row ->> 'big') AS ins_new_big
+  FROM undo.history
+ WHERE relid = 't1'::regclass::oid AND op = 'I' AND new_row ->> 'id' = '1';
+ ins_new_big 
+-------------
+       50000
+(1 row)
+
+--
+-- recent_changes
+--
+SELECT op, old_row IS NOT NULL AS has_old, new_row IS NOT NULL AS has_new
+  FROM undo.recent_changes('t1')
+ ORDER BY change_lsn;
+ op | has_old | has_new 
+----+---------+---------
+ I  | f       | t
+ I  | f       | t
+ U  | t       | t
+ D  | t       | f
+(4 rows)
+
+--
+-- preview is non-mutating
+--
+SELECT count(*) FROM undo.preview(last => '10 minutes', "table" => 't1');
+ count 
+-------
+     4
+(1 row)
+
+SELECT count(*) FROM t1;
+ count 
+-------
+     1
+(1 row)
+
+--
+-- apply, xid-scoped: bring back the deleted row
+--
+SELECT xid AS del_xid
+  FROM undo.history
+ WHERE relid = 't1'::regclass::oid AND op = 'D' \gset
+SELECT * FROM undo.apply(xid => :del_xid);
+ applied | skipped | conflicts 
+---------+---------+-----------
+       1 |       0 |         0
+(1 row)
+
+SELECT id, v, length(big) FROM t1 ORDER BY id;
+ id |  v  | length 
+----+-----+--------
+  1 | one |  50000
+  2 | TWO |      5
+(2 rows)
+
+--
+-- conflict handling: modify a row after the change being undone
+--
+SELECT xid AS upd_xid
+  FROM undo.history
+ WHERE relid = 't1'::regclass::oid AND op = 'U' \gset
+UPDATE t1 SET v = 'TWO-again' WHERE id = 2;
+SELECT wait_for_history('t1', 6);
+ wait_for_history 
+------------------
+ t
+(1 row)
+
+SELECT * FROM undo.apply(xid => :upd_xid);						-- abort
+ERROR:  pg_undo: conflict while undoing U on t1: the row was modified afterwards
+HINT:  Use on_conflict => 'skip' or 'force'.
+CONTEXT:  PL/pgSQL function undo.apply(bigint,interval,timestamp with time zone,timestamp with time zone,regclass,text) line 42 at RAISE
+SELECT * FROM undo.apply(xid => :upd_xid, on_conflict => 'skip');
+ applied | skipped | conflicts 
+---------+---------+-----------
+       0 |       1 |         1
+(1 row)
+
+SELECT v FROM t1 WHERE id = 2;
+     v     
+-----------
+ TWO-again
+(1 row)
+
+SELECT * FROM undo.apply(xid => :upd_xid, on_conflict => 'force');
+ applied | skipped | conflicts 
+---------+---------+-----------
+       1 |       0 |         1
+(1 row)
+
+SELECT v FROM t1 WHERE id = 2;
+  v  
+-----
+ two
+(1 row)
+
+SELECT * FROM undo.apply(xid => :upd_xid, on_conflict => 'nonsense');	-- error
+ERROR:  pg_undo: on_conflict must be 'abort', 'skip' or 'force'
+CONTEXT:  PL/pgSQL function undo.apply(bigint,interval,timestamp with time zone,timestamp with time zone,regclass,text) line 17 at RAISE
+--
+-- selector validation
+--
+SELECT * FROM undo.apply();										-- error
+ERROR:  pg_undo: specify xid, last, or since/until
+CONTEXT:  PL/pgSQL function undo._changes(bigint,interval,timestamp with time zone,timestamp with time zone,regclass) line 7 at RAISE
+PL/pgSQL function undo.apply(bigint,interval,timestamp with time zone,timestamp with time zone,regclass,text) line 20 at FOR over SELECT rows
+SELECT count(*) FROM undo.preview(xid => 1, last => '1 minute');	-- error
+ERROR:  pg_undo: xid and a time range are mutually exclusive
+CONTEXT:  PL/pgSQL function undo._changes(bigint,interval,timestamp with time zone,timestamp with time zone,regclass) line 11 at RAISE
+PL/pgSQL function undo.preview(bigint,interval,timestamp with time zone,timestamp with time zone,regclass) line 11 at FOR over SELECT rows
+--
+-- TRUNCATE is captured but not invertible
+--
+INSERT INTO nopk VALUES (1, 'x');
+SELECT wait_for_history('nopk', 1);
+ wait_for_history 
+------------------
+ t
+(1 row)
+
+TRUNCATE nopk;
+SELECT wait_for_history('nopk', 2);
+ wait_for_history 
+------------------
+ t
+(1 row)
+
+SELECT op FROM undo.history WHERE relid = 'nopk'::regclass::oid ORDER BY change_lsn;
+ op 
+----
+ I
+ T
+(2 rows)
+
+SELECT * FROM undo.apply(last => '10 minutes', "table" => 'nopk');	-- abort on 'T'
+ERROR:  pg_undo: a TRUNCATE of nopk cannot be undone
+HINT:  Re-run with on_conflict => 'skip' to undo the remaining changes.
+CONTEXT:  PL/pgSQL function undo.apply(bigint,interval,timestamp with time zone,timestamp with time zone,regclass,text) line 24 at RAISE
+SELECT applied, skipped >= 1 AS skipped_some, conflicts
+  FROM undo.apply(last => '10 minutes', "table" => 'nopk', on_conflict => 'skip');
+ applied | skipped_some | conflicts 
+---------+--------------+-----------
+       0 | t            |         1
+(1 row)
+
+--
+-- untrack restores the previous replica identity and stops capture
+--
+SELECT undo.untrack('t1');
+ untrack 
+---------
+ 
+(1 row)
+
+SELECT relreplident FROM pg_class WHERE oid = 't1'::regclass;
+ relreplident 
+--------------
+ d
+(1 row)
+
+SELECT undo.untrack('t1');	-- no longer tracked
+NOTICE:  pg_undo: t1 was not tracked
+ untrack 
+---------
+ 
+(1 row)
+
+SELECT pg_sleep(2);			-- let the worker drop t1 from its tracked set
+ pg_sleep 
+----------
+ 
+(1 row)
+
+INSERT INTO t1 VALUES (99, 'not captured', '');
+SELECT pg_sleep(2);
+ pg_sleep 
+----------
+ 
+(1 row)
+
+SELECT count(*) FROM undo.history WHERE new_row ->> 'id' = '99';
+ count 
+-------
+     0
+(1 row)
+
