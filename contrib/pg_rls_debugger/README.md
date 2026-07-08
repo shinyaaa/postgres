@@ -9,6 +9,8 @@ role list? A restrictive policy? Is RLS even being applied to that role, or is
 it being bypassed because they own the table? You end up bisecting policies by
 hand with `SET ROLE` and a scratch session.
 
+![pg_rls_debugger demo](img/demo.gif)
+
 `pg_rls_debugger` answers the question directly:
 
 ```sql
