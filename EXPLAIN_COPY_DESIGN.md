@@ -1,62 +1,49 @@
-# EXPLAIN COPY 詳細設計(パッチ 0001〜0003)
+# EXPLAIN COPY 詳細設計(パッチ 0001〜0004)
 
 対象: PostgreSQL 20devel (master)
 目的: EXPLAIN の対象コマンドに COPY を追加し、COPY FROM の時間内訳を表示する。
 
-パッチシリーズの意味論(最初に固定し、以後変更しない):
+## パッチ構成
 
-| パッチ | できるようになること | 実行の有無 |
+リファクタリング(挙動変更なし)と機能追加を分離した 4 パッチ構成とする。
+
+| パッチ | 内容 | 挙動変更 |
 |---|---|---|
-| 0001 | `EXPLAIN COPY ...`(全バリアント、ANALYZE なし) | 一切実行しない |
-| 0002 | `EXPLAIN ANALYZE COPY (query) TO ...` | クエリを実行、COPY 出力(ファイル/STDOUT)は生成しない |
-| 0003 | `EXPLAIN ANALYZE COPY ... FROM ...` + 時間内訳 | 実際にデータをロードする |
+| 0001 | copy.c / copyto.c のリファクタリング(共通関数の抽出) | なし |
+| 0002 | `EXPLAIN COPY ...`(全バリアント、ANALYZE なし) | 新機能 |
+| 0003 | `EXPLAIN ANALYZE COPY (query) TO ...` | 新機能 |
+| 0004 | `EXPLAIN ANALYZE COPY ... FROM ...` + 時間内訳 | 新機能 |
+
+分割の方針:
+- **純粋なコード移動は独立パッチにする**(0001)。レビュアーが
+  「挙動変更なし」を diff だけで確認でき、機能部分の議論と切り離して
+  先行コミットできる。
+- **利用者のいない API 変更は機能パッチ側に残す**。ExplainOnePlan の
+  パラメータ追加(0002)や CopyFromInstrumentation のセッター(0004)を
+  先行パッチに切り出すと、in-tree の呼び出し元が存在しない dead code に
+  なるため、それを使う機能と同じパッチに含める。
+
+実行意味論(シリーズとして最初に固定し、以後変更しない):
+
+| コマンド | ANALYZE なし | ANALYZE あり |
+|---|---|---|
+| COPY ... FROM | 実行しない | 実際にロードする(0004) |
+| COPY (query) TO | 実行しない(プランのみ表示) | クエリを実行、COPY 出力は生成しない(0003) |
+| COPY relation TO | 実行しない | ERROR(将来課題) |
 
 ---
 
-## 0001: 文法・ディスパッチ・非 ANALYZE の EXPLAIN
+## 0001: copy.c / copyto.c のリファクタリング
 
-### 0001-1. 文法 (src/backend/parser/gram.y)
+挙動変更を一切含まない、共通関数の抽出のみのパッチ。コミットメッセージに
+"No functional changes." と、0002 以降で EXPLAIN から再利用する予定である
+ことを明記する。新規テストは追加しない(既存リグレッションテストが
+そのまま通ることが検証条件)。
 
-`ExplainableStmt`(gram.y:12846)に `| CopyStmt` を追加する。
-
-```
-ExplainableStmt:
-            SelectStmt
-            | ...
-            | ExecuteStmt
-            | CopyStmt                  /* by default all are $$=$1 */
-```
-
-bison 3.8.2 で shift/reduce 競合が発生しないことは検証済み(gram.y は
-`%expect 0` のため、競合があればビルドが失敗する)。
-
-`PreparableStmt` には追加しない(PREPARE 対象外のため EXPLAIN EXECUTE 経由で
-CopyStmt が来ることはない)。
-
-### 0001-2. パース解析
-
-変更不要。`transformExplainStmt`(analyze.c:3461)は内包文を
-`transformOptionalSelectInto` → `transformStmt` に渡し、CopyStmt は
-transformStmt の default 分岐(analyze.c:435-444)で CMD_UTILITY の Query に
-包まれる。実行時は ExplainQuery → ExplainOneQuery → ExplainOneUtility に
-到達する(NotifyStmt と同じ経路)。
-
-### 0001-3. ディスパッチ (src/backend/commands/explain.c)
-
-`ExplainOneUtility()`(explain.c:396)の NotifyStmt 分岐の前に追加:
-
-```c
-else if (IsA(utilityStmt, CopyStmt))
-    ExplainCopyStmt(castNode(CopyStmt, utilityStmt), es, pstate, params);
-```
-
-CopyStmt は変更しない(const 扱い)ため、EXPLAIN EXECUTE 経路のような
-copyObject は不要。
-
-### 0001-4. copy.c のリファクタリング
+### 0001-1. copy.c: ProcessCopyTarget の抽出
 
 DoCopy(copy.c:63-386)の前半(74〜355 行: 権限チェック〜RLS 変換)を
-共通関数に抽出する。**挙動変更なし**。
+共通関数に抽出する。
 
 ```c
 /* copy.c / copy.h */
@@ -77,15 +64,9 @@ void ProcessCopyTarget(ParseState *pstate, const CopyStmt *stmt,
 
 DoCopy は `ProcessCopyTarget` + 実行部(357-382 行)+ table_close となる。
 
-EXPLAIN(非 ANALYZE)でもこの関数を通すことで、存在しないテーブル・権限
-不足は通常の COPY と同様に検出される(EXPLAIN INSERT が ExecutorStart で
-ACL チェックされるのと整合)。ファイルは open しないため、ファイル不存在は
-検出されない(EXPLAIN の一般的な性質として許容し、ドキュメントに記載)。
-
-### 0001-5. copyto.c のリファクタリング
+### 0001-2. copyto.c: CopyToTransformQuery の抽出
 
 BeginCopyTo のクエリ解析・検証部(copyto.c:909-986)を抽出する。
-**挙動変更なし**。
 
 ```c
 /* copyto.c / copy.h */
@@ -94,9 +75,64 @@ Query *CopyToTransformQuery(ParseState *pstate, RawStmt *raw_query);
 
 内容: pg_analyze_and_rewrite_fixedparams、DO INSTEAD ルール拒否、
 SELECT INTO 拒否、ユーティリティ文拒否、RETURNING 必須チェック。
-プランニングと relationOids 再確認(copyto.c:989-1015)は呼び出し元に残す。
+プランニングと relationOids 再確認(copyto.c:989-1015)は BeginCopyTo に
+残す(0003 の EXPLAIN 経路は自前でプランニングするため)。
 
-### 0001-6. explain_copy.c(新規ファイル)
+### 0001-3. 変更ファイル一覧
+
+```
+src/backend/commands/copy.c                | ProcessCopyTarget 抽出
+src/backend/commands/copyto.c              | CopyToTransformQuery 抽出
+src/include/commands/copy.h                | 両関数の宣言
+```
+
+備考: 2 関数を 1 パッチにまとめるのは、いずれも「COPY 文のセットアップを
+EXPLAIN から再利用可能にする」という同一目的の抽出であるため。レビューで
+分割を求められた場合はファイル単位(copy.c / copyto.c)で容易に分割できる。
+
+---
+
+## 0002: 文法・ディスパッチ・非 ANALYZE の EXPLAIN
+
+### 0002-1. 文法 (src/backend/parser/gram.y)
+
+`ExplainableStmt`(gram.y:12846)に `| CopyStmt` を追加する。
+
+```
+ExplainableStmt:
+            SelectStmt
+            | ...
+            | ExecuteStmt
+            | CopyStmt                  /* by default all are $$=$1 */
+```
+
+bison 3.8.2 で shift/reduce 競合が発生しないことは検証済み(gram.y は
+`%expect 0` のため、競合があればビルドが失敗する)。
+
+`PreparableStmt` には追加しない(PREPARE 対象外のため EXPLAIN EXECUTE 経由で
+CopyStmt が来ることはない)。
+
+### 0002-2. パース解析
+
+変更不要。`transformExplainStmt`(analyze.c:3461)は内包文を
+`transformOptionalSelectInto` → `transformStmt` に渡し、CopyStmt は
+transformStmt の default 分岐(analyze.c:435-444)で CMD_UTILITY の Query に
+包まれる。実行時は ExplainQuery → ExplainOneQuery → ExplainOneUtility に
+到達する(NotifyStmt と同じ経路)。
+
+### 0002-3. ディスパッチ (src/backend/commands/explain.c)
+
+`ExplainOneUtility()`(explain.c:396)の NotifyStmt 分岐の前に追加:
+
+```c
+else if (IsA(utilityStmt, CopyStmt))
+    ExplainCopyStmt(castNode(CopyStmt, utilityStmt), es, pstate, params);
+```
+
+CopyStmt は変更しない(const 扱い)ため、EXPLAIN EXECUTE 経路のような
+copyObject は不要。
+
+### 0002-4. explain_copy.c(新規ファイル)
 
 explain.c は近年 explain_dr.c / explain_format.c / explain_state.c に分割
 されており、この流れに沿って `src/backend/commands/explain_copy.c` を新設。
@@ -107,7 +143,7 @@ void ExplainCopyStmt(CopyStmt *stmt, ExplainState *es,
                      ParseState *pstate, ParamListInfo params);
 ```
 
-0001 時点の処理フロー:
+0002 時点の処理フロー:
 
 ```
 ProcessCopyTarget(pstate, stmt, ..., &rel, &relid, &query, &whereClause);
@@ -116,19 +152,19 @@ if (stmt->is_from)
 {
     if (es->analyze)
         ereport(ERROR, "EXPLAIN ANALYZE is not yet supported for COPY FROM");
-        /* 0003 で解除 */
+        /* 0004 で解除 */
     ExplainCopyFromInfo(stmt, rel, es);      /* 静的情報のみ */
 }
 else if (query != NULL)          /* COPY (query) TO / RLS 変換された relation TO */
 {
     if (es->analyze)
-        ereport(ERROR, "...");   /* 0002 で解除 */
+        ereport(ERROR, "...");   /* 0003 で解除 */
     ExplainCopyToQuery(stmt, query, relid, es, pstate, params);
 }
 else                             /* COPY relation TO */
 {
     if (es->analyze)
-        ereport(ERROR, "...");   /* relation TO の ANALYZE は将来課題(Phase 4) */
+        ereport(ERROR, "...");   /* relation TO の ANALYZE は将来課題 */
     ExplainCopyToInfo(stmt, rel, es);
 }
 
@@ -136,10 +172,16 @@ if (rel)
     table_close(rel, NoLock);
 ```
 
-STDIN/STDOUT は 0001 では**許可**する(実行しないためプロトコル問題は
-発生しない)。ANALYZE 時の制限は 0002/0003 で導入する。
+STDIN/STDOUT は 0002 では**許可**する(実行しないためプロトコル問題は
+発生しない)。ANALYZE 時の制限は 0003/0004 で導入する。
 
-#### ExplainCopyToQuery の実装(0001 の中核)
+非 ANALYZE の EXPLAIN でも ProcessCopyTarget を通すことで、存在しない
+テーブル・権限不足は通常の COPY と同様に検出される(EXPLAIN INSERT が
+ExecutorStart で ACL チェックされるのと整合)。ファイルは open しないため、
+ファイル不存在は検出されない(EXPLAIN の一般的な性質として許容し、
+ドキュメントに記載)。
+
+#### ExplainCopyToQuery の実装(0002 の中核)
 
 standard_ExplainOneQuery(explain.c:324-381)を模倣し、COPY 用の追加情報を
 ExplainOnePlan に渡す:
@@ -195,6 +237,9 @@ COPY の静的情報を「Query」グループの**内側**に出力するため
 前例に従う。ABI 変化はメジャーリリースの通例として許容(planduration /
 bufusage / mem_counters 追加時と同じ)。
 
+このパラメータ追加は 0002 で初めて使うため、0001 には含めず本パッチに
+含める(dead code を作らない)。
+
 ExplainOnePlan 内では ExplainPrintPlan 直後に、copystmt が非 NULL なら
 ExplainPrintCopyInfo(explain_copy.c で定義、後述の共通出力関数)を呼ぶ。
 
@@ -219,7 +264,7 @@ static void ExplainPrintCopyInfo(const CopyStmt *stmt, Relation rel,
 オプションの単純な復唱(DELIMITER 等)は行わない(文面に書いてある情報で
 あり、レビューで削られるのが常のため最小限とする)。
 
-#### TEXT フォーマット出力例(0001)
+#### TEXT フォーマット出力例(0002)
 
 ```
 =# EXPLAIN COPY tab FROM '/tmp/tab.csv' WITH (FORMAT csv);
@@ -255,35 +300,29 @@ ExplainOpenGroup("Copy From", "Copy From", true, es) → プロパティ、の
 入れ子で出力する(TEXT の見出し行 "Copy From on tab" は
 format == EXPLAIN_FORMAT_TEXT のとき手動出力)。
 
-### 0001-7. その他の変更
+### 0002-5. その他の変更
 
 - **psql タブ補完** (src/bin/psql/tab-complete.in.c): EXPLAIN の後続候補に
   COPY を追加。
 - **ドキュメント**: explain.sgml の対象文リスト(SELECT, INSERT, ...)に
-  COPY を追加。「ANALYZE は 0001 時点では COPY に未対応」の footnote は
-  シリーズ全体コミット時には不要になるため、0002/0003 と同時期の
-  コミットを想定して段階ごとに記述を更新。copy.sgml から explain.sgml への
-  相互参照を追加。
+  COPY を追加。copy.sgml から explain.sgml への相互参照を追加。
 - **リグレッションテスト**: 新規 `src/test/regress/sql/explain_copy.sql`
-  (+ expected、parallel_schedule への追加)。0001 分:
+  (+ expected、parallel_schedule への追加)。0002 分:
   - EXPLAIN COPY tbl FROM '/nonexistent'(実行しないため成功する)
   - EXPLAIN COPY tbl TO stdout / FROM stdin
   - EXPLAIN (FORMAT JSON) を explain.sql の explain_filter /
     explain_filter_to_json と同様のフィルタ関数で安定化
   - 権限エラー(非特権ロールで FROM 'file')、存在しないテーブル
-  - EXPLAIN ANALYZE COPY ... が ERROR になること(0002/0003 で期待値更新)
+  - EXPLAIN ANALYZE COPY ... が ERROR になること(0003/0004 で期待値更新)
 
-### 0001-8. 変更ファイル一覧
+### 0002-6. 変更ファイル一覧
 
 ```
 src/backend/parser/gram.y                  | ExplainableStmt に CopyStmt
 src/backend/commands/explain.c             | ディスパッチ + ExplainOnePlan 拡張
 src/backend/commands/explain_copy.c        | 新規
-src/backend/commands/copy.c                | ProcessCopyTarget 抽出
-src/backend/commands/copyto.c              | CopyToTransformQuery 抽出
 src/backend/commands/Makefile, meson.build | explain_copy.o 追加
 src/include/commands/explain.h             | ExplainCopyStmt / ExplainOnePlan
-src/include/commands/copy.h                | ProcessCopyTarget / CopyToTransformQuery
 src/bin/psql/tab-complete.in.c
 doc/src/sgml/ref/explain.sgml, copy.sgml
 src/test/regress/{sql,expected}/explain_copy.*, parallel_schedule
@@ -291,9 +330,9 @@ src/test/regress/{sql,expected}/explain_copy.*, parallel_schedule
 
 ---
 
-## 0002: EXPLAIN ANALYZE COPY (query) TO
+## 0003: EXPLAIN ANALYZE COPY (query) TO
 
-### 0002-1. 意味論(シリーズとして固定)
+### 0003-1. 意味論(シリーズとして固定)
 
 **ANALYZE 時、内包クエリは実行するが、COPY の整形出力は一切生成しない。**
 ファイルは書かれず、STDOUT にもデータは送られない。
@@ -305,12 +344,12 @@ src/test/regress/{sql,expected}/explain_copy.*, parallel_schedule
 
 - `TO STDOUT` でも CopyOutResponse が送られないためプロトコル問題が
   発生せず、**ANALYZE 時も STDIN/STDOUT 制限が不要**(TO 側)。
-- 将来整形時間を計測する場合(Phase 4)も、EXPLAIN (SERIALIZE) と同様に
+- 将来整形時間を計測する場合も、EXPLAIN (SERIALIZE) と同様に
   「整形するが捨てる」DestReceiver を追加するだけで意味論が変わらない。
 
-### 0002-2. 実装
+### 0003-2. 実装
 
-0001 の ExplainCopyToQuery から `if (es->analyze) ereport(ERROR ...)` を
+0002 の ExplainCopyToQuery から `if (es->analyze) ereport(ERROR ...)` を
 削除するだけで、実行は ExplainOnePlan が担う:
 
 - es->analyze 時、ExplainOnePlan は into == NULL かつ SERIALIZE なしなら
@@ -322,13 +361,13 @@ src/test/regress/{sql,expected}/explain_copy.*, parallel_schedule
 UpdateActiveSnapshotCommandId(explain.c:539-540)が BeginCopyTo
 (copyto.c:1021-1022)と同等のため追加対応不要。
 
-`COPY relation TO`(query なし)の ANALYZE はプランを持たないため 0002 の
+`COPY relation TO`(query なし)の ANALYZE はプランを持たないため 0003 の
 対象外とし、引き続き ERROR(メッセージ: "EXPLAIN ANALYZE is not supported
 for COPY relation TO", HINT: "Use the COPY (SELECT ...) TO variant.")。
 RLS 有効時は relation TO でも query に変換されるため ANALYZE 可能になる
 点をテストで確認する。
 
-### 0002-3. 出力例
+### 0003-3. 出力例
 
 ```
 =# EXPLAIN (ANALYZE, COSTS OFF) COPY (SELECT * FROM t) TO '/tmp/t.out';
@@ -345,7 +384,7 @@ RLS 有効時は relation TO でも query に変換されるため ANALYZE 可�
 
 (注: /tmp/t.out は作成されない。ドキュメントに明記する。)
 
-### 0002-4. テスト・ドキュメント
+### 0003-4. テスト・ドキュメント
 
 - explain_filter 経由で (ANALYZE, TIMING OFF, SUMMARY OFF, COSTS OFF,
   BUFFERS OFF) の TEXT / JSON 出力を検証。
@@ -355,7 +394,7 @@ RLS 有効時は relation TO でも query に変換されるため ANALYZE 可�
 - explain.sgml: 「EXPLAIN ANALYZE COPY ... TO はクエリを実行するが出力先
   には何も書かれない」を明記。
 
-### 0002-5. 変更ファイル一覧
+### 0003-5. 変更ファイル一覧
 
 ```
 src/backend/commands/explain_copy.c        | ANALYZE 許可(エラー分岐の整理)
@@ -365,9 +404,9 @@ src/test/regress/{sql,expected}/explain_copy.*
 
 ---
 
-## 0003: EXPLAIN ANALYZE COPY FROM + 時間内訳
+## 0004: EXPLAIN ANALYZE COPY FROM + 時間内訳
 
-### 0003-1. 意味論
+### 0004-1. 意味論
 
 - **実際にデータをロードする**(EXPLAIN ANALYZE INSERT と同じ)。
   ドキュメントに BEGIN; EXPLAIN ANALYZE COPY ...; ROLLBACK; の例を記載。
@@ -375,13 +414,13 @@ src/test/regress/{sql,expected}/explain_copy.*
   "EXPLAIN ANALYZE cannot be used with COPY FROM STDIN"
   HINT "Use COPY FROM a file or PROGRAM."
   (EXPLAIN 応答中に CopyInResponse を送るとプロトコル上クライアントの
-  想定を壊すため。非 ANALYZE は 0001 どおり許可。)
+  想定を壊すため。非 ANALYZE は 0002 どおり許可。)
 - 読み取り専用トランザクションでは既存 COPY FROM と同じく
   PreventCommandIfReadOnly(copy.c:364-365 と同一条件)。
 - FREEZE / ON_ERROR / WHERE / トリガ / パーティションはすべて通常どおり
   動作する。
 
-### 0003-2. 計測構造体と受け渡し
+### 0004-2. 計測構造体と受け渡し
 
 ```c
 /* src/include/commands/copy.h */
@@ -411,8 +450,10 @@ void CopyFromSetInstrumentation(CopyFromState cstate,
   `CopyFromInstrumentation *instr`(既定 NULL)を追加。
 - **BeginCopyFrom のシグネチャは変更しない**。BeginCopyFrom は file_fdw
   等の拡張から呼ばれる公開 API のため、セッター方式で後付けする。
+- セッターとフィールドは本パッチで初めて使われるため、リファクタリング
+  パッチ(0001)には含めない(dead code を作らない)。
 
-### 0003-3. 計測ポイント(copyfrom.c)
+### 0004-3. 計測ポイント(copyfrom.c)
 
 タイマーはすべて `if (cstate->instr && cstate->instr->collect_timing)` で
 ガードし、EXPLAIN 経由でない通常 COPY(instr == NULL)には**分岐 1 回以外の
@@ -444,15 +485,15 @@ void CopyFromSetInstrumentation(CopyFromState cstate,
    - CopyFrom の終了処理(FreeExecutorState 前)で、estate の
      result-relation 群から {トリガ名, リレーション名, calls, total time}
      を instr->triggers に集約する(EState は CopyFrom のローカルで
-     ある解放されるため、ここで転記が必要)。
+     あり解放されるため、ここで転記が必要)。
 4. **カウンタ**: excluded(copyfrom.c:1202 のローカル変数)と
    cstate->num_errors を終了時に instr へ転記。処理行数は CopyFrom の
    戻り値を使用。
 
-### 0003-4. explain_copy.c の ANALYZE FROM 経路
+### 0004-4. explain_copy.c の ANALYZE FROM 経路
 
 ```c
-/* 0001 の ereport(ERROR) を置き換え */
+/* 0002 の ereport(ERROR) を置き換え */
 if (es->analyze)
 {
     CopyFromInstrumentation ci = {0};
@@ -490,7 +531,7 @@ extern 化して再利用する。トリガ出力は report_triggers(explain.c:7
 出力(ExplainOnePlan と同書式)。プランニングが存在しないため
 "Planning Time" は出力しない。
 
-### 0003-5. 出力設計
+### 0004-5. 出力設計
 
 TEXT(TIMING ON):
 
@@ -520,7 +561,7 @@ TEXT(TIMING ON):
 - Rows Excluded by Filter は WHERE 句がある場合のみ、Rows Skipped は
   ON_ERROR が stop 以外の場合のみ出力。
 - Input Time は「読み込み+パース+型変換」の合計であることを
-  ドキュメントに明記(細分化は Phase 4)。名称は bikeshed 対象として
+  ドキュメントに明記(細分化は将来課題)。名称は bikeshed 対象として
   提案メールで代替案(Read Time / Parse Time 分離等)とともに提示する。
 
 JSON:
@@ -541,7 +582,7 @@ JSON:
    "Execution Time": 6543.210 }]
 ```
 
-### 0003-6. オーバーヘッドの見積りと緩和
+### 0004-6. オーバーヘッドの見積りと緩和
 
 - TIMING ON 時の追加コストは行あたり clock_gettime × 2(input)+
   単一挿入経路なら × 4。Linux vDSO で 1 回 20〜30ns として 10^7 行で
@@ -554,7 +595,7 @@ JSON:
   unpatched / patched+非EXPLAIN / ANALYZE+TIMING OFF / ANALYZE+TIMING ON を
   narrow(2 列)・wide(30 列)× 1000 万行で比較。
 
-### 0003-7. テスト
+### 0004-7. テスト
 
 ```
 \set filename :abs_builddir '/results/explain_copy.data'
@@ -569,14 +610,12 @@ ROLLBACK;
   BUFFERS OFF で安定化し、TIMING ON の形は explain_filter(数値→N 置換)で
   1 ケースのみ検証。
 - ケース: 単純ロード / WHERE 付き / ON_ERROR ignore(Rows Skipped)/
-  BEFORE・AFTER トリガ付き(Trigger 行)/ パーティション先ロード /
-  FDW 先(postgres_fdw regress は不可のため file_fdw 圏外、コアでは
-  対象外とし contrib テスト追加は保留)/ FREEZE。
+  BEFORE・AFTER トリガ付き(Trigger 行)/ パーティション先ロード / FREEZE。
 - エラー系: ANALYZE + STDIN、read-only トランザクション、REJECT_LIMIT 超過
   (途中エラーでも壊れないこと)。
 - トランザクション内 ROLLBACK でデータが残らないこと。
 
-### 0003-8. 変更ファイル一覧
+### 0004-8. 変更ファイル一覧
 
 ```
 src/backend/commands/copyfrom.c            | タイマー挿入、セッター、トリガ集約
