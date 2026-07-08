@@ -1,0 +1,17 @@
+case,width,jobs,compression,images,elapsed_med_s,elapsed_min_s,elapsed_max_s,wal_bytes,wal_bytes_per_row,wal_fpi,wal_io_write_time_ms_med,wal_io_fsync_time_ms_med
+narrow_img_j1,narrow,1,off,on,1.780,1.771,1.795,245138543,24.5,18,18.0,114.3
+narrow_img_lz4_j1,narrow,1,lz4,on,2.009,2.005,2.010,190849502,19.1,44073,14.1,92.8
+narrow_img_lz4_j4,narrow,4,lz4,on,0.717,0.685,0.741,190763255,19.1,44123,25.1,89.5
+narrow_replica_j1,narrow,1,off,off,1.775,1.767,1.775,245137863,24.5,18,18.1,114.6
+narrow_replica_j4,narrow,4,off,off,0.664,0.649,0.670,245299129,24.5,18,40.1,107.5
+rand_img_lz4_j1,rand,1,lz4,on,1.276,1.262,1.278,608237662,1013.7,27,45.1,273.9
+rand_img_lz4_j4,rand,4,lz4,on,0.731,0.729,0.755,608265458,1013.8,27,105.1,272.3
+rand_replica_j1,rand,1,off,off,1.271,1.262,1.280,608446299,1014.1,27,44.3,276.8
+rand_replica_j4,rand,4,off,off,0.739,0.723,0.750,608473057,1014.1,27,103.8,273.5
+wide_img_j1,wide,1,off,on,1.262,1.256,1.266,612107117,1020.2,27,45.1,277.8
+wide_img_lz4_j1,wide,1,lz4,on,1.113,1.109,1.118,121123589,201.9,76650,8.9,62.7
+wide_img_lz4_j4,wide,4,lz4,on,0.450,0.444,0.480,120575325,201.0,76695,10.8,55.5
+wide_img_zstd_j1,wide,1,zstd,on,1.707,1.694,1.711,99654390,166.1,76650,7.4,55.1
+wide_img_zstd_j4,wide,4,zstd,on,0.630,0.624,0.679,99329155,165.5,76676,8.5,48.4
+wide_replica_j1,wide,1,off,off,1.263,1.261,1.263,612106409,1020.2,27,45.3,278.0
+wide_replica_j4,wide,4,off,off,0.726,0.726,0.767,612135003,1020.2,27,106.5,267.3

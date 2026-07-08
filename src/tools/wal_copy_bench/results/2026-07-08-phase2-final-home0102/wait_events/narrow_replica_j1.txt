@@ -1,0 +1,6 @@
+     93 CPU/Running
+      6 IO:WalSync
+      3 IO:DataFileWrite
+      1 IO:WalWrite
+      1 IO:DataFileExtend
+      1 IO:CopyFromRead

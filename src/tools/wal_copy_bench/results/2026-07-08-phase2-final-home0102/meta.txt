@@ -1,0 +1,44 @@
+Phase 2 production-patch final run (numbers for the -hackers proposal),
+home0102, 2026-07-08
+
+Patch under test: the production form cherry-picked at 72cf55ae4cc
+  - REGBUF_IMAGE_IF_SMALLER in xloginsert (image included only when the
+    compressed image is smaller than the registered block data)
+  - wal_multi_insert_page_images GUC, default on, effective only with
+    wal_compression enabled; back-off after 3 consecutive losses,
+    re-probe 1 page in 32 (state in BulkInsertState)
+
+Host: home0102 (192.168.1.3), 11th Gen Intel Core i5-1135G7 @ 2.40GHz,
+      8 CPUs, 15GB RAM, Rocky Linux 10 (kernel 6.12.0-124.8.1.el10_1),
+      WD Blue SN570 500GB NVMe (xfs on LVM).  Idle long-lived dev
+      cluster present as in all previous runs.
+Build: 20devel, gcc 14.3.1
+      ./configure --with-zstd --with-lz4 --without-icu --enable-tap-tests
+                  CFLAGS='-O2'
+      (note: plain -O2 this time, without the perf run's
+      -fno-omit-frame-pointer -g; control medians match the previous
+      run within ~2%)
+
+Pre-measurement verification, both on this exact build:
+  - make -C src/test/recovery check
+      PROVE_TESTS=t/055_multi_insert_page_images.pl  -> 4/4 PASS
+  - make -C src/test/regress check with TEMP_CONFIG =
+      { wal_compression=lz4, wal_consistency_checking=heap2 }
+      -> all 245 tests passed
+
+Method: identical to results/2026-07-08-phase2-home0102 — harness
+run_bench.sh, SCALE_NARROW=10000000 SCALE_WIDE=600000 MAX_JOBS=4
+FSYNC=on, BENCH_ROOT on the same NVMe, 16 cases x 3 repetitions
+interleaved (_r1 block, _r2 block, _r3 block).  Control cases pin
+wal_multi_insert_page_images=off explicitly (it defaults to on).
+
+Files:
+  summary.csv        per-case 3-rep medians (elapsed med/min/max,
+                     wal_bytes, B/row, wal_fpi, WAL io write/fsync ms)
+  summary-repeat.csv raw harness output, 48 rows
+  wait_events/       wait-event histograms summed over the 3 reps
+  report.md          analysis, -hackers-ready table, checks 3 and 4
+
+Repeatability: within-case elapsed spread is <=1% for all j1 cases;
+j4 cases spread up to ~8% (narrow_img_lz4_j4 0.685-0.741s) — medians
+used throughout.

@@ -1,0 +1,7 @@
+    115 CPU/Running
+     16 IO:DataFileWrite
+      6 IO:CopyFromRead
+      2 Buffer:BufferExclusive
+      1 Lock:extend
+      1 IO:WalSync
+      1 IO:DataFileExtend
