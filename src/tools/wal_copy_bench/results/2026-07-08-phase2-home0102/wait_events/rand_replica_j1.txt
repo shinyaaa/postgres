@@ -1,0 +1,6 @@
+     43 CPU/Running
+     12 IO:WalSync
+      8 IO:DataFileWrite
+      5 IO:WalWrite
+      5 IO:CopyFromRead
+      2 LWLock:WALWrite
