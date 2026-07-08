@@ -172,6 +172,13 @@ There is no `SECURITY DEFINER` and no privilege escalation anywhere:
 - For partitioned tables, policies apply to the table actually named in the
   query; run the debugger against the same table your query uses.
 
+## Internals
+
+A detailed developer-oriented walkthrough of the implementation —
+architecture and evaluation-flow diagrams, the security design, and the
+plpgsql pitfalls encountered — is available (in Japanese) in
+[INTERNALS.ja.md](INTERNALS.ja.md).
+
 ## Testing
 
 `make check` (or `meson test` with the `pg_rls_debugger` suite) runs a full

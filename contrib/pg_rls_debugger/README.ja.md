@@ -168,6 +168,12 @@ BYPASSRLS、所有者は `FORCE ROW LEVEL SECURITY` がない限り免除）、
   ものが適用されます。デバッガーも実クエリと同じテーブルに対して実行して
   ください。
 
+## 実装の詳細
+
+内部実装の解説（アーキテクチャ図・評価フロー・セキュリティ設計・plpgsql の
+落とし穴を含む開発者向けドキュメント）は [INTERNALS.ja.md](INTERNALS.ja.md)
+にあります。
+
 ## テスト
 
 `make check` で、PERMISSIVE/RESTRICTIVEの合成、ロールマッチ、
