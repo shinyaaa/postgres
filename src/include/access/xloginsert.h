@@ -39,6 +39,11 @@
 #define REGBUF_KEEP_DATA	0x10	/* include data even if a full-page image
 									 * is taken */
 #define REGBUF_NO_CHANGE	0x20	/* intentionally register clean buffer */
+#define REGBUF_IMAGE_IF_SMALLER 0x40	/* back up the page by a compressed
+										 * full-page image instead of the
+										 * registered block data if the image
+										 * turns out smaller; no effect unless
+										 * wal_compression is enabled */
 
 /* prototypes for public functions in xloginsert.c: */
 extern void XLogBeginInsert(void);
@@ -52,6 +57,7 @@ extern void XLogRegisterBlock(uint8 block_id, RelFileLocator *rlocator,
 							  ForkNumber forknum, BlockNumber blknum, const PageData *page,
 							  uint8 flags);
 extern void XLogRegisterBufData(uint8 block_id, const void *data, uint32 len);
+extern bool XLogImageIfSmallerUsed(void);
 extern void XLogResetInsertion(void);
 extern bool XLogCheckBufferNeedsBackup(Buffer buffer);
 

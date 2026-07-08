@@ -106,6 +106,14 @@ static uint64 mainrdata_len;	/* total # of bytes in chain */
 static uint8 curinsert_flags = 0;
 
 /*
+ * Whether the record most recently assembled adopted a conditional
+ * full-page image (REGBUF_IMAGE_IF_SMALLER) for at least one block.
+ * Valid until the next XLogBeginInsert(); callers query it through
+ * XLogImageIfSmallerUsed() after XLogInsert() returns.
+ */
+static bool image_if_smaller_used = false;
+
+/*
  * These are used to hold the record header while constructing a record.
  * 'hdr_scratch' is not a plain variable, but is palloc'd at initialization,
  * because we want it to be MAXALIGNed and padding bytes zeroed.
@@ -164,6 +172,18 @@ XLogBeginInsert(void)
 		elog(ERROR, "XLogBeginInsert was already called");
 
 	begininsert_called = true;
+	image_if_smaller_used = false;
+}
+
+/*
+ * Report whether the most recently assembled record adopted a conditional
+ * full-page image (REGBUF_IMAGE_IF_SMALLER) for at least one of its blocks.
+ * Callers use this after XLogInsert() to drive their own back-off logic.
+ */
+bool
+XLogImageIfSmallerUsed(void)
+{
+	return image_if_smaller_used;
 }
 
 /*
@@ -249,6 +269,8 @@ XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags)
 
 	/* NO_IMAGE doesn't make sense with FORCE_IMAGE */
 	Assert(!((flags & REGBUF_FORCE_IMAGE) && (flags & (REGBUF_NO_IMAGE))));
+	/* neither does IMAGE_IF_SMALLER, whose image is not unconditional */
+	Assert(!((flags & REGBUF_IMAGE_IF_SMALLER) && (flags & REGBUF_FORCE_IMAGE)));
 	Assert(begininsert_called);
 
 	/*
@@ -637,6 +659,9 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 	 * All the modifications we do to the rdata chains below must handle that.
 	 */
 
+	/* start from scratch on re-assembly, the outcome can change */
+	image_if_smaller_used = false;
+
 	/* The record begins with the fixed-size header */
 	rechdr = (XLogRecord *) scratch;
 	scratch += SizeOfXLogRecord;
@@ -671,6 +696,8 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 		bool		samerel;
 		bool		is_compressed = false;
 		bool		include_image;
+		bool		try_image_if_smaller;
+		uint16		compressed_len = 0;
 
 		if (!regbuf->in_use)
 			continue;
@@ -707,6 +734,22 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 		else
 			needs_data = !needs_backup;
 
+		/*
+		 * A REGBUF_IMAGE_IF_SMALLER block that does not otherwise need a
+		 * backup block gets one anyway if its compressed image turns out
+		 * smaller than the registered block data it would then replace. There
+		 * is nothing to gain when the block is imaged anyway, when there is
+		 * no block data to replace (or the data must be kept), or when
+		 * wal_compression is disabled: an image of a page can never beat the
+		 * page's own payload without compression.  The decision is made
+		 * below, once the image has been compressed.
+		 */
+		try_image_if_smaller = (regbuf->flags & REGBUF_IMAGE_IF_SMALLER) != 0 &&
+			!needs_backup &&
+			wal_compression != WAL_COMPRESSION_NONE &&
+			regbuf->rdata_len > 0 &&
+			(regbuf->flags & REGBUF_KEEP_DATA) == 0;
+
 		bkpb.id = block_id;
 		bkpb.fork_flags = regbuf->forkno;
 		bkpb.data_length = 0;
@@ -716,14 +759,17 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 
 		/*
 		 * If needs_backup is true or WAL checking is enabled for current
-		 * resource manager, log a full-page write for the current block.
+		 * resource manager, log a full-page write for the current block.  A
+		 * REGBUF_IMAGE_IF_SMALLER block also gets this far, but its image is
+		 * discarded again below unless it beats the block data.
 		 */
-		include_image = needs_backup || (info & XLR_CHECK_CONSISTENCY) != 0;
+		include_image = needs_backup ||
+			(info & XLR_CHECK_CONSISTENCY) != 0 ||
+			try_image_if_smaller;
 
 		if (include_image)
 		{
 			const PageData *page = regbuf->page;
-			uint16		compressed_len = 0;
 
 			/*
 			 * The page needs to be backed up, so calculate its hole length
@@ -767,6 +813,29 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 											regbuf->compressed_page,
 											&compressed_len);
 			}
+
+			/*
+			 * Decide the fate of a conditional image: adopt it only if its
+			 * compressed form is smaller than the block data it replaces;
+			 * otherwise forget it again, unless consistency checking wants
+			 * the image anyway (without BKPIMAGE_APPLY, as usual).
+			 */
+			if (try_image_if_smaller)
+			{
+				if (is_compressed && compressed_len < regbuf->rdata_len)
+				{
+					needs_backup = true;
+					needs_data = false;
+					image_if_smaller_used = true;
+				}
+				else if ((info & XLR_CHECK_CONSISTENCY) == 0)
+					include_image = false;
+			}
+		}
+
+		if (include_image)
+		{
+			const PageData *page = regbuf->page;
 
 			/*
 			 * Fill in the remaining fields in the XLogRecordBlockHeader
