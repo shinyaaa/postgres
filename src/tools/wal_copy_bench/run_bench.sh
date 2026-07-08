@@ -47,9 +47,10 @@
 #                 uses SCALE_WIDE)
 #     jobs:       number of concurrent COPY sessions (<= MAX_JOBS)
 #     wal_buffers: optional, defaults to 16MB (the auto-tuned cap)
-#     images:     optional on|off (default off); sets the Phase 2 prototype
-#                 GUC debug_multi_insert_page_images (needs a patched build;
-#                 cases are skipped gracefully on an unpatched server)
+#     images:     optional on|off (default off); sets the GUC
+#                 wal_multi_insert_page_images (needs a patched build;
+#                 cases are skipped gracefully on an unpatched server).
+#                 Only effective combined with wal_compression.
 
 set -euo pipefail
 
@@ -144,8 +145,11 @@ server_start_for_case()
 		wal_compression = $wal_compression
 		wal_buffers = $wal_buffers
 	EOF
-	if [ "$images" = on ]; then
-		echo "debug_multi_insert_page_images = on" >> "$PGDATA/bench_case.conf"
+	# On builds that know the GUC, pin it explicitly either way: it defaults
+	# to on, so control cases must force it off.  Unpatched builds simply
+	# don't get the line (images=on cases are skipped in run_case).
+	if [ "${HAVE_IMG_GUC:-0}" = 1 ]; then
+		echo "wal_multi_insert_page_images = $images" >> "$PGDATA/bench_case.conf"
 	fi
 	"$PGBIN/pg_ctl" -D "$PGDATA" -w -l "$OUTDIR/server.log" start > /dev/null
 }
@@ -242,6 +246,11 @@ run_case()
 
 	mkdir -p "$detail"
 	log "=== case $name (wal_level=$wal_level mode=$mode compression=$compression width=$width jobs=$jobs wal_buffers=$wal_buffers images=$images)"
+
+	if [ "$images" = on ] && [ "${HAVE_IMG_GUC:-0}" != 1 ]; then
+		log "    SKIPPED: server build lacks wal_multi_insert_page_images"
+		return 0
+	fi
 
 	server_stop
 	if ! server_start_for_case "$wal_level" "$compression" "$wal_buffers" "$images"
@@ -460,6 +469,16 @@ done
 
 trap server_stop EXIT
 init_cluster
+
+# Does this build know the page-image GUC?  (Determines whether image cases
+# run and whether control cases must pin the GUC off.)
+if "$PGBIN/postgres" -D "$PGDATA" -C wal_multi_insert_page_images > /dev/null 2>&1; then
+	HAVE_IMG_GUC=1
+else
+	HAVE_IMG_GUC=0
+fi
+log "wal_multi_insert_page_images support: $([ $HAVE_IMG_GUC = 1 ] && echo yes || echo no)"
+
 warmup
 
 echo "name,wal_level,mode,compression,width,jobs,wal_buffers,images,rows,elapsed_s,rows_per_s,wal_records,wal_fpi,wal_bytes,wal_fpi_bytes,wal_bytes_per_row,wal_to_heap_ratio,wal_MB_per_s,wal_buffers_full,wal_io_writes,wal_io_write_time_ms,wal_io_fsyncs,wal_io_fsync_time_ms,heap_bytes" \
