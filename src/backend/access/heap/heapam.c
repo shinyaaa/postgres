@@ -39,6 +39,7 @@
 #include "access/syncscan.h"
 #include "access/valid.h"
 #include "access/visibilitymap.h"
+#include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_database_d.h"
@@ -57,8 +58,51 @@
 #include "utils/syscache.h"
 
 
-/* GUC: log page images instead of tuple data for filled multi-insert pages */
-bool		debug_multi_insert_page_images = false;
+/*
+ * GUC: when a multi-insert fills a previously-empty page, back the page up
+ * with a compressed full-page image instead of the tuple data if the image
+ * is smaller.  Only effective when wal_compression is enabled.
+ */
+bool		wal_multi_insert_page_images = true;
+
+/*
+ * Back-off bookkeeping for wal_multi_insert_page_images, kept in the
+ * BulkInsertState so that it spans a whole bulk load: after
+ * MULTI_INSERT_IMAGE_MAX_LOSSES consecutive pages whose compressed image
+ * failed to beat the tuple data (poorly compressible data), stop paying for
+ * compression attempts, and re-probe a single page out of every
+ * MULTI_INSERT_IMAGE_REPROBE in case the data changed character.
+ */
+#define MULTI_INSERT_IMAGE_MAX_LOSSES	3
+#define MULTI_INSERT_IMAGE_REPROBE		32
+
+static inline bool
+multi_insert_image_try(BulkInsertState bistate)
+{
+	if (bistate == NULL)
+		return true;			/* no state to remember losses in */
+	if (bistate->image_losses < MULTI_INSERT_IMAGE_MAX_LOSSES)
+		return true;
+	if (++bistate->image_pages_skipped >= MULTI_INSERT_IMAGE_REPROBE)
+	{
+		/* re-probe: grant a single attempt */
+		bistate->image_losses = MULTI_INSERT_IMAGE_MAX_LOSSES - 1;
+		bistate->image_pages_skipped = 0;
+		return true;
+	}
+	return false;
+}
+
+static inline void
+multi_insert_image_feedback(BulkInsertState bistate, bool image_used)
+{
+	if (bistate == NULL)
+		return;
+	if (image_used)
+		bistate->image_losses = 0;
+	else
+		bistate->image_losses++;
+}
 
 static HeapTuple heap_prepare_insert(Relation relation, HeapTuple tup,
 									 TransactionId xid, CommandId cid, uint32 options);
@@ -1947,6 +1991,8 @@ GetBulkInsertState(void)
 	bistate->next_free = InvalidBlockNumber;
 	bistate->last_free = InvalidBlockNumber;
 	bistate->already_extended_by = 0;
+	bistate->image_losses = 0;
+	bistate->image_pages_skipped = 0;
 	return bistate;
 }
 
@@ -2480,7 +2526,7 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 			bool		init;
 			int			bufflags = 0;
 
-			bool		use_image;
+			bool		try_image;
 
 			/*
 			 * If the page was previously empty, we can reinit the page
@@ -2489,18 +2535,24 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 			init = starting_with_empty_page;
 
 			/*
-			 * Log a full image of the page instead of the tuple data when
-			 * so requested.  That is only legal when the tuple data is not
-			 * needed by logical decoding, and only worthwhile when no later
-			 * record will add tuples to this page — otherwise that record
-			 * would have to image the whole page again.  The tuple loop
-			 * above stopped early iff the page had no room for the next
-			 * tuple, so use that as the "page is full" test; the final,
-			 * partially-filled page of a batch keeps the per-tuple format.
+			 * Ask for a conditional full-page image: a compressed image of
+			 * the page replaces the tuple data at record-assembly time if it
+			 * turns out smaller (REGBUF_IMAGE_IF_SMALLER).  This is only
+			 * legal when the tuple data is not needed by logical decoding,
+			 * and only worthwhile when no later record will add tuples to
+			 * this page — otherwise that record would have to image the
+			 * whole page again.  The tuple loop above stopped early iff the
+			 * page had no room for the next tuple, so use that as the "page
+			 * is full" test; the final, partially-filled page of a batch
+			 * always keeps the per-tuple format.  When recent pages' images
+			 * kept losing, back off and only re-probe occasionally (the
+			 * bookkeeping lives in the BulkInsertState).
 			 */
-			use_image = debug_multi_insert_page_images &&
+			try_image = wal_multi_insert_page_images &&
+				wal_compression != WAL_COMPRESSION_NONE &&
 				init && !need_tuple_data && !need_cids &&
-				ndone + nthispage < ntuples;
+				ndone + nthispage < ntuples &&
+				multi_insert_image_try(bistate);
 
 			/* allocate xl_heap_multi_insert struct from the scratch area */
 			xlrec = (xl_heap_multi_insert *) scratchptr;
@@ -2537,10 +2589,9 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 
 			/*
 			 * Write out an xl_multi_insert_tuple and the tuple data itself
-			 * for each tuple.  A page-image record carries no tuple data at
-			 * all: recovery restores the page from the image.
+			 * for each tuple.
 			 */
-			for (i = 0; !use_image && i < nthispage; i++)
+			for (i = 0; i < nthispage; i++)
 			{
 				HeapTuple	heaptup = heaptuples[ndone + i];
 				xl_multi_insert_tuple *tuphdr;
@@ -2578,22 +2629,13 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 			if (ndone + nthispage == ntuples)
 				xlrec->flags |= XLH_INSERT_LAST_IN_MULTI;
 
-			if (use_image)
-			{
-				/*
-				 * REGBUF_FORCE_IMAGE guarantees that the image is both
-				 * included and marked for apply, so redo always restores
-				 * the page (BLK_RESTORED) and never looks at ntuples or
-				 * the (absent) tuple data.  XLOG_HEAP_INIT_PAGE must not
-				 * be set: there is nothing to replay incrementally.
-				 */
-				bufflags |= REGBUF_FORCE_IMAGE;
-			}
-			else if (init)
+			if (init)
 			{
 				info |= XLOG_HEAP_INIT_PAGE;
 				bufflags |= REGBUF_WILL_INIT;
 			}
+			if (try_image)
+				bufflags |= REGBUF_IMAGE_IF_SMALLER;
 
 			/*
 			 * If we're doing logical decoding, include the new tuple data
@@ -2608,13 +2650,16 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 			if (all_frozen_set)
 				XLogRegisterBuffer(1, vmbuffer, 0);
 
-			if (!use_image)
-				XLogRegisterBufData(0, tupledata, totaldatalen);
+			XLogRegisterBufData(0, tupledata, totaldatalen);
 
 			/* filtering by origin on a row level is much more efficient */
 			XLogSetRecordFlags(XLOG_INCLUDE_ORIGIN);
 
 			recptr = XLogInsert(RM_HEAP2_ID, info);
+
+			if (try_image)
+				multi_insert_image_feedback(bistate,
+											XLogImageIfSmallerUsed());
 
 			PageSetLSN(page, recptr);
 			if (all_frozen_set)

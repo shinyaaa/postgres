@@ -539,10 +539,19 @@ heap_xlog_multi_insert(XLogReaderState *record)
 
 	if (isinit)
 	{
-		buffer = XLogInitBufferForRedo(record, 0);
-		page = BufferGetPage(buffer);
-		PageInit(page, BufferGetPageSize(buffer), 0);
-		action = BLK_NEEDS_REDO;
+		/*
+		 * The record normally reinitializes the page and fills it from the
+		 * tuple data, but when a conditional full-page image was adopted in
+		 * place of the tuple data (see REGBUF_IMAGE_IF_SMALLER), the image is
+		 * restored instead (BLK_RESTORED) and there is nothing to replay.
+		 */
+		action = XLogReadBufferForRedoExtended(record, 0, RBM_ZERO_AND_LOCK,
+											   false, &buffer);
+		if (action == BLK_NEEDS_REDO)
+		{
+			page = BufferGetPage(buffer);
+			PageInit(page, BufferGetPageSize(buffer), 0);
+		}
 	}
 	else
 		action = XLogReadBufferForRedo(record, 0, &buffer);

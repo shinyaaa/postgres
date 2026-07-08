@@ -48,6 +48,14 @@ typedef struct BulkInsertStateData
 	BlockNumber next_free;
 	BlockNumber last_free;
 	uint32		already_extended_by;
+
+	/*
+	 * Back-off state for wal_multi_insert_page_images: consecutive pages
+	 * whose conditional full-page image failed to beat the tuple data, and
+	 * pages skipped since attempts were suspended.  See heapam.c.
+	 */
+	int			image_losses;
+	int			image_pages_skipped;
 } BulkInsertStateData;
 
 
