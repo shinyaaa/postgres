@@ -33,7 +33,7 @@
 
 
 /* GUC variable, in heapam.c */
-extern PGDLLIMPORT bool debug_multi_insert_page_images;
+extern PGDLLIMPORT bool wal_multi_insert_page_images;
 
 /* "options" flag bits for heap_insert */
 #define HEAP_INSERT_SKIP_FSM	TABLE_INSERT_SKIP_FSM

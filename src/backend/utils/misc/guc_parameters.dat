@@ -692,14 +692,6 @@
   options => 'debug_logical_replication_streaming_options',
 },
 
-{ name => 'debug_multi_insert_page_images', type => 'bool', context => 'PGC_SUSET', group => 'DEVELOPER_OPTIONS',
-  short_desc => 'Logs full-page images instead of tuple data for pages filled by multi-inserts.',
-  long_desc => 'When a multi-insert (e.g. COPY FROM) fills a previously-empty page completely, log a full image of the page instead of the individual tuples. The image is compressed according to "wal_compression". Has no effect on relations that require tuple data for logical decoding.',
-  flags => 'GUC_NOT_IN_SAMPLE',
-  variable => 'debug_multi_insert_page_images',
-  boot_val => 'false',
-},
-
 { name => 'debug_parallel_query', type => 'enum', context => 'PGC_USERSET', group => 'DEVELOPER_OPTIONS',
   short_desc => 'Forces the planner\'s use parallel query nodes.',
   long_desc => 'This can be useful for testing the parallel query infrastructure by forcing the planner to generate plans that contain nodes that perform tuple communication between workers and the main process.',
@@ -3522,6 +3514,13 @@
   short_desc => 'Writes full pages to WAL when first modified after a checkpoint, even for a non-critical modification.',
   variable => 'wal_log_hints',
   boot_val => 'false',
+},
+
+{ name => 'wal_multi_insert_page_images', type => 'bool', context => 'PGC_SUSET', group => 'WAL_SETTINGS',
+  short_desc => 'Backs up pages filled by multi-inserts with compressed page images when smaller.',
+  long_desc => 'When a multi-insert (e.g. COPY FROM) fills a previously-empty page completely, replace the per-tuple WAL data with a full-page image compressed according to "wal_compression", if the image is smaller. Has no effect when "wal_compression" is off, or on relations whose tuple data is required for logical decoding.',
+  variable => 'wal_multi_insert_page_images',
+  boot_val => 'true',
 },
 
 { name => 'wal_receiver_create_temp_slot', type => 'bool', context => 'PGC_SIGHUP', group => 'REPLICATION_STANDBY',

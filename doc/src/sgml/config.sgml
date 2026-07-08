@@ -3687,6 +3687,36 @@ include_dir 'conf.d'
       </listitem>
      </varlistentry>
 
+     <varlistentry id="guc-wal-multi-insert-page-images" xreflabel="wal_multi_insert_page_images">
+      <term><varname>wal_multi_insert_page_images</varname> (<type>boolean</type>)
+      <indexterm>
+       <primary><varname>wal_multi_insert_page_images</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        When a bulk insertion such as <command>COPY ... FROM</command> fills a
+        previously-empty page completely, this parameter allows the per-row
+        WAL data to be replaced by a full image of the page, compressed
+        according to <xref linkend="guc-wal-compression"/>, whenever the
+        compressed image is smaller.  This can substantially reduce the
+        amount of WAL written by bulk data loads, at the cost of the CPU
+        spent on compression.  The default is <literal>on</literal>.
+        It has no effect while <varname>wal_compression</varname> is
+        <literal>off</literal>, nor on relations whose row data must be
+        retained in WAL for logical decoding.
+        Only superusers and users with the appropriate <literal>SET</literal>
+        privilege can change this setting.
+       </para>
+       <para>
+        For bulk loading, <literal>lz4</literal> is usually the most
+        effective <varname>wal_compression</varname> setting; heavier
+        compression methods can spend more CPU time compressing the data
+        than the reduced WAL volume saves.
+       </para>
+      </listitem>
+     </varlistentry>
+
      <varlistentry id="guc-wal-init-zero" xreflabel="wal_init_zero">
       <term><varname>wal_init_zero</varname> (<type>boolean</type>)
       <indexterm>
