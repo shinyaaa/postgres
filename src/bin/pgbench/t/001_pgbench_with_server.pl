@@ -718,6 +718,77 @@ $node->pgbench(
 		)
 	});
 
+# test \while loops
+$node->pgbench(
+	'--no-vacuum --client=1 --exit-on-abort --transactions=1',
+	0,
+	[qr{actually processed}],
+	[
+		qr{debug\(script=0,command=\d+\): int 15\b},
+		qr{debug\(script=0,command=\d+\): int 7777\b},
+		qr{debug\(script=0,command=\d+\): int 44\b},
+		qr{debug\(script=0,command=\d+\): int 4444\b},
+	],
+	'while loops',
+	{
+		'pgbench_while' => q(
+			-- basic loop computing a sum
+			\set i 0
+			\set s 0
+			\while :i < 5
+				\set i :i + 1
+				\set s :s + :i
+			\endwhile
+			\set d1 debug(:s)
+			-- loop whose body is never entered
+			\set nope 7777
+			\while false
+				\set nope 1
+			\endwhile
+			\set d2 debug(:nope)
+			-- nested loops and conditionals
+			\set x 0
+			\set j 0
+			\while :j < 2
+				\set k 0
+				\while :k < 4
+					\if :k % 2 = 0
+						\set x :x + 1
+					\else
+						\set x :x + 10
+					\endif
+					\set k :k + 1
+				\endwhile
+				\set j :j + 1
+			\endwhile
+			\set d3 debug(:x)
+			-- a loop inside a false conditional branch is skipped
+			\set y 4444
+			\if false
+				\while true
+					\set y 1
+				\endwhile
+			\endif
+			\set d4 debug(:y)
+			SELECT 1;
+		)
+	});
+
+# runaway \while loops are caught by --max-loop-iterations
+$node->pgbench(
+	'--no-vacuum --client=1 --transactions=1 --max-loop-iterations=100',
+	2,
+	[qr{processed: 0/1}],
+	[qr{exceeded the maximum number of loop iterations}],
+	'while loop iteration limit',
+	{
+		'pgbench_while_limit' => q(
+			\while true
+				\set x 1
+			\endwhile
+		)
+	});
+
 # random determinism when seeded
 $node->safe_psql('postgres',
 	'CREATE UNLOGGED TABLE seeded_random(seed INT8 NOT NULL, rand TEXT NOT NULL, val INTEGER NOT NULL);'

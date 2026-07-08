@@ -290,6 +290,13 @@ static int	main_pid;			/* main process id used in log filename */
  */
 static uint32 max_tries = 1;
 
+/*
+ * We stop \while looping and abort the client when the total number of loop
+ * iterations performed within one script execution reaches this maximum; if
+ * its value is zero, it is not used.
+ */
+static int64 max_loop_iterations = 1000000;
+
 static bool failures_detailed = false;	/* whether to group failures in
 										 * reports or logs by basic types */
 
@@ -617,6 +624,12 @@ typedef struct
 
 	int			use_file;		/* index in sql_script for this client */
 	int			command;		/* command number in script */
+	int			jump_to;		/* command number to jump to instead of just
+								 * advancing to the next command, or -1; used
+								 * by \while and \endwhile */
+	int64		loop_iterations;	/* total number of \while loop iterations
+									 * performed in the current script
+									 * execution, to catch runaway loops */
 	int			num_syncs;		/* number of ongoing sync commands */
 
 	/* client variables */
@@ -706,6 +719,8 @@ typedef enum MetaCommand
 	META_ELIF,					/* \elif */
 	META_ELSE,					/* \else */
 	META_ENDIF,					/* \endif */
+	META_WHILE,					/* \while */
+	META_ENDWHILE,				/* \endwhile */
 	META_STARTPIPELINE,			/* \startpipeline */
 	META_SYNCPIPELINE,			/* \syncpipeline */
 	META_ENDPIPELINE,			/* \endpipeline */
@@ -741,6 +756,9 @@ static const char *const QUERYMODE[] = {"simple", "extended", "prepared"};
  *				variable name that receives the value.
  * aset			do gset on all possible queries of a combined query (\;).
  * expr			Parsed expression, if needed.
+ * jump_target	For a \while or \endwhile command, the command number of the
+ *				matching \endwhile or \while, else -1.  Resolved statically
+ *				by CheckConditional().
  * stats		Time spent in this command.
  * retries		Number of retries after a serialization or deadlock error in the
  *				current command.
@@ -757,6 +775,7 @@ typedef struct Command
 	char	   *prepname;
 	char	   *varprefix;
 	PgBenchExpr *expr;
+	int			jump_target;
 	SimpleStats stats;
 	int64		retries;
 	int64		failures;
@@ -962,6 +981,9 @@ usage(void)
 		   "  --failures-detailed      report the failures grouped by basic types\n"
 		   "  --log-prefix=PREFIX      prefix for transaction time log file\n"
 		   "                           (default: \"pgbench_log\")\n"
+		   "  --max-loop-iterations=NUM\n"
+		   "                           max number of \\while loop iterations per script\n"
+		   "                           execution (default: 1000000, 0 for no limit)\n"
 		   "  --max-tries=NUM          max number of tries to run transaction (default: 1)\n"
 		   "  --progress-timestamp     use Unix epoch timestamps for progress\n"
 		   "  --random-seed=SEED       set random seed (\"time\", \"rand\", integer)\n"
@@ -2889,6 +2911,10 @@ getMetaCommand(const char *cmd)
 		mc = META_ELSE;
 	else if (pg_strcasecmp(cmd, "endif") == 0)
 		mc = META_ENDIF;
+	else if (pg_strcasecmp(cmd, "while") == 0)
+		mc = META_WHILE;
+	else if (pg_strcasecmp(cmd, "endwhile") == 0)
+		mc = META_ENDWHILE;
 	else if (pg_strcasecmp(cmd, "gset") == 0)
 		mc = META_GSET;
 	else if (pg_strcasecmp(cmd, "aset") == 0)
@@ -3763,6 +3789,8 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 				/* Begin with the first command */
 				st->state = CSTATE_START_COMMAND;
 				st->command = 0;
+				st->jump_to = -1;
+				st->loop_iterations = 0;
 				break;
 
 				/*
@@ -4105,7 +4133,14 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 				}
 
 				/* Go ahead with next command, to be executed or skipped */
-				st->command++;
+				if (st->jump_to >= 0)
+				{
+					/* an executed \while or \endwhile requested a jump */
+					st->command = st->jump_to;
+					st->jump_to = -1;
+				}
+				else
+					st->command++;
 				st->state = conditional_active(st->cstack) ?
 					CSTATE_START_COMMAND : CSTATE_SKIP_COMMAND;
 				break;
@@ -4242,6 +4277,8 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 
 				/* Process the first transaction command. */
 				st->command = 0;
+				st->jump_to = -1;
+				st->loop_iterations = 0;
 				st->estatus = ESTATUS_NO_ERROR;
 				st->state = CSTATE_START_COMMAND;
 				break;
@@ -4487,6 +4524,43 @@ executeMetaCommand(CState *st, pg_time_usec_t *now)
 	{
 		Assert(!conditional_stack_empty(st->cstack));
 		conditional_stack_pop(st->cstack);
+	}
+	else if (command->meta == META_WHILE)
+	{
+		/* backslash commands with an expression to evaluate */
+		PgBenchExpr *expr = command->expr;
+		PgBenchValue result;
+
+		if (!evaluateExpr(st, expr, &result))
+		{
+			commandFailed(st, argv[0], "evaluation of meta-command failed");
+			return CSTATE_ABORTED;
+		}
+
+		/*
+		 * If the condition does not hold, resume execution after the matching
+		 * \endwhile; else just fall into the loop body.
+		 */
+		if (!valueTruth(&result))
+			st->jump_to = command->jump_target + 1;
+	}
+	else if (command->meta == META_ENDWHILE)
+	{
+		/*
+		 * Guard against runaway loops: an executed \endwhile marks the end of
+		 * one loop iteration, and only so many of them may be performed
+		 * within one script execution.
+		 */
+		st->loop_iterations++;
+		if (max_loop_iterations > 0 &&
+			st->loop_iterations > max_loop_iterations)
+		{
+			commandFailed(st, "endwhile", "exceeded the maximum number of loop iterations (see --max-loop-iterations)");
+			return CSTATE_ABORTED;
+		}
+
+		/* loop back to the matching \while to re-evaluate its condition */
+		st->jump_to = command->jump_target;
 	}
 	else if (command->meta == META_SETSHELL)
 	{
@@ -5757,6 +5831,7 @@ process_backslash_command(PsqlScanState sstate, const char *source,
 	my_command = pg_malloc0_object(Command);
 	my_command->type = META_COMMAND;
 	my_command->argc = 0;
+	my_command->jump_target = -1;
 	initSimpleStats(&my_command->stats);
 
 	/* Save first word (command name) */
@@ -5770,7 +5845,8 @@ process_backslash_command(PsqlScanState sstate, const char *source,
 
 	if (my_command->meta == META_SET ||
 		my_command->meta == META_IF ||
-		my_command->meta == META_ELIF)
+		my_command->meta == META_ELIF ||
+		my_command->meta == META_WHILE)
 	{
 		yyscan_t	yyscanner;
 
@@ -5909,6 +5985,7 @@ process_backslash_command(PsqlScanState sstate, const char *source,
 						 "missing command", NULL, -1);
 	}
 	else if (my_command->meta == META_ELSE || my_command->meta == META_ENDIF ||
+			 my_command->meta == META_ENDWHILE ||
 			 my_command->meta == META_STARTPIPELINE ||
 			 my_command->meta == META_ENDPIPELINE ||
 			 my_command->meta == META_SYNCPIPELINE)
@@ -5942,14 +6019,30 @@ ConditionError(const char *desc, int cmdn, const char *msg)
 			 desc, cmdn, msg);
 }
 
+/* an entry in the stack of open \if and \while blocks in CheckConditional */
+typedef struct BlockScope
+{
+	bool		is_while;		/* \while rather than \if */
+	bool		saw_else;		/* \if block has already seen an \else */
+	int			index;			/* command number of the opening command */
+}			BlockScope;
+
 /*
- * Partial evaluation of conditionals before recording and running the script.
+ * Partial evaluation of conditionals and loops before recording and running
+ * the script.
+ *
+ * \if ... \endif and \while ... \endwhile blocks may nest, but must be
+ * properly contained within one another.  This also resolves the pairing of
+ * each \while and \endwhile, recording it in their jump_target fields for
+ * use at execution time.
  */
 static void
 CheckConditional(const ParsedScript *ps)
 {
-	/* statically check conditional structure */
-	ConditionalStack cs = conditional_stack_create();
+	/* statically check conditional and loop structure */
+	int			alloced = 8;
+	BlockScope *blocks = pg_malloc_array(BlockScope, alloced);
+	int			depth = 0;
 	int			i;
 
 	for (i = 0; ps->commands[i] != NULL; i++)
@@ -5961,24 +6054,50 @@ CheckConditional(const ParsedScript *ps)
 			switch (cmd->meta)
 			{
 				case META_IF:
-					conditional_stack_push(cs, IFSTATE_FALSE);
+				case META_WHILE:
+					if (depth >= alloced)
+					{
+						alloced *= 2;
+						blocks = pg_realloc_array(blocks, BlockScope, alloced);
+					}
+					blocks[depth].is_while = (cmd->meta == META_WHILE);
+					blocks[depth].saw_else = false;
+					blocks[depth].index = i;
+					depth++;
 					break;
 				case META_ELIF:
-					if (conditional_stack_empty(cs))
+					if (depth == 0)
 						ConditionError(ps->desc, i + 1, "\\elif without matching \\if");
-					if (conditional_stack_peek(cs) == IFSTATE_ELSE_FALSE)
+					if (blocks[depth - 1].is_while)
+						ConditionError(ps->desc, i + 1, "\\elif inside \\while block");
+					if (blocks[depth - 1].saw_else)
 						ConditionError(ps->desc, i + 1, "\\elif after \\else");
 					break;
 				case META_ELSE:
-					if (conditional_stack_empty(cs))
+					if (depth == 0)
 						ConditionError(ps->desc, i + 1, "\\else without matching \\if");
-					if (conditional_stack_peek(cs) == IFSTATE_ELSE_FALSE)
+					if (blocks[depth - 1].is_while)
+						ConditionError(ps->desc, i + 1, "\\else inside \\while block");
+					if (blocks[depth - 1].saw_else)
 						ConditionError(ps->desc, i + 1, "\\else after \\else");
-					conditional_stack_poke(cs, IFSTATE_ELSE_FALSE);
+					blocks[depth - 1].saw_else = true;
 					break;
 				case META_ENDIF:
-					if (!conditional_stack_pop(cs))
+					if (depth == 0)
 						ConditionError(ps->desc, i + 1, "\\endif without matching \\if");
+					if (blocks[depth - 1].is_while)
+						ConditionError(ps->desc, i + 1, "\\endif inside \\while block");
+					depth--;
+					break;
+				case META_ENDWHILE:
+					if (depth == 0)
+						ConditionError(ps->desc, i + 1, "\\endwhile without matching \\while");
+					if (!blocks[depth - 1].is_while)
+						ConditionError(ps->desc, i + 1, "\\endwhile inside \\if block");
+					depth--;
+					/* record the pairing, for jumps at execution time */
+					ps->commands[blocks[depth].index]->jump_target = i;
+					cmd->jump_target = blocks[depth].index;
 					break;
 				default:
 					/* ignore anything else... */
@@ -5986,9 +6105,12 @@ CheckConditional(const ParsedScript *ps)
 			}
 		}
 	}
-	if (!conditional_stack_empty(cs))
-		ConditionError(ps->desc, i + 1, "\\if without matching \\endif");
-	conditional_stack_destroy(cs);
+	if (depth > 0)
+		ConditionError(ps->desc, i + 1,
+					   blocks[depth - 1].is_while ?
+					   "\\while without matching \\endwhile" :
+					   "\\if without matching \\endif");
+	pg_free(blocks);
 }
 
 /*
@@ -6778,6 +6900,7 @@ main(int argc, char **argv)
 		{"exit-on-abort", no_argument, NULL, 16},
 		{"debug", no_argument, NULL, 17},
 		{"continue-on-error", no_argument, NULL, 18},
+		{"max-loop-iterations", required_argument, NULL, 19},
 		{NULL, 0, NULL, 0}
 	};
 
@@ -7138,6 +7261,18 @@ main(int argc, char **argv)
 				benchmarking_option_set = true;
 				continue_on_error = true;
 				break;
+			case 19:			/* max-loop-iterations */
+				{
+					int64		max_loop_iterations_arg;
+
+					if (!strtoint64(optarg, true, &max_loop_iterations_arg) ||
+						max_loop_iterations_arg < 0)
+						pg_fatal("invalid number of maximum loop iterations: \"%s\"", optarg);
+
+					benchmarking_option_set = true;
+					max_loop_iterations = max_loop_iterations_arg;
+				}
+				break;
 			default:
 				/* getopt_long already emitted a complaint */
 				pg_log_error_hint("Try \"%s --help\" for more information.", progname);
@@ -7333,6 +7468,7 @@ main(int argc, char **argv)
 	for (i = 0; i < nclients; i++)
 	{
 		state[i].cstack = conditional_stack_create();
+		state[i].jump_to = -1;
 		initRandomState(&state[i].cs_func_rs);
 	}
 

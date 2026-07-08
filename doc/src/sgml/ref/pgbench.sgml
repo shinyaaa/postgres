@@ -828,6 +828,20 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
       </listitem>
      </varlistentry>
 
+     <varlistentry id="pgbench-option-max-loop-iterations">
+      <term><option>--max-loop-iterations=<replaceable>number</replaceable></option></term>
+      <listitem>
+       <para>
+        Abort the client when a single script execution performs more than
+        <replaceable>number</replaceable> iterations of
+        <link linkend="pgbench-metacommand-while"><literal>\while</literal></link>
+        loops in total.  This protects against scripts looping forever.
+        The default value is 1000000.  Setting it to 0 disables the check,
+        in which case a script can loop forever.
+       </para>
+      </listitem>
+     </varlistentry>
+
      <varlistentry id="pgbench-option-max-tries">
       <term><option>--max-tries=<replaceable>number_of_tries</replaceable></option></term>
       <listitem>
@@ -1275,6 +1289,49 @@ SELECT 4 AS four \; SELECT 5 AS five \aset
       Conditional expressions are identical to those with <literal>\set</literal>,
       with non-zero values interpreted as true.
      </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry id="pgbench-metacommand-while">
+    <term><literal>\while</literal> <replaceable class="parameter">expression</replaceable></term>
+    <term><literal>\endwhile</literal></term>
+    <listitem>
+     <para>
+      This pair of commands implements a loop: the commands between
+      <literal>\while</literal> and the matching <literal>\endwhile</literal>
+      are executed repeatedly as long as the expression evaluates to true.
+      The expression is evaluated before each iteration and is identical to
+      those with <literal>\set</literal>, with non-zero values interpreted
+      as true.
+     </para>
+
+     <para>
+      Loops and conditional blocks can be nested within each other, but each
+      block must be properly contained within the enclosing one; for
+      instance, an <literal>\if</literal> block that is opened inside a loop
+      must be closed by <literal>\endif</literal> before the loop's
+      <literal>\endwhile</literal>.
+     </para>
+
+     <para>
+      To protect against scripts looping forever, the client is aborted when
+      a single script execution performs more loop iterations than allowed by
+      <option>--max-loop-iterations</option>.  Note that a loop that executes
+      no SQL command and no <literal>\sleep</literal> cannot be interrupted
+      before reaching that limit, not even when the run duration given by
+      <option>-T</option> is over.
+     </para>
+
+     <para>
+      Example, inserting a random number of order lines one by one:
+<programlisting>
+\set ol_cnt random(5, 15)
+\set i 1
+\while :i &lt;= :ol_cnt
+  INSERT INTO order_line VALUES (:order_id, :i, random(1, 100000));
+  \set i :i + 1
+\endwhile
+</programlisting></para>
     </listitem>
    </varlistentry>
 

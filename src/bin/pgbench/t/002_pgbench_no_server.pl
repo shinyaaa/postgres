@@ -193,6 +193,11 @@ my @options = (
 		[qr{invalid number of maximum tries: "-10"}]
 	],
 	[
+		'bad maximum number of loop iterations',
+		'--max-loop-iterations -1',
+		[qr{invalid number of maximum loop iterations: "-1"}]
+	],
+	[
 		'an infinite number of tries',
 		'--max-tries 0',
 		[
@@ -311,6 +316,46 @@ my @script_tests = (
 		'endif syntax error',
 		[qr{unexpected argument in command "endif"}],
 		{ 'endif-bad.sql' => "\\if 0\n\\endif BAD\n" }
+	],
+	[
+		'missing endwhile',
+		[qr{\\while without matching \\endwhile}],
+		{ 'while-noendwhile.sql' => "\\while 1\n" }
+	],
+	[
+		'missing while on endwhile',
+		[qr{\\endwhile without matching \\while}],
+		{ 'endwhile-nowhile.sql' => "\\endwhile\n" }
+	],
+	[
+		'endif closing a while block',
+		[qr{\\endif inside \\while block}],
+		{ 'while-endif.sql' => "\\if 1\n\\while 1\n\\endif\n\\endwhile\n" }
+	],
+	[
+		'endwhile closing an if block',
+		[qr{\\endwhile inside \\if block}],
+		{ 'if-endwhile.sql' => "\\while 1\n\\if 1\n\\endwhile\n\\endif\n" }
+	],
+	[
+		'elif inside a while block',
+		[qr{\\elif inside \\while block}],
+		{ 'while-elif.sql' => "\\if 0\n\\while 1\n\\elif 1\n\\endwhile\n\\endif\n" }
+	],
+	[
+		'else inside a while block',
+		[qr{\\else inside \\while block}],
+		{ 'while-else.sql' => "\\if 0\n\\while 1\n\\else\n\\endwhile\n\\endif\n" }
+	],
+	[
+		'while syntax error',
+		[qr{syntax error in command "while"}],
+		{ 'while-bad.sql' => "\\while\n\\endwhile\n" }
+	],
+	[
+		'endwhile syntax error',
+		[qr{unexpected argument in command "endwhile"}],
+		{ 'endwhile-bad.sql' => "\\while 0\n\\endwhile BAD\n" }
 	],
 	[
 		'not enough arguments for least',
