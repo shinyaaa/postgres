@@ -409,15 +409,24 @@ TAP テストの注意: `PostgreSQL::Test::Cluster::psql` に `stdin` パラメ�
 | narrow, img のみ非圧縮(プロトタイプ) | 245.1MB | 409.4MB | **+67%** → ポリシー1の根拠 |
 | wide, zstd のみ(img なし) | 612.1MB | 611.9MB | ±0% → 「タプルデータは非圧縮」の実証 |
 
-### 7.2 実行時間(home0102 / NVMe、3反復中央値、ばらつき約1%)
+### 7.2 実行時間(home0102 / NVMe、最終計測 = 製品版そのもの、3反復中央値)
 
-| ケース | 変化 | 備考 |
-|---|---|---|
-| wide img+lz4 j1 | 1.263→1.095s (**−13.3%**) | WAL write+fsync 待ち 320ms→71ms、圧縮CPU <100ms |
-| wide img+lz4 j4 | 0.724→0.450s (**−37.8%**) | LWLock:WALWrite サンプル 48→15、wal_buffers_full 65k→0 |
-| wide img+zstd j1 | **+34% 退行** | 同じ削減に ~500ms の圧縮CPU → lz4 推奨の根拠 |
-| rand img+lz4 j1(バックオフ前) | +21% | プロトタイプの毎ページ試行 |
-| rand img+lz4 j1(バックオフ後・見込み) | 約+2% | 試行 1/32 ページ。最終計測で確認予定 |
+`results/2026-07-08-phase2-final-home0102/report.md` が -hackers 用の確定値。
+
+| ケース(lz4) | WAL bytes | elapsed | 備考 |
+|---|---|---|---|
+| narrow j1 | −22.1% | **+13.2%**(1.775→2.009s) | 唯一の実退行。narrow は CPU バウンド(WAL 待ちは elapsed の~7%)で、圧縮が毎回勝つため CPU を払い続ける |
+| narrow j4 | −22.2% | **+8.0%**(0.664→0.717s) | 同上(j4 の反復ばらつきは最大8%でこの値はやや粗い) |
+| wide j1 | −80.2% | **−11.9%**(1.263→1.113s) | WAL fsync 278→63ms、write 45→9ms |
+| wide j4 | −80.3% | **−38.0%**(0.726→0.450s) | LWLock:WALWrite サンプル 69→15、wal_buffers_full 68k→0 |
+| rand j1 | −0.03% | +0.4% | バックオフ動作(採用イメージ0、Heap2 FPI 0バイト)。目標 +2% 以内 → **チェック4 PASS** |
+| rand j4 | −0.03% | −1.1% | ノイズ範囲 |
+| wide j1 zstd | −83.7% | +35.2% | lz4 推奨の根拠(削減率の上積み3.5ptに圧縮CPUが見合わない) |
+| wide j4 zstd | −83.8% | −13.2% | 並列だと勝つが lz4(−38%)に大きく劣る |
+
+**無退行チェック(チェック3)**: images=on + `wal_compression=off` は対照と
+elapsed ±0.3%・wal_bytes ±0.0003%・wal_fpi 完全一致(ヒントFPIのみ)で
+**厳密に no-op — PASS**。プロトタイプの +67% バイト増はポリシー1で解消。
 
 ---
 
@@ -433,6 +442,15 @@ TAP テストの注意: `PostgreSQL::Test::Cluster::psql` に `stdin` パラメ�
   小さい。
 - **バックオフ定数(3/32)は経験的**: テーブル内で圧縮性が細かく変動する
   データでは追従が粗い可能性。-hackers での議論点。
+- **narrow テーブルのトレード(default on の最大の論点)**: 圧縮が
+  「勝つ」データでも、そのワークロードが WAL 待ちでない(CPU バウンド)
+  場合は圧縮 CPU が純コストになる(narrow lz4 で WAL −22% ⇔ elapsed
+  +13.2%/j1)。バックオフは「負け」にしか反応しないため、この形の退行は
+  抑止できない。default on を維持する論拠は (a) `wal_compression` 設定済み
+  環境のみで発動(CPU で WAL を買うことへのオプトイン済み)、(b) 逆側の
+  ワークロードでは −38% elapsed / −80% bytes、(c) 最悪ケースが有界で
+  GUC 一つで退避可能、の3点。レビューで厳しければ default off +
+  文書推奨に後退する(機構は不変)。
 - **残タスク**:
   1. home0102 での最終計測(特に「GUC on + `wal_compression=off` が対照と
      完全一致」の無退行チェックと、バックオフ残留コストの実測)
