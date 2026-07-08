@@ -41,7 +41,10 @@
 #                               eligible under wal_level=minimal)
 #                 newrel_freeze same as newrel but COPY (FREEZE)
 #     wal_compression: off | pglz | lz4 | zstd
-#     width:      narrow (2x bigint) | wide (bigint + 1000-char text)
+#     width:      narrow (2x bigint) | wide (bigint + 1000-char text) |
+#                 rand (like wide, but the payload is base64 of /dev/urandom:
+#                 a low-compressibility bound for the compression cases;
+#                 uses SCALE_WIDE)
 #     jobs:       number of concurrent COPY sessions (<= MAX_JOBS)
 #     wal_buffers: optional, defaults to 16MB (the auto-tuned cap)
 #     images:     optional on|off (default off); sets the Phase 2 prototype
@@ -93,7 +96,19 @@ gen_data()
 			continue
 		fi
 		log "generating $f ($per_chunk rows)"
-		if [ "$width" = narrow ]; then
+		if [ "$width" = rand ]; then
+			# ~985 base64 chars per row; ~6 bits of entropy per payload
+			# byte, so roughly incompressible for LZ-class compressors
+			# (no repeats to find).  The raw byte count is sized (and
+			# rounded down to a 3-byte base64 group) so the wrapped
+			# stream is exactly per_chunk lines: truncating with
+			# head -n here would SIGPIPE base64 and trip pipefail.
+			local raw=$((per_chunk * 985 * 3 / 4))
+			raw=$((raw - raw % 3))
+			head -c "$raw" /dev/urandom | base64 -w 985 \
+				| awk -v n=$per_chunk -v seed=$chunk \
+					'{ printf "%d\t%s\n", seed * n + NR, $0 }' > "$f"
+		elif [ "$width" = narrow ]; then
 			awk -v n=$per_chunk -v seed=$chunk 'BEGIN {
 				for (i = 1; i <= n; i++)
 					printf "%d\t%d\n", seed * n + i, (seed * n + i) * 17 % 1000000007
@@ -427,8 +442,21 @@ log "output: $OUTDIR"
 	echo "nproc=$(nproc)"
 } > "$OUTDIR/meta.txt"
 
-gen_data narrow "$SCALE_NARROW"
-gen_data wide "$SCALE_WIDE"
+if [ -n "${CASES_FILE:-}" ]; then
+	cases=$(grep -v '^\s*#' "$CASES_FILE" | grep -v '^\s*$')
+else
+	cases=$(default_cases | grep -v '^\s*#' | grep -v '^\s*$' | sed 's/^\s*//')
+fi
+
+# wide is always needed: warmup() uses it to pre-allocate WAL segments
+for width in $( { echo wide; echo "$cases" | awk -F'|' '{ print $5 }'; } | sort -u)
+do
+	if [ "$width" = narrow ]; then
+		gen_data narrow "$SCALE_NARROW"
+	else
+		gen_data "$width" "$SCALE_WIDE"
+	fi
+done
 
 trap server_stop EXIT
 init_cluster
@@ -436,12 +464,6 @@ warmup
 
 echo "name,wal_level,mode,compression,width,jobs,wal_buffers,images,rows,elapsed_s,rows_per_s,wal_records,wal_fpi,wal_bytes,wal_fpi_bytes,wal_bytes_per_row,wal_to_heap_ratio,wal_MB_per_s,wal_buffers_full,wal_io_writes,wal_io_write_time_ms,wal_io_fsyncs,wal_io_fsync_time_ms,heap_bytes" \
 	> "$OUTDIR/summary.csv"
-
-if [ -n "${CASES_FILE:-}" ]; then
-	cases=$(grep -v '^\s*#' "$CASES_FILE" | grep -v '^\s*$')
-else
-	cases=$(default_cases | grep -v '^\s*#' | grep -v '^\s*$' | sed 's/^\s*//')
-fi
 
 while IFS='|' read -r name wal_level mode compression width jobs walbuf images
 do

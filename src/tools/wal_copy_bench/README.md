@@ -26,7 +26,9 @@ PGBIN=/path/to/install/bin ./run_bench.sh [output_dir]
 ```
 
 Useful knobs (environment variables): `SCALE_NARROW` (default 5M rows),
-`SCALE_WIDE` (default 300k rows of ~1KB), `MAX_JOBS` (default 4),
+`SCALE_WIDE` (default 300k rows of ~1KB; also used by the `rand` width,
+a low-compressibility variant available via `CASES_FILE` — base64 of
+/dev/urandom, for bounding the compression cases), `MAX_JOBS` (default 4),
 `BENCH_ROOT` (scratch dir, default `/tmp/wal_copy_bench`), `FSYNC`,
 `SAMPLE_SEC`, `CASES_FILE` (custom case matrix; format documented in the
 script header).
