@@ -189,6 +189,12 @@ GRANT SELECT ON TABLE g1 TO regress_graph_user2;
 GRANT INSERT ON TABLE g1 TO regress_graph_user2;  -- warning, grants nothing
 SELECT has_table_privilege('regress_graph_user2', 'g1', 'INSERT');  -- false
 RESET ROLE;
+-- a property graph with no explicit ACL grants only SELECT to its owner
+CREATE PROPERTY GRAPH gpriv;
+ALTER PROPERTY GRAPH gpriv OWNER TO regress_graph_user1;
+SELECT has_table_privilege('regress_graph_user1', 'gpriv', 'SELECT') AS sel,
+       has_table_privilege('regress_graph_user1', 'gpriv', 'INSERT') AS ins;
+DROP PROPERTY GRAPH gpriv;
 
 -- collation
 

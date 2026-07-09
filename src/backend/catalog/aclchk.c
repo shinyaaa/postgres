@@ -3414,6 +3414,9 @@ pg_class_aclmask_ext(Oid table_oid, Oid roleid, AclMode mask,
 			case RELKIND_SEQUENCE:
 				acl = acldefault(OBJECT_SEQUENCE, ownerId);
 				break;
+			case RELKIND_PROPGRAPH:
+				acl = acldefault(OBJECT_PROPGRAPH, ownerId);
+				break;
 			default:
 				acl = acldefault(OBJECT_TABLE, ownerId);
 				break;
