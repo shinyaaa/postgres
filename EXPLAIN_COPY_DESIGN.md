@@ -23,6 +23,74 @@
   先行パッチに切り出すと、in-tree の呼び出し元が存在しない dead code に
   なるため、それを使う機能と同じパッチに含める。
 
+## 設計根拠: なぜ COPY (VERBOSE) オプションではなく EXPLAIN 拡張か
+
+対抗案は「COPY にオプション(例: `COPY ... WITH (VERBOSE)`)を追加し、
+完了時に NOTICE で内訳を出す」である。UI 層以外(計測コード = 0004 の
+本体)は両案で共通であり、これは計測結果をどの機構に載せるかの選択で
+ある。以下の理由で EXPLAIN を採る。
+
+### 積極的根拠
+
+1. **実行統計の取得は EXPLAIN ANALYZE の責務、という既存の役割分担**。
+   INSERT / UPDATE / DELETE / MERGE / CTAS の実行統計はすべて
+   EXPLAIN ANALYZE で取る。COPY FROM は意味的にはバルク INSERT であり
+   (WHERE 句・トリガ・パーティションルーティングを持つ DML 的性格)、
+   これだけ別の入口になるのはユーザーのメンタルモデル
+   (「遅い文を調べる → EXPLAIN ANALYZE」)に反する。
+
+2. **構造化出力(FORMAT JSON/XML/YAML)が無償で手に入る**。
+   NOTICE は自由書式テキストで、監視ツールや解析ツールが機械可読に
+   取れず、文言変更が事実上の互換性破壊になる。EXPLAIN の JSON なら
+   フィールド追加が後方互換で行える。
+
+3. **既存 EXPLAIN オプション体系との直交な合成**。TIMING ON/OFF・
+   BUFFERS・WAL・SUMMARY・FORMAT がそのまま効き、計測オーバーヘッドの
+   制御語彙(TIMING OFF)も再発明不要。VERBOSE 案ではこれらを COPY
+   オプションとして重複定義していくことになる。
+
+4. **出力チャネルの問題**。COPY の結果はコマンドタグのみで行を返す場所が
+   なく、VERBOSE 案は必然的に NOTICE/ログになる。NOTICE はドライバに
+   よって扱いが異なり、捨てられることもある。EXPLAIN は結果セットとして
+   返すため全クライアントで一様に扱える。リグレッションテストも
+   explain_filter 等の既存基盤に乗る。
+
+5. **COPY (query) TO のプラン表示は EXPLAIN でしか成立しない**。内包
+   クエリの実行計画を NOTICE に吐くのは auto_explain のログ形式問題の
+   再来である。TO/FROM を一貫した UI で扱うなら EXPLAIN 側しかない。
+
+6. **「実行しないで確認」(非 ANALYZE)が自然に手に入る**。COPY
+   オプション案には「実行しない COPY」という概念がなく、dry-run 相当を
+   別途発明する必要がある。
+
+7. **副作用と計測の意味論が確立済み**。「EXPLAIN ANALYZE は実際に実行
+   する」は INSERT/CTAS で周知・文書化済みで、COPY FROM にもそのまま
+   適用できる。
+
+### 対抗案の利点と反論
+
+- **STDIN が計測できない(EXPLAIN 案の弱点)**: VERBOSE 案なら
+  COPY FROM STDIN でも動くのは事実。ただし (a) チューニング目的の計測は
+  サーバサイドファイル / PROGRAM での再現実験として行うのが通常で、
+  実運用ストリームの常時計測は progress ビューやログの領分、
+  (b) CopyFromInstrumentation はコマンド非依存に設計してあるため、
+  STDIN 込みの軽量サマリが将来必要になれば、同じ計測基盤の上に
+  log_verbosity 拡張等を後付けできる。**EXPLAIN 案は VERBOSE 案を排除
+  しないが、逆(NOTICE テキストから構造化出力・プラン表示へ)は
+  成り立たない**。
+- **VACUUM (VERBOSE) 等の前例がある**: VACUUM / CLUSTER は プランを
+  持たず、複数リレーションを対象にし得る純ユーティリティで、EXPLAIN の
+  対象になりようがない。COPY は半分(query TO)が文字どおりプランを持ち、
+  FROM も DML 的性格を持つ点で異なる。また VACUUM (VERBOSE) の出力が
+  機械可読でないことは長年の不満で、pg_stat_progress_vacuum や
+  log_autovacuum 系が別途必要になった経緯は、むしろ「VERBOSE テキストは
+  行き止まり」であることの証左。
+- **「EXPLAIN はプランの説明であり、プランのない COPY FROM は対象外」**:
+  EXPLAIN は既に NOTIFY / EXECUTE / DECLARE CURSOR / CTAS という
+  ユーティリティ文を扱っており(ExplainOneUtility)、実態は「文の実行
+  内容と実行統計の説明」である。プランノードを持たない文への内訳表示は
+  その自然な延長にある。
+
 実行意味論(シリーズとして最初に固定し、以後変更しない):
 
 | コマンド | ANALYZE なし | ANALYZE あり |
