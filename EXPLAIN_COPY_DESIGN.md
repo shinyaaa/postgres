@@ -422,16 +422,30 @@ src/test/regress/{sql,expected}/explain_copy.*
 
 ### 0004-2. 計測構造体と受け渡し
 
+計測フェーズを enum で定義し、位相別時間は enum で添字付けする配列で
+保持する(EXPLAIN 出力側・将来のフェーズ追加の双方で扱いやすい)。
+
 ```c
 /* src/include/commands/copy.h */
+
+/* COPY FROM の計測フェーズ */
+typedef enum CopyFromPhase
+{
+    COPY_FROM_PHASE_INPUT,      /* NextCopyFrom: 読込+パース+型変換
+                                 * (DEFAULT 式の評価を含む) */
+    COPY_FROM_PHASE_INSERT,     /* table_(multi_)insert / FDW insert */
+    COPY_FROM_PHASE_INDEX,      /* ExecInsertIndexTuples */
+} CopyFromPhase;
+
+#define COPY_FROM_NUM_PHASES  (COPY_FROM_PHASE_INDEX + 1)
+
 typedef struct CopyFromInstrumentation
 {
     bool        collect_timing; /* es->timing: 位相別時間を計測するか */
 
     /* collect_timing 時のみ更新 */
-    instr_time  input_time;     /* NextCopyFrom 合計(読込+パース+型変換) */
-    instr_time  insert_time;    /* table_(multi_)insert / FDW insert */
-    instr_time  index_time;     /* ExecInsertIndexTuples */
+    instr_time  phase_start;    /* 実行中フェーズの開始時刻 */
+    instr_time  phase_time[COPY_FROM_NUM_PHASES];   /* フェーズ別累積時間 */
 
     /* 常時更新(既存カウンタの転記) */
     uint64      excluded;       /* WHERE で除外された行数 */
@@ -453,29 +467,126 @@ void CopyFromSetInstrumentation(CopyFromState cstate,
 - セッターとフィールドは本パッチで初めて使われるため、リファクタリング
   パッチ(0001)には含めない(dead code を作らない)。
 
-### 0004-3. 計測ポイント(copyfrom.c)
+### 0004-3. 計測 API(スタート/ストップ)
 
-タイマーはすべて `if (cstate->instr && cstate->instr->collect_timing)` で
-ガードし、EXPLAIN 経由でない通常 COPY(instr == NULL)には**分岐 1 回以外の
-コストを一切追加しない**。
+呼び出し箇所(メインループとマルチ挿入フラッシュ)はいずれも copyfrom.c
+内だが、将来 copyfromparse.c での read 時間細分化にも使えるよう、
+copyfrom_internal.h に static inline で定義する。
 
-1. **input_time**: メインループの NextCopyFrom 呼び出し
-   (copyfrom.c:1151)を INSTR_TIME_SET_CURRENT 対で挟む。
-   - 計測点が CopyFromRoutine->CopyFromOneRow のコールバック境界に一致
-     するため、text/csv/binary だけでなくカスタムフォーマットも計測される。
-   - ON_ERROR でスキップされる行のパースコストも含まれる(入力時間の
-     一部として妥当)。
-2. **insert_time / index_time**(2 経路):
-   - 単一挿入経路: table_tuple_insert(copyfrom.c:1429)と
-     ExecForeignInsert(copyfrom.c:1411)を insert_time で、
-     ExecInsertIndexTuples(copyfrom.c:1433)を index_time で挟む。
-   - マルチ挿入経路: CopyMultiInsertBufferFlush 内の
-     table_multi_insert(copyfrom.c:556)を insert_time で、
-     ExecInsertIndexTuples(copyfrom.c:576)を index_time で挟む
-     (miinfo->cstate から instr に到達可能)。
-   - フラッシュ内の AFTER ROW トリガ処理はタイマーの外に置き、トリガ
-     計測(下記)に委ねる。
-3. **トリガ**: EXPLAIN ANALYZE の既存トリガ計測機構を再利用する。
+```c
+/* src/include/commands/copyfrom_internal.h */
+
+/*
+ * フェーズ計測の開始。計測が無効(instr == NULL または timing off)なら
+ * 何もしない。フェーズはネスト不可(単一の phase_start を共有するため)。
+ */
+static inline void
+CopyFromInstrStartPhase(CopyFromState cstate)
+{
+    CopyFromInstrumentation *ci = cstate->instr;
+
+    if (ci == NULL || !ci->collect_timing)
+        return;
+    Assert(INSTR_TIME_IS_ZERO(ci->phase_start));    /* ネスト検出 */
+    INSTR_TIME_SET_CURRENT(ci->phase_start);
+}
+
+/*
+ * フェーズ計測の終了。経過時間を phase_time[phase] に加算する。
+ */
+static inline void
+CopyFromInstrStopPhase(CopyFromState cstate, CopyFromPhase phase)
+{
+    CopyFromInstrumentation *ci = cstate->instr;
+    instr_time  now;
+
+    if (ci == NULL || !ci->collect_timing)
+        return;
+    INSTR_TIME_SET_CURRENT(now);
+    INSTR_TIME_ACCUM_DIFF(ci->phase_time[phase], now, ci->phase_start);
+    INSTR_TIME_SET_ZERO(ci->phase_start);           /* ネスト検出用 */
+}
+```
+
+設計上のポイント:
+
+- **ガードは関数内**に置き、呼び出し箇所は常に 1 行にする(ホットループの
+  可読性維持)。通常 COPY(instr == NULL)の追加コストは分岐 1 回のみ。
+- **start はフェーズ引数を取らない**。フェーズの区別が必要なのは累積先を
+  決める stop 側だけであり、start を軽くする。
+- **フェーズはネストしない**という不変条件を置く。3 フェーズの計測区間は
+  すべて逐次(NextCopyFrom → [flush: multi_insert → index] → 次行)で
+  重ならないため、単一の phase_start で足りる。誤用は
+  Assert(INSTR_TIME_IS_ZERO) がアサートビルドで検出する
+  (INSTR_TIME_SET_ZERO は数命令なので非アサートビルドでも許容)。
+- **エラー時の後始末は不要**。計測途中で ereport(ERROR) が起きた場合
+  (ON_ERROR stop のパースエラー等)は文全体が中断され EXPLAIN 出力自体が
+  行われないため、走りかけのフェーズ時間は捨てられるだけでよい。
+  ON_ERROR ignore のソフトエラーは NextCopyFrom が正常返却するので、
+  直後の stop が通常どおり実行される。
+
+### 0004-4. 計測ポイント(copyfrom.c への挿入箇所)
+
+| フェーズ | start | stop | 箇所 |
+|---|---|---|---|
+| INPUT | NextCopyFrom 呼び出し直前 | 直後 | copyfrom.c:1151(メインループ) |
+| INSERT | table_tuple_insert 直前 | 直後 | copyfrom.c:1429(単一挿入) |
+| INSERT | ExecForeignInsert 直前 | 直後 | copyfrom.c:1411(FDW 単一挿入) |
+| INSERT | table_multi_insert 直前 | 直後 | copyfrom.c:556(フラッシュ) |
+| INDEX | ExecInsertIndexTuples 直前 | 直後 | copyfrom.c:1433(単一挿入) |
+| INDEX | ExecInsertIndexTuples 直前 | 直後 | copyfrom.c:576(フラッシュ内の行ループ) |
+
+挿入例(メインループ、copyfrom.c:1151):
+
+```c
+    CopyFromInstrStartPhase(cstate);
+    if (!NextCopyFrom(cstate, econtext, myslot->tts_values, myslot->tts_isnull))
+    {
+        CopyFromInstrStopPhase(cstate, COPY_FROM_PHASE_INPUT);
+        break;
+    }
+    CopyFromInstrStopPhase(cstate, COPY_FROM_PHASE_INPUT);
+```
+
+挿入例(フラッシュ内、copyfrom.c:556 / 576。cstate は
+miinfo->cstate から取得):
+
+```c
+    CopyFromInstrStartPhase(cstate);
+    table_multi_insert(resultRelInfo->ri_RelationDesc,
+                       slots, nused, mycid, ti_options, buffer->bistate);
+    CopyFromInstrStopPhase(cstate, COPY_FROM_PHASE_INSERT);
+
+    for (i = 0; i < nused; i++)
+    {
+        ...
+        CopyFromInstrStartPhase(cstate);
+        recheckIndexes = ExecInsertIndexTuples(...);
+        CopyFromInstrStopPhase(cstate, COPY_FROM_PHASE_INDEX);
+        ExecARInsertTriggers(...);      /* タイマー外(トリガ計測に委ねる) */
+        ...
+    }
+```
+
+計測意味論の注記:
+
+- INPUT は CopyFromRoutine->CopyFromOneRow のコールバック境界に一致する
+  ため、text/csv/binary だけでなくカスタムフォーマットも計測される。
+- INPUT には ON_ERROR でスキップされる行のパースコスト、および DEFAULT 式
+  の評価コストが含まれる。
+- INDEX のフラッシュ内計測は行単位の start/stop になるが、発生するのは
+  インデックスが存在する場合のみで、コストは INPUT タイマー(全行で発生)
+  と同オーダー以下。
+- 検討した代替案: 既存の instrument.c(InstrStartNode / InstrStopNode +
+  NodeInstrumentation)をフェーズごとに割り当てる案。フェーズ別
+  BufferUsage が将来ほぼ無償で得られる利点はあるが、firsttuple /
+  tuplecount 等プランノード前提の管理が不要に付いてくること、構造体が
+  EXPLAIN 出力側に対して過剰であることから、軽量な専用 API を採用した。
+  提案メールには代替案として記載する。
+
+### 0004-5. トリガ・カウンタの計測
+
+1. **トリガ**: EXPLAIN ANALYZE の既存トリガ計測機構を再利用する。
    - CopyFrom の初期化部で、instr 設定時に対象 ResultRelInfo の
      ri_TrigInstrument に InstrAlloc(numTriggers, INSTRUMENT_TIMER, false)
      を設定。パーティションルーティング時は resultRelInfo 切替ブロック
@@ -486,11 +597,11 @@ void CopyFromSetInstrumentation(CopyFromState cstate,
      result-relation 群から {トリガ名, リレーション名, calls, total time}
      を instr->triggers に集約する(EState は CopyFrom のローカルで
      あり解放されるため、ここで転記が必要)。
-4. **カウンタ**: excluded(copyfrom.c:1202 のローカル変数)と
+2. **カウンタ**: excluded(copyfrom.c:1202 のローカル変数)と
    cstate->num_errors を終了時に instr へ転記。処理行数は CopyFrom の
    戻り値を使用。
 
-### 0004-4. explain_copy.c の ANALYZE FROM 経路
+### 0004-6. explain_copy.c の ANALYZE FROM 経路
 
 ```c
 /* 0002 の ereport(ERROR) を置き換え */
@@ -531,7 +642,7 @@ extern 化して再利用する。トリガ出力は report_triggers(explain.c:7
 出力(ExplainOnePlan と同書式)。プランニングが存在しないため
 "Planning Time" は出力しない。
 
-### 0004-5. 出力設計
+### 0004-7. 出力設計
 
 TEXT(TIMING ON):
 
@@ -582,7 +693,7 @@ JSON:
    "Execution Time": 6543.210 }]
 ```
 
-### 0004-6. オーバーヘッドの見積りと緩和
+### 0004-8. オーバーヘッドの見積りと緩和
 
 - TIMING ON 時の追加コストは行あたり clock_gettime × 2(input)+
   単一挿入経路なら × 4。Linux vDSO で 1 回 20〜30ns として 10^7 行で
@@ -595,7 +706,7 @@ JSON:
   unpatched / patched+非EXPLAIN / ANALYZE+TIMING OFF / ANALYZE+TIMING ON を
   narrow(2 列)・wide(30 列)× 1000 万行で比較。
 
-### 0004-7. テスト
+### 0004-9. テスト
 
 ```
 \set filename :abs_builddir '/results/explain_copy.data'
@@ -615,7 +726,7 @@ ROLLBACK;
   (途中エラーでも壊れないこと)。
 - トランザクション内 ROLLBACK でデータが残らないこと。
 
-### 0004-8. 変更ファイル一覧
+### 0004-10. 変更ファイル一覧
 
 ```
 src/backend/commands/copyfrom.c            | タイマー挿入、セッター、トリガ集約
