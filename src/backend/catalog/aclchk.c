@@ -1891,6 +1891,28 @@ ExecGrant_Relation(InternalGrant *istmt)
 					this_privileges &= (AclMode) ACL_ALL_RIGHTS_SEQUENCE;
 				}
 			}
+			else if (pg_class_tuple->relkind == RELKIND_PROPGRAPH)
+			{
+				/*
+				 * Like for sequences, throw only a warning for privileges not
+				 * supported by property graphs when using the generic TABLE
+				 * GRANT syntax, so that the command can proceed for whichever
+				 * privileges are valid.
+				 */
+				if (this_privileges & ~((AclMode) ACL_ALL_RIGHTS_PROPGRAPH))
+				{
+					/*
+					 * Mention the object name because the user needs to know
+					 * which operations succeeded.  This is required because
+					 * WARNING allows the command to continue.
+					 */
+					ereport(WARNING,
+							(errcode(ERRCODE_INVALID_GRANT_OPERATION),
+							 errmsg("property graph \"%s\" only supports SELECT privileges",
+									NameStr(pg_class_tuple->relname))));
+					this_privileges &= (AclMode) ACL_ALL_RIGHTS_PROPGRAPH;
+				}
+			}
 			else
 			{
 				if (this_privileges & ~((AclMode) ACL_ALL_RIGHTS_RELATION))
@@ -1995,6 +2017,9 @@ ExecGrant_Relation(InternalGrant *istmt)
 			{
 				case RELKIND_SEQUENCE:
 					objtype = OBJECT_SEQUENCE;
+					break;
+				case RELKIND_PROPGRAPH:
+					objtype = OBJECT_PROPGRAPH;
 					break;
 				default:
 					objtype = OBJECT_TABLE;

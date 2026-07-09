@@ -184,6 +184,10 @@ ALTER PROPERTY GRAPH g1 OWNER TO regress_graph_user1;
 SET ROLE regress_graph_user1;
 GRANT SELECT ON PROPERTY GRAPH g1 TO regress_graph_user2;
 GRANT UPDATE ON PROPERTY GRAPH g1 TO regress_graph_user2;  -- fail
+-- property graphs only support SELECT, even via the generic TABLE syntax
+GRANT SELECT ON TABLE g1 TO regress_graph_user2;
+GRANT INSERT ON TABLE g1 TO regress_graph_user2;  -- warning, grants nothing
+SELECT has_table_privilege('regress_graph_user2', 'g1', 'INSERT');  -- false
 RESET ROLE;
 
 -- collation

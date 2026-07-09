@@ -236,6 +236,16 @@ SET ROLE regress_graph_user1;
 GRANT SELECT ON PROPERTY GRAPH g1 TO regress_graph_user2;
 GRANT UPDATE ON PROPERTY GRAPH g1 TO regress_graph_user2;  -- fail
 ERROR:  invalid privilege type UPDATE for property graph
+-- property graphs only support SELECT, even via the generic TABLE syntax
+GRANT SELECT ON TABLE g1 TO regress_graph_user2;
+GRANT INSERT ON TABLE g1 TO regress_graph_user2;  -- warning, grants nothing
+WARNING:  property graph "g1" only supports SELECT privileges
+SELECT has_table_privilege('regress_graph_user2', 'g1', 'INSERT');  -- false
+ has_table_privilege 
+---------------------
+ f
+(1 row)
+
 RESET ROLE;
 -- collation
 CREATE TABLE tc1 (a int, b text);
