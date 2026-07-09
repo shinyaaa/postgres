@@ -7232,7 +7232,8 @@ getTables(Archive *fout, int *numTables)
 						 "c.reloftype, "
 						 "c.relacl, "
 						 "acldefault(CASE WHEN c.relkind = " CppAsString2(RELKIND_SEQUENCE)
-						 " THEN 's'::\"char\" ELSE 'r'::\"char\" END, c.relowner) AS acldefault, "
+						 " THEN 's'::\"char\" WHEN c.relkind = " CppAsString2(RELKIND_PROPGRAPH)
+						 " THEN 'g'::\"char\" ELSE 'r'::\"char\" END, c.relowner) AS acldefault, "
 						 "CASE WHEN c.relkind = " CppAsString2(RELKIND_FOREIGN_TABLE) " THEN "
 						 "(SELECT ftserver FROM pg_catalog.pg_foreign_table WHERE ftrelid = c.oid) "
 						 "ELSE 0 END AS foreignserver, "

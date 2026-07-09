@@ -1066,6 +1066,7 @@ SELECT has_function_privilege('joeuser', 'myfunc(int, text)', 'execute');
         'c' for <literal>COLUMN</literal>,
         'r' for <literal>TABLE</literal> and table-like objects,
         's' for <literal>SEQUENCE</literal>,
+        'g' for <literal>PROPERTY GRAPH</literal>,
         'd' for <literal>DATABASE</literal>,
         'f' for <literal>FUNCTION</literal> or <literal>PROCEDURE</literal>,
         'l' for <literal>LANGUAGE</literal>,
