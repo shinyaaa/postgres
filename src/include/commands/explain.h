@@ -88,4 +88,7 @@ extern void ExplainQueryText(ExplainState *es, QueryDesc *queryDesc);
 extern void ExplainQueryParameters(ExplainState *es,
 								   ParamListInfo params, int maxlen);
 
+extern void show_buffer_usage(ExplainState *es, const BufferUsage *usage);
+extern void show_wal_usage(ExplainState *es, const WalUsage *usage);
+
 #endif							/* EXPLAIN_H */

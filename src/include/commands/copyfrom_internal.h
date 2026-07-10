@@ -189,7 +189,42 @@ typedef struct CopyFromStateData
 #define RAW_BUF_BYTES(cstate) ((cstate)->raw_buf_len - (cstate)->raw_buf_index)
 
 	uint64		bytes_processed;	/* number of bytes processed so far */
+
+	/* EXPLAIN ANALYZE instrumentation, or NULL */
+	CopyFromInstrumentation *instr;
 } CopyFromStateData;
+
+/*
+ * Start and stop helpers for the per-phase timing of EXPLAIN ANALYZE COPY
+ * FROM.  These are no-ops when no instrumentation is attached or timing is
+ * not requested, so calling them costs regular COPY only a branch.
+ *
+ * Phases never nest; the single shared start-time field both exploits and,
+ * with assertions enabled, verifies this.
+ */
+static inline void
+CopyFromInstrStartPhase(CopyFromState cstate)
+{
+	CopyFromInstrumentation *ci = cstate->instr;
+
+	if (ci == NULL || !ci->collect_timing)
+		return;
+	Assert(INSTR_TIME_IS_ZERO(ci->phase_start));
+	INSTR_TIME_SET_CURRENT(ci->phase_start);
+}
+
+static inline void
+CopyFromInstrStopPhase(CopyFromState cstate, CopyFromPhase phase)
+{
+	CopyFromInstrumentation *ci = cstate->instr;
+	instr_time	now;
+
+	if (ci == NULL || !ci->collect_timing)
+		return;
+	INSTR_TIME_SET_CURRENT(now);
+	INSTR_TIME_ACCUM_DIFF(ci->phase_time[phase], now, ci->phase_start);
+	INSTR_TIME_SET_ZERO(ci->phase_start);
+}
 
 extern void ReceiveCopyBegin(CopyFromState cstate);
 extern void ReceiveCopyBinaryHeader(CopyFromState cstate);

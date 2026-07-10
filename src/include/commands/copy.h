@@ -17,6 +17,7 @@
 #include "nodes/execnodes.h"
 #include "nodes/parsenodes.h"
 #include "parser/parse_node.h"
+#include "portability/instr_time.h"
 #include "tcop/dest.h"
 
 /*
@@ -99,6 +100,50 @@ typedef struct CopyFormatOptions
 	List	   *convert_select; /* list of column names (can be NIL) */
 } CopyFormatOptions;
 
+/*
+ * Execution phases of COPY FROM distinguished by EXPLAIN ANALYZE.
+ */
+typedef enum CopyFromPhase
+{
+	COPY_FROM_PHASE_INPUT,		/* reading, parsing and converting the input
+								 * data, including the evaluation of default
+								 * expressions */
+	COPY_FROM_PHASE_INSERT,		/* inserting tuples into the target table */
+	COPY_FROM_PHASE_INDEX,		/* updating indexes of the target table */
+} CopyFromPhase;
+
+#define COPY_FROM_NUM_PHASES	(COPY_FROM_PHASE_INDEX + 1)
+
+/* Per-trigger statistics collected for EXPLAIN ANALYZE COPY FROM */
+typedef struct CopyFromTriggerStats
+{
+	char	   *trigger_name;
+	char	   *constraint_name;	/* NULL if not a constraint trigger */
+	char	   *relation_name;
+	int64		firings;		/* number of times the trigger was fired */
+	instr_time	total;			/* total time spent in the trigger */
+} CopyFromTriggerStats;
+
+/*
+ * Instrumentation collected while executing COPY FROM under EXPLAIN
+ * ANALYZE.  Attach to a CopyFromState with CopyFromSetInstrumentation()
+ * between BeginCopyFrom() and CopyFrom().
+ */
+typedef struct CopyFromInstrumentation
+{
+	bool		collect_timing; /* collect per-phase timing? */
+
+	/* Updated only when collect_timing; see copyfrom_internal.h */
+	instr_time	phase_start;	/* start of the currently running phase */
+	instr_time	phase_time[COPY_FROM_NUM_PHASES];	/* accumulated time */
+
+	/* Filled in at the end of CopyFrom() */
+	uint64		excluded;		/* rows excluded by the WHERE clause */
+	uint64		skipped;		/* rows skipped because of ON_ERROR */
+	List	   *triggers;		/* list of CopyFromTriggerStats */
+	bool		show_relname;	/* qualify trigger names with the relation? */
+} CopyFromInstrumentation;
+
 /* These are private in commands/copy[from|to].c */
 typedef struct CopyFromStateData *CopyFromState;
 typedef struct CopyToStateData *CopyToState;
@@ -127,6 +172,8 @@ extern void CopyFromErrorCallback(void *arg);
 extern char *CopyLimitPrintoutLength(const char *str);
 
 extern uint64 CopyFrom(CopyFromState cstate);
+extern void CopyFromSetInstrumentation(CopyFromState cstate,
+									   CopyFromInstrumentation *instr);
 
 extern DestReceiver *CreateCopyDestReceiver(void);
 

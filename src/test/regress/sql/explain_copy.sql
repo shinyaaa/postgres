@@ -53,4 +53,100 @@ revoke all on explain_copy_tbl from regress_explain_copy;
 revoke all on explain_copy_rls from regress_explain_copy;
 drop role regress_explain_copy;
 drop table explain_copy_rls;
+
+--
+-- EXPLAIN ANALYZE COPY FROM executes the COPY and reports a breakdown of
+-- the execution.  (The timing values are not stable, so the breakdown
+-- itself is exercised with TIMING OFF, which omits it.)
+--
+\getenv abs_builddir PG_ABS_BUILDDIR
+\set filename :abs_builddir '/results/explain_copy.data'
+copy explain_copy_tbl to :'filename';
+
+create table explain_copy_target (a int, b text);
+create index explain_copy_target_idx on explain_copy_target (a);
+
+-- The File property of the output contains the absolute build directory
+-- path, so filter it out.
+create function explain_copy_filter(cmd text) returns setof text
+language plpgsql as
+$$
+declare
+    ln text;
+begin
+    for ln in execute cmd loop
+        ln := regexp_replace(ln, '(File|Program): .*', '\1: ...');
+        return next ln;
+    end loop;
+end;
+$$;
+
+begin;
+select explain_copy_filter(
+  'explain (analyze, timing off, summary off, buffers off) '
+  'copy explain_copy_target from ' || quote_literal(:'filename'));
+-- the data is actually loaded ...
+select count(*) from explain_copy_target;
+rollback;
+-- ... and was rolled back with the transaction
+select count(*) from explain_copy_target;
+
+-- rows excluded by the WHERE clause are reported
+begin;
+select explain_copy_filter(
+  'explain (analyze, timing off, summary off, buffers off) '
+  'copy explain_copy_target from ' || quote_literal(:'filename')
+  || ' where a > 1');
+rollback;
+
+-- trigger statistics are reported
+create function explain_copy_trigf() returns trigger language plpgsql
+  as $$ begin return new; end $$;
+create trigger explain_copy_trig before insert on explain_copy_target
+  for each row execute function explain_copy_trigf();
+begin;
+select explain_copy_filter(
+  'explain (analyze, timing off, summary off, buffers off) '
+  'copy explain_copy_target from ' || quote_literal(:'filename'));
+rollback;
+drop trigger explain_copy_trig on explain_copy_target;
+drop function explain_copy_trigf();
+
+-- rows skipped because of ON_ERROR are reported
+create table explain_copy_texts (a text, b text);
+insert into explain_copy_texts values ('1', 'one'), ('bogus', 'two'), ('3', 'three');
+\set badfile :abs_builddir '/results/explain_copy_bad.data'
+copy explain_copy_texts to :'badfile';
+begin;
+select explain_copy_filter(
+  'explain (analyze, timing off, summary off, buffers off) '
+  'copy explain_copy_target from ' || quote_literal(:'badfile')
+  || ' with (on_error ignore)');
+rollback;
+drop table explain_copy_texts;
+
+-- a partitioned table can be the target
+create table explain_copy_part (a int, b text) partition by range (a);
+create table explain_copy_part1 partition of explain_copy_part
+  for values from (0) to (2);
+create table explain_copy_part2 partition of explain_copy_part
+  for values from (2) to (100);
+begin;
+select explain_copy_filter(
+  'explain (analyze, timing off, summary off, buffers off) '
+  'copy explain_copy_part from ' || quote_literal(:'filename'));
+rollback;
+drop table explain_copy_part;
+
+-- ANALYZE cannot be used with COPY FROM STDIN
+explain (analyze) copy explain_copy_target from stdin;
+
+-- nor in a read-only transaction
+begin transaction read only;
+explain (analyze, timing off, summary off, buffers off)
+  copy explain_copy_target from :'filename';
+rollback;
+
+drop function explain_copy_filter(text);
+drop table explain_copy_target;
 drop table explain_copy_tbl;

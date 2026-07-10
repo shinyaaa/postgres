@@ -14,11 +14,13 @@
 #include "postgres.h"
 
 #include "access/table.h"
+#include "access/xact.h"
 #include "commands/copy.h"
 #include "commands/explain.h"
 #include "commands/explain_format.h"
 #include "commands/explain_state.h"
 #include "executor/instrument.h"
+#include "miscadmin.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
@@ -29,12 +31,18 @@
 static void ExplainCopyToQuery(const CopyStmt *stmt, RawStmt *raw_query,
 							   Oid queryRelId, ExplainState *es,
 							   ParseState *pstate, ParamListInfo params);
+static void ExplainCopyFromExec(const CopyStmt *stmt, Relation rel,
+								Node *whereClause,
+								const CopyFormatOptions *opts,
+								ExplainState *es, ParseState *pstate);
 static void ExplainCopyGeneric(const CopyStmt *stmt, Relation rel,
 							   const CopyFormatOptions *opts,
 							   ExplainState *es);
 static void show_copy_properties(const CopyStmt *stmt,
 								 const CopyFormatOptions *opts,
 								 ExplainState *es);
+static void show_copy_trigger_stats(const CopyFromInstrumentation *ci,
+									ExplainState *es);
 
 /*
  * ExplainCopyStmt -
@@ -67,11 +75,9 @@ ExplainCopyStmt(CopyStmt *stmt, ExplainState *es,
 	if (stmt->is_from)
 	{
 		if (es->analyze)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("EXPLAIN ANALYZE is not supported for COPY FROM")));
-
-		ExplainCopyGeneric(stmt, rel, &opts, es);
+			ExplainCopyFromExec(stmt, rel, whereClause, &opts, es, pstate);
+		else
+			ExplainCopyGeneric(stmt, rel, &opts, es);
 	}
 	else if (query != NULL)
 	{
@@ -179,6 +185,149 @@ ExplainCopyToQuery(const CopyStmt *stmt, RawStmt *raw_query, Oid queryRelId,
 				   (es->buffers ? &bufusage : NULL),
 				   (es->memory ? &mem_counters : NULL),
 				   stmt);
+}
+
+/*
+ * ExplainCopyFromExec -
+ *	  execute a COPY FROM statement under EXPLAIN ANALYZE and print the
+ *	  collected statistics, including the per-phase timing breakdown
+ */
+static void
+ExplainCopyFromExec(const CopyStmt *stmt, Relation rel, Node *whereClause,
+					const CopyFormatOptions *opts, ExplainState *es,
+					ParseState *pstate)
+{
+	CopyFromInstrumentation ci = {0};
+	CopyFromState cstate;
+	BufferUsage bufusage_start,
+				bufusage;
+	WalUsage	walusage_start,
+				walusage;
+	instr_time	starttime,
+				totaltime;
+	uint64		processed;
+
+	/*
+	 * COPY FROM STDIN cannot be executed under EXPLAIN: the CopyInResponse
+	 * protocol message would be sent while the client expects the result of
+	 * the EXPLAIN statement.
+	 */
+	if (stmt->filename == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("EXPLAIN ANALYZE cannot be used with COPY FROM STDIN"),
+				 errhint("Use COPY FROM a file or PROGRAM.")));
+
+	/* check read-only transaction, as the execution of COPY FROM would */
+	if (XactReadOnly && !rel->rd_islocaltemp)
+		PreventCommandIfReadOnly("COPY FROM");
+
+	ci.collect_timing = es->timing;
+
+	if (es->buffers)
+		bufusage_start = pgBufferUsage;
+	if (es->wal)
+		walusage_start = pgWalUsage;
+	INSTR_TIME_SET_CURRENT(starttime);
+
+	/* run the COPY as DoCopy would, with the instrumentation attached */
+	cstate = BeginCopyFrom(pstate, rel, whereClause, stmt->filename,
+						   stmt->is_program, NULL, stmt->attlist,
+						   stmt->options);
+	CopyFromSetInstrumentation(cstate, &ci);
+	processed = CopyFrom(cstate);
+	EndCopyFrom(cstate);
+
+	/* as in ExplainOnePlan, in case this is used in a multi-command string */
+	CommandCounterIncrement();
+
+	INSTR_TIME_SET_CURRENT(totaltime);
+	INSTR_TIME_SUBTRACT(totaltime, starttime);
+
+	/* calc differences of buffer and WAL counters */
+	if (es->buffers)
+	{
+		memset(&bufusage, 0, sizeof(BufferUsage));
+		BufferUsageAccumDiff(&bufusage, &pgBufferUsage, &bufusage_start);
+	}
+	if (es->wal)
+	{
+		memset(&walusage, 0, sizeof(WalUsage));
+		WalUsageAccumDiff(&walusage, &pgWalUsage, &walusage_start);
+	}
+
+	/* produce the output */
+	ExplainOpenGroup("Query", NULL, true, es);
+	ExplainOpenGroup("Copy From", "Copy From", true, es);
+
+	if (es->format == EXPLAIN_FORMAT_TEXT)
+	{
+		ExplainIndentText(es);
+		if (es->verbose)
+			appendStringInfo(es->str, "Copy From on %s.%s",
+							 quote_identifier(get_namespace_name(RelationGetNamespace(rel))),
+							 quote_identifier(RelationGetRelationName(rel)));
+		else
+			appendStringInfo(es->str, "Copy From on %s",
+							 quote_identifier(RelationGetRelationName(rel)));
+		appendStringInfo(es->str, " (actual rows=%" PRIu64 ")\n", processed);
+		es->indent++;
+	}
+	else
+	{
+		ExplainPropertyText("Relation Name",
+							RelationGetRelationName(rel), es);
+		if (es->verbose)
+			ExplainPropertyText("Schema",
+								get_namespace_name(RelationGetNamespace(rel)),
+								es);
+		ExplainPropertyUInteger("Actual Rows", NULL, processed, es);
+	}
+
+	show_copy_properties(stmt, opts, es);
+
+	/* the per-phase timing breakdown */
+	if (es->timing)
+	{
+		ExplainPropertyFloat("Input Time", "ms",
+							 INSTR_TIME_GET_MILLISEC(ci.phase_time[COPY_FROM_PHASE_INPUT]),
+							 3, es);
+		ExplainPropertyFloat("Insert Time", "ms",
+							 INSTR_TIME_GET_MILLISEC(ci.phase_time[COPY_FROM_PHASE_INSERT]),
+							 3, es);
+		ExplainPropertyFloat("Index Update Time", "ms",
+							 INSTR_TIME_GET_MILLISEC(ci.phase_time[COPY_FROM_PHASE_INDEX]),
+							 3, es);
+	}
+
+	if (whereClause != NULL)
+		ExplainPropertyUInteger("Rows Excluded by Filter", NULL,
+								ci.excluded, es);
+	if (opts->on_error != COPY_ON_ERROR_STOP)
+		ExplainPropertyUInteger("Rows Skipped", NULL, ci.skipped, es);
+
+	if (es->buffers)
+		show_buffer_usage(es, &bufusage);
+	if (es->wal)
+		show_wal_usage(es, &walusage);
+
+	if (es->format == EXPLAIN_FORMAT_TEXT)
+		es->indent--;
+
+	ExplainCloseGroup("Copy From", "Copy From", true, es);
+
+	/* Print info about runtime of triggers */
+	show_copy_trigger_stats(&ci, es);
+
+	/*
+	 * As in ExplainOnePlan, total execution time is only reported when
+	 * summary reporting is enabled.
+	 */
+	if (es->summary)
+		ExplainPropertyFloat("Execution Time", "ms",
+							 INSTR_TIME_GET_MILLISEC(totaltime), 3, es);
+
+	ExplainCloseGroup("Query", NULL, true, es);
 }
 
 /*
@@ -317,4 +466,69 @@ show_copy_properties(const CopyStmt *stmt, const CopyFormatOptions *opts,
 		ExplainPropertyText("On Error",
 							opts->on_error == COPY_ON_ERROR_IGNORE ?
 							"ignore" : "set_null", es);
+}
+
+/*
+ * show_copy_trigger_stats -
+ *	  print the per-trigger statistics collected by CopyFrom
+ *
+ * This mirrors the output of report_triggers() in explain.c, which cannot
+ * be used directly because the executor state of the COPY has already been
+ * destroyed by the time we get here.
+ */
+static void
+show_copy_trigger_stats(const CopyFromInstrumentation *ci, ExplainState *es)
+{
+	ListCell   *lc;
+
+	ExplainOpenGroup("Triggers", "Triggers", false, es);
+
+	foreach(lc, ci->triggers)
+	{
+		CopyFromTriggerStats *stats = (CopyFromTriggerStats *) lfirst(lc);
+
+		ExplainOpenGroup("Trigger", NULL, true, es);
+
+		/*
+		 * In text format, we avoid printing both the trigger name and the
+		 * constraint name unless VERBOSE is specified.  In non-text formats
+		 * we just print everything.
+		 */
+		if (es->format == EXPLAIN_FORMAT_TEXT)
+		{
+			if (es->verbose || stats->constraint_name == NULL)
+				appendStringInfo(es->str, "Trigger %s", stats->trigger_name);
+			else
+				appendStringInfoString(es->str, "Trigger");
+			if (stats->constraint_name)
+				appendStringInfo(es->str, " for constraint %s",
+								 stats->constraint_name);
+			if (ci->show_relname)
+				appendStringInfo(es->str, " on %s", stats->relation_name);
+			if (es->timing)
+				appendStringInfo(es->str, ": time=%.3f calls=%" PRId64 "\n",
+								 INSTR_TIME_GET_MILLISEC(stats->total),
+								 stats->firings);
+			else
+				appendStringInfo(es->str, ": calls=%" PRId64 "\n",
+								 stats->firings);
+		}
+		else
+		{
+			ExplainPropertyText("Trigger Name", stats->trigger_name, es);
+			if (stats->constraint_name)
+				ExplainPropertyText("Constraint Name", stats->constraint_name,
+									es);
+			ExplainPropertyText("Relation", stats->relation_name, es);
+			if (es->timing)
+				ExplainPropertyFloat("Time", "ms",
+									 INSTR_TIME_GET_MILLISEC(stats->total), 3,
+									 es);
+			ExplainPropertyInteger("Calls", NULL, stats->firings, es);
+		}
+
+		ExplainCloseGroup("Trigger", NULL, true, es);
+	}
+
+	ExplainCloseGroup("Triggers", "Triggers", false, es);
 }

@@ -147,8 +147,6 @@ static void show_instrumentation_count(const char *qlabel, int which,
 static void show_foreignscan_info(ForeignScanState *fsstate, ExplainState *es);
 static const char *explain_get_index_name(Oid indexId);
 static bool peek_buffer_usage(ExplainState *es, const BufferUsage *usage);
-static void show_buffer_usage(ExplainState *es, const BufferUsage *usage);
-static void show_wal_usage(ExplainState *es, const WalUsage *usage);
 static void show_memory_counters(ExplainState *es,
 								 const MemoryContextCounters *mem_counters);
 static void show_result_replacement_info(Result *result, ExplainState *es);
@@ -4295,7 +4293,7 @@ peek_buffer_usage(ExplainState *es, const BufferUsage *usage)
 /*
  * Show buffer usage details.  This better be sync with peek_buffer_usage.
  */
-static void
+void
 show_buffer_usage(ExplainState *es, const BufferUsage *usage)
 {
 	if (es->format == EXPLAIN_FORMAT_TEXT)
@@ -4464,7 +4462,7 @@ show_buffer_usage(ExplainState *es, const BufferUsage *usage)
 /*
  * Show WAL usage details.
  */
-static void
+void
 show_wal_usage(ExplainState *es, const WalUsage *usage)
 {
 	if (es->format == EXPLAIN_FORMAT_TEXT)

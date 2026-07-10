@@ -98,7 +98,7 @@ EXPLAIN [ ( <replaceable class="parameter">option</replaceable> [, ...] ) ] <rep
     <command>EXPLAIN ANALYZE</command> on an
     <command>INSERT</command>, <command>UPDATE</command>,
     <command>DELETE</command>, <command>MERGE</command>,
-    <command>CREATE TABLE AS</command>,
+    <command>CREATE TABLE AS</command>, <command>COPY FROM</command>,
     or <command>EXECUTE</command> statement
     without letting the command affect your data, use this approach:
 <programlisting>
@@ -371,6 +371,21 @@ ROLLBACK;
       executes the source query, but does not produce the
       <command>COPY</command> output: no file is written, and no data is
       sent to the client.
+     </para>
+     <para>
+      <command>EXPLAIN ANALYZE</command> of a <command>COPY FROM</command>
+      statement executes the <command>COPY</command> and actually loads the
+      data.  In addition to the row counts, it reports a breakdown of the
+      time spent reading, parsing and converting the input data
+      (<literal>Input Time</literal>), inserting tuples into the table
+      (<literal>Insert Time</literal>), and updating indexes
+      (<literal>Index Update Time</literal>), as well as trigger execution
+      times.  The time breakdown is omitted when <literal>TIMING
+      OFF</literal> is specified.  Time spent elsewhere, for example
+      evaluating the <literal>WHERE</literal> clause or routing tuples to
+      partitions, is included only in the total execution time.
+      <command>COPY FROM STDIN</command> cannot be executed under
+      <command>EXPLAIN ANALYZE</command>.
      </para>
     </listitem>
    </varlistentry>
