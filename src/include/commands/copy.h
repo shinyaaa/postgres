@@ -109,6 +109,10 @@ typedef void (*copy_data_dest_cb) (void *data, int len);
 extern void DoCopy(ParseState *pstate, const CopyStmt *stmt,
 				   int stmt_location, int stmt_len,
 				   uint64 *processed);
+extern void ProcessCopyTarget(ParseState *pstate, const CopyStmt *stmt,
+							  int stmt_location, int stmt_len,
+							  Relation *rel_p, Oid *relid_p,
+							  RawStmt **query_p, Node **whereClause_p);
 
 extern void ProcessCopyOptions(ParseState *pstate, CopyFormatOptions *opts_out, bool is_from, List *options);
 extern CopyFromState BeginCopyFrom(ParseState *pstate, Relation rel, Node *whereClause,
@@ -129,6 +133,7 @@ extern DestReceiver *CreateCopyDestReceiver(void);
 /*
  * internal prototypes
  */
+extern Query *CopyToTransformQuery(ParseState *pstate, RawStmt *raw_query);
 extern CopyToState BeginCopyTo(ParseState *pstate, Relation rel, RawStmt *raw_query,
 							   Oid queryRelId, const char *filename, bool is_program,
 							   copy_data_dest_cb data_dest_cb, List *attnamelist, List *options);
