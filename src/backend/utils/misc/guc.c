@@ -260,6 +260,7 @@ static void replace_auto_config_value(ConfigVariable **head_p, ConfigVariable **
 static bool valid_custom_variable_name(const char *name);
 static bool assignable_custom_variable_name(const char *name, bool skip_errors,
 											int elevel);
+static int	guc_name_ncompare(const char *namea, const char *nameb, size_t len);
 static void do_serialize(char **destptr, Size *maxbytes,
 						 const char *fmt, ...) pg_attribute_printf(3, 4);
 static bool call_bool_check_hook(const struct config_generic *conf, bool *newval,
@@ -1026,7 +1027,7 @@ assignable_custom_variable_name(const char *name, bool skip_errors, int elevel)
 			const char *rcprefix = lfirst(lc);
 
 			if (strlen(rcprefix) == classLen &&
-				strncmp(name, rcprefix, classLen) == 0)
+				guc_name_ncompare(name, rcprefix, classLen) == 0)
 			{
 				if (!skip_errors)
 					ereport(elevel,
@@ -1198,6 +1199,30 @@ guc_name_compare(const char *namea, const char *nameb)
 		return 1;				/* a is longer */
 	if (*nameb)
 		return -1;				/* b is longer */
+	return 0;
+}
+
+/*
+ * the same, but comparing no more than the first len bytes
+ * (like strncmp, but case-folding as guc_name_compare does)
+ */
+static int
+guc_name_ncompare(const char *namea, const char *nameb, size_t len)
+{
+	while (len-- > 0)
+	{
+		char		cha = *namea++;
+		char		chb = *nameb++;
+
+		if (cha >= 'A' && cha <= 'Z')
+			cha += 'a' - 'A';
+		if (chb >= 'A' && chb <= 'Z')
+			chb += 'a' - 'A';
+		if (cha != chb)
+			return cha - chb;
+		if (cha == '\0')
+			break;				/* both strings ended */
+	}
 	return 0;
 }
 
@@ -5200,7 +5225,7 @@ MarkGUCPrefixReserved(const char *className)
 		struct config_generic *var = hentry->gucvar;
 
 		if ((var->flags & GUC_CUSTOM_PLACEHOLDER) != 0 &&
-			strncmp(className, var->name, classLen) == 0 &&
+			guc_name_ncompare(className, var->name, classLen) == 0 &&
 			var->name[classLen] == GUC_QUALIFIER_SEPARATOR)
 		{
 			ereport(WARNING,

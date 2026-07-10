@@ -176,11 +176,13 @@ SET special."weird name" = 'foo';  -- could be allowed, but we choose not to
 SHOW special."weird name";
 
 -- Check what happens when you try to set a "custom" GUC within the
--- namespace of an extension.
-SET plpgsql.extra_foo_warnings = true;  -- allowed if plpgsql is not loaded yet
+-- namespace of an extension.  Reserved-prefix matching is case-insensitive,
+-- like all other GUC name comparisons, so use mixed case to verify that.
+SET "PLpgSQL".Extra_Foo_Warnings = true;  -- allowed if plpgsql is not loaded yet
 LOAD 'plpgsql';  -- this will throw a warning and delete the variable
 SET plpgsql.extra_foo_warnings = true;  -- now, it's an error
-SHOW plpgsql.extra_foo_warnings;
+SET "PLpgSQL".Extra_Foo_Warnings = true;  -- so is this, case-insensitively
+SHOW "PLpgSQL.Extra_Foo_Warnings";
 
 --
 -- Test DISCARD TEMP
