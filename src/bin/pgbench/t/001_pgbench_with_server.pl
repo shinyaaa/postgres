@@ -1221,6 +1221,105 @@ END;
 }
 	});
 
+# Working setup section: the setup part is run once, before the benchmark,
+# and variables set there are visible in all client sessions.
+my $setup_script = q{\setup
+DROP TABLE IF EXISTS pgbench_setup_test;
+CREATE TABLE pgbench_setup_test(id int primary key, val text);
+INSERT INTO pgbench_setup_test
+  SELECT i, 'val ' || i FROM generate_series(1, 10 * :scale) i;
+\set setup_nrows 10 * :scale
+\endsetup
+\set id random(1, :setup_nrows)
+SELECT val FROM pgbench_setup_test WHERE id = :id;
+};
+
+# Use -M prepared to check that setup commands are nonetheless executed
+# with the simple query protocol.
+$node->pgbench(
+	'-n -c2 -t3 -M prepared',
+	0,
+	[qr{processed: 6/6}],
+	[qr{running setup section of script .*001_pgbench_setup_section}],
+	'setup section is run before the benchmark',
+	{ '001_pgbench_setup_section' => $setup_script });
+
+is( $node->safe_psql('postgres', 'SELECT count(*) FROM pgbench_setup_test'),
+	'10',
+	'setup section created and filled the table');
+
+# With --skip-setup the setup section is not run, but the benchmark part
+# still works against the previously initialized data.
+$node->pgbench(
+	'-n -t1 --skip-setup',
+	0,
+	[qr{processed: 1/1}],
+	[qr{^$}],
+	'--skip-setup skips the setup section',
+	{ '001_pgbench_skip_setup' => $setup_script });
+
+# With --setup-only, only the setup section is run.
+$node->safe_psql('postgres', 'DROP TABLE pgbench_setup_test');
+$node->pgbench(
+	'-n --setup-only',
+	0,
+	[qr{^pgbench}],
+	[qr{running setup section of script .*001_pgbench_setup_only}],
+	'--setup-only runs only the setup section',
+	{ '001_pgbench_setup_only' => $setup_script });
+
+is( $node->safe_psql('postgres', 'SELECT count(*) FROM pgbench_setup_test'),
+	'10',
+	'--setup-only initialized the table');
+
+# A script containing only a setup section is never selected for execution,
+# so it can be combined with another script providing the benchmark part.
+$node->pgbench(
+	'-n -t5',
+	0,
+	[
+		qr{processed: 5/5},
+		qr{ - weight: 0 \(targets 0\.0% of total\)}
+	],
+	[qr{running setup section of script .*001_pgbench_setup_part}],
+	'setup-only script combined with a benchmark script',
+	{
+		'001_pgbench_setup_part' => q{\setup
+SELECT 1;
+\endsetup
+},
+		'001_pgbench_bench_part' => "SELECT 1;\n"
+	});
+
+# An error in a setup command is fatal.
+$node->pgbench(
+	'-n -t1',
+	1,
+	[qr{^pgbench}],
+	[
+		qr{setup command failed:},
+		qr{Query was: SELECT 1/0}
+	],
+	'error in a setup command',
+	{
+		'001_pgbench_setup_error' => q{\setup
+SELECT 1/0;
+\endsetup
+SELECT 1;
+}
+	});
+
+$node->safe_psql('postgres', 'DROP TABLE pgbench_setup_test');
+
+# --skip-setup and --setup-only are mutually exclusive.
+$node->pgbench(
+	'-n --skip-setup --setup-only',
+	1,
+	[qr{^$}],
+	[qr{--skip-setup and --setup-only cannot be used together}],
+	'--skip-setup with --setup-only',
+	{ '001_pgbench_setup_conflict' => "SELECT 1;\n" });
+
 # trigger many expression errors
 my @errors = (
 
@@ -1463,6 +1562,46 @@ SELECT LEAST(} . join(', ', (':i') x 256) . q{)}
 		2,
 		[qr{error storing into variable bad name!}],
 		q{SELECT 1 AS "bad name!" \gset}
+	],
+
+	# SETUP
+	[
+		'setup nested', 1,
+		[qr{\\setup sections cannot be nested}], q{\setup
+\setup}
+	],
+	[
+		'endsetup without setup', 1,
+		[qr{\\endsetup without matching \\setup}], q{\endsetup}
+	],
+	[
+		'setup without endsetup', 1,
+		[qr{\\setup without matching \\endsetup}], q{\setup
+SELECT 1;}
+	],
+	[
+		'setup inside if', 1,
+		[qr{\\setup is not allowed inside \\if}], q{\if true
+\setup
+\endsetup
+\endif}
+	],
+	[
+		'setup with unexpected argument', 1,
+		[qr{unexpected argument}], q{\setup foo
+\endsetup}
+	],
+	[
+		'setup with sleep', 1,
+		[qr{meta-command is not allowed in a setup section}], q{\setup
+\sleep 1
+\endsetup}
+	],
+	[
+		'setup with gset', 1,
+		[qr{meta-command is not allowed in a setup section}], q{\setup
+SELECT 1 \gset
+\endsetup}
 	],);
 
 for my $e (@errors)

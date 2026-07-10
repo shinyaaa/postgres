@@ -913,12 +913,40 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
       </listitem>
      </varlistentry>
 
+     <varlistentry id="pgbench-option-setup-only">
+      <term><option>--setup-only</option></term>
+      <listitem>
+       <para>
+        Run only the setup sections of the specified scripts, then exit
+        without running the benchmark itself.
+        See <xref linkend="pgbench-setup-sections"/> for more information.
+        This option cannot be used together with
+        <option>--skip-setup</option>.
+       </para>
+      </listitem>
+     </varlistentry>
+
      <varlistentry id="pgbench-option-show-script">
       <term><option>--show-script=</option><replaceable>scriptname</replaceable></term>
       <listitem>
        <para>
         Show the actual code of builtin script <replaceable>scriptname</replaceable>
         on stderr, and exit immediately.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry id="pgbench-option-skip-setup">
+      <term><option>--skip-setup</option></term>
+      <listitem>
+       <para>
+        Do not run the SQL commands of the setup sections of the specified
+        scripts.  This is useful to re-run a benchmark against data that
+        was already initialized by a previous run.
+        <literal>\set</literal> commands appearing in setup sections are
+        still evaluated, so that the variables they define remain available
+        to the rest of the script.
+        See <xref linkend="pgbench-setup-sections"/> for more information.
        </para>
       </listitem>
      </varlistentry>
@@ -1403,6 +1431,19 @@ SELECT 4 AS four \; SELECT 5 AS five \aset
     </listitem>
    </varlistentry>
 
+   <varlistentry id="pgbench-metacommand-setup">
+    <term><literal>\setup</literal></term>
+    <term><literal>\endsetup</literal></term>
+
+    <listitem>
+     <para>
+      This pair of commands delimits a <firstterm>setup section</firstterm>
+      of the script, which is run only once, before the benchmark proper
+      starts.  See <xref linkend="pgbench-setup-sections"/> for details.
+     </para>
+    </listitem>
+   </varlistentry>
+
    <varlistentry id="pgbench-metacommand-pipeline">
     <term><literal>\startpipeline</literal></term>
     <term><literal>\syncpipeline</literal></term>
@@ -1425,6 +1466,76 @@ SELECT 4 AS four \; SELECT 5 AS five \aset
    </varlistentry>
 
   </variablelist>
+
+  <refsect3 id="pgbench-setup-sections" xreflabel="Setup Sections">
+   <title>Setup Sections</title>
+
+   <para>
+    A script file may contain one or more <firstterm>setup
+    sections</firstterm>, delimited by the <literal>\setup</literal> and
+    <literal>\endsetup</literal> meta commands.  A setup section typically
+    creates and populates the tables that the rest of the script operates
+    on, so that a complete benchmark scenario &mdash; workload
+    initialization and the benchmarked transaction &mdash; can be
+    distributed as a single file.
+   </para>
+
+   <para>
+    The commands of setup sections are not part of the benchmarked
+    transaction.  Instead, they are executed only once, before the
+    benchmark starts, regardless of the number of clients and threads.
+    If several script files are specified, the setup sections are run
+    serially, in the order in which the scripts are given on the command
+    line.  An error in a setup command causes
+    <application>pgbench</application> to abort.
+   </para>
+
+   <para>
+    A setup section may contain SQL commands and <literal>\set</literal>
+    meta commands; other meta commands are not allowed.  SQL commands are
+    always sent using the simple query protocol, regardless of the
+    <option>-M</option> option, after replacing any
+    <literal>:</literal><replaceable>variablename</replaceable> references
+    as described above.  A variable assigned by a <literal>\set</literal>
+    command in a setup section is set in all client sessions, so it can be
+    referenced later by the benchmarked part of the script.
+   </para>
+
+   <para>
+    The <option>--setup-only</option> option can be used to run only the
+    setup sections, without running the benchmark itself; conversely,
+    <option>--skip-setup</option> skips the SQL commands of the setup
+    sections (<literal>\set</literal> commands are still evaluated), which
+    is useful to re-run a benchmark against already-initialized data.
+    A script that consists of only a setup section is never selected for
+    execution during the benchmark; this allows the initialization part
+    of a scenario to be kept in a separate file, e.g., combined with a
+    builtin script:
+<programlisting>
+pgbench -n -f setup_only_script.sql -b select-only ...
+</programlisting>
+   </para>
+
+   <para>
+    For example, a complete self-initializing scenario could look like:
+<programlisting>
+\setup
+DROP TABLE IF EXISTS test_data;
+CREATE TABLE test_data (id int PRIMARY KEY, val text);
+INSERT INTO test_data
+  SELECT i, 'value ' || i FROM generate_series(1, 100000 * :scale) i;
+\set nrows 100000 * :scale
+\endsetup
+
+\set id random(1, :nrows)
+SELECT val FROM test_data WHERE id = :id;
+</programlisting>
+    which can then be run with, e.g.:
+<programlisting>
+pgbench -n -f test_data.sql -c 10 -T 60 ...
+</programlisting>
+   </para>
+  </refsect3>
  </refsect2>
 
  <refsect2 id="pgbench-builtin-operators">

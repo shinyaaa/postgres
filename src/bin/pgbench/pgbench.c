@@ -709,6 +709,8 @@ typedef enum MetaCommand
 	META_STARTPIPELINE,			/* \startpipeline */
 	META_SYNCPIPELINE,			/* \syncpipeline */
 	META_ENDPIPELINE,			/* \endpipeline */
+	META_SETUP,					/* \setup */
+	META_ENDSETUP,				/* \endsetup */
 } MetaCommand;
 
 typedef enum QueryMode
@@ -767,6 +769,8 @@ typedef struct ParsedScript
 	const char *desc;			/* script descriptor (eg, file name) */
 	int			weight;			/* selection weight */
 	Command   **commands;		/* NULL-terminated array of Commands */
+	Command   **setup_commands; /* NULL-terminated array of setup section
+								 * Commands, or NULL if none */
 	StatsData	stats;			/* total time spent in script */
 } ParsedScript;
 
@@ -966,7 +970,9 @@ usage(void)
 		   "  --progress-timestamp     use Unix epoch timestamps for progress\n"
 		   "  --random-seed=SEED       set random seed (\"time\", \"rand\", integer)\n"
 		   "  --sampling-rate=NUM      fraction of transactions to log (e.g., 0.01 for 1%%)\n"
+		   "  --setup-only             run only the setup sections of scripts, then exit\n"
 		   "  --show-script=NAME       show builtin script code, then exit\n"
+		   "  --skip-setup             do not run the setup sections of scripts\n"
 		   "  --verbose-errors         print messages of all errors\n"
 		   "\nCommon options:\n"
 		   "  --debug                  print debugging output\n"
@@ -2899,6 +2905,10 @@ getMetaCommand(const char *cmd)
 		mc = META_SYNCPIPELINE;
 	else if (pg_strcasecmp(cmd, "endpipeline") == 0)
 		mc = META_ENDPIPELINE;
+	else if (pg_strcasecmp(cmd, "setup") == 0)
+		mc = META_SETUP;
+	else if (pg_strcasecmp(cmd, "endsetup") == 0)
+		mc = META_ENDSETUP;
 	else
 		mc = META_NONE;
 	return mc;
@@ -5404,6 +5414,101 @@ runInitSteps(const char *initialize_steps)
 }
 
 /*
+ * Run the setup section of each script, if any, before the benchmark proper
+ * starts.
+ *
+ * Setup commands are executed only once, serially, through the given
+ * connection, in the order the scripts were specified.  SQL commands are
+ * sent with the simple query protocol, after substituting any :variable
+ * references; a \set command is evaluated once and the resulting variable
+ * is assigned in all clients, so that it can be referenced later by the
+ * benchmark script proper.  Any error is fatal.
+ *
+ * With skip_sql (--skip-setup), SQL commands are skipped, but \set commands
+ * are still evaluated: they are client-side only and the benchmark part of
+ * the script may depend on the variables they define.
+ */
+static void
+runSetupScripts(PGconn *con, CState *state, int nclients, bool skip_sql)
+{
+	for (int i = 0; i < num_scripts; i++)
+	{
+		Command   **commands = sql_script[i].setup_commands;
+
+		if (commands == NULL)
+			continue;
+
+		if (!skip_sql)
+			fprintf(stderr, "running setup section of script \"%s\"...",
+					sql_script[i].desc);
+
+		for (int j = 0; commands[j] != NULL; j++)
+		{
+			Command    *command = commands[j];
+
+			if (command->type == SQL_COMMAND)
+			{
+				char	   *sql;
+				PGresult   *res;
+
+				if (skip_sql)
+					continue;
+
+				sql = pg_strdup(command->argv[0]);
+				sql = assignVariables(&state[0].variables, sql);
+
+				res = PQexec(con, sql);
+				switch (PQresultStatus(res))
+				{
+					case PGRES_COMMAND_OK:
+					case PGRES_TUPLES_OK:
+					case PGRES_EMPTY_QUERY:
+						break;
+					default:
+						fprintf(stderr, "\n");
+						pg_log_error("setup command failed: %s",
+									 PQerrorMessage(con));
+						pg_log_error_detail("Query was: %s", sql);
+						exit(1);
+				}
+				PQclear(res);
+				free(sql);
+			}
+			else
+			{
+				/* meta command; only \set is allowed in a setup section */
+				PgBenchValue result;
+
+				Assert(command->type == META_COMMAND &&
+					   command->meta == META_SET);
+
+				if (!evaluateExpr(&state[0], command->expr, &result))
+				{
+					if (!skip_sql)
+						fprintf(stderr, "\n");
+					pg_fatal("setup command failed: %s", command->first_line);
+				}
+
+				/* assign the variable in all clients */
+				for (int k = 0; k < nclients; k++)
+				{
+					if (!putVariableValue(&state[k].variables, "setup",
+										  command->argv[1], &result))
+					{
+						if (!skip_sql)
+							fprintf(stderr, "\n");
+						exit(1);
+					}
+				}
+			}
+		}
+
+		if (!skip_sql)
+			fprintf(stderr, " done.\n");
+	}
+}
+
+/*
  * Extract pgbench table information into global variables scale,
  * partition_method and partitions.
  */
@@ -5730,6 +5835,27 @@ postprocess_sql_command(Command *my_command)
 }
 
 /*
+ * Likewise, but for an SQL command belonging to a setup section.  Setup
+ * commands are always executed with the simple query protocol, regardless
+ * of the -M option.
+ */
+static void
+postprocess_setup_sql_command(Command *my_command)
+{
+	char		buffer[128];
+
+	Assert(my_command->type == SQL_COMMAND);
+
+	/* Save the first line for error display. */
+	strlcpy(buffer, my_command->lines.data, sizeof(buffer));
+	buffer[strcspn(buffer, "\n\r")] = '\0';
+	my_command->first_line = pg_strdup(buffer);
+
+	my_command->argv[0] = my_command->lines.data;
+	my_command->argc++;
+}
+
+/*
  * Parse a backslash command; return a Command struct, or NULL if comment
  *
  * At call, we have scanned only the initial backslash.
@@ -5911,7 +6037,9 @@ process_backslash_command(PsqlScanState sstate, const char *source,
 	else if (my_command->meta == META_ELSE || my_command->meta == META_ENDIF ||
 			 my_command->meta == META_STARTPIPELINE ||
 			 my_command->meta == META_ENDPIPELINE ||
-			 my_command->meta == META_SYNCPIPELINE)
+			 my_command->meta == META_SYNCPIPELINE ||
+			 my_command->meta == META_SETUP ||
+			 my_command->meta == META_ENDSETUP)
 	{
 		if (my_command->argc != 1)
 			syntax_error(source, lineno, my_command->first_line, my_command->argv[0],
@@ -6003,15 +6131,26 @@ ParseScript(const char *script, const char *desc, int weight)
 	PQExpBufferData line_buf;
 	int			alloc_num;
 	int			index;
+	Command   **setup_commands;
+	int			setup_alloc_num;
+	int			setup_index;
+	bool		in_setup = false;
+	int			setup_lineno = 0;
+	int			if_depth = 0;
 
 #define COMMANDS_ALLOC_NUM 128
 	alloc_num = COMMANDS_ALLOC_NUM;
+	setup_alloc_num = COMMANDS_ALLOC_NUM;
 
 	/* Initialize all fields of ps */
 	ps.desc = desc;
 	ps.weight = weight;
 	ps.commands = pg_malloc_array(Command *, alloc_num);
+	ps.setup_commands = NULL;	/* set later, if needed */
 	initStats(&ps.stats, 0);
+
+	setup_commands = pg_malloc_array(Command *, setup_alloc_num);
+	setup_index = 0;
 
 	/* Prepare to parse script */
 	sstate = psql_scan_create(&pgbench_callbacks);
@@ -6046,7 +6185,12 @@ ParseScript(const char *script, const char *desc, int weight)
 
 		/* store new command */
 		if (command)
-			ps.commands[index++] = command;
+		{
+			if (in_setup)
+				setup_commands[setup_index++] = command;
+			else
+				ps.commands[index++] = command;
+		}
 
 		/* If we reached a backslash, process that */
 		if (sr == PSCAN_BACKSLASH)
@@ -6064,10 +6208,54 @@ ParseScript(const char *script, const char *desc, int weight)
 			if (command)
 			{
 				/*
+				 * \setup and \endsetup are markers delimiting the setup
+				 * section of the script; they do not use a command slot.
+				 */
+				if (command->meta == META_SETUP)
+				{
+					if (in_setup)
+						syntax_error(desc, lineno, command->first_line,
+									 command->argv[0],
+									 "\\setup sections cannot be nested",
+									 NULL, -1);
+					if (if_depth > 0)
+						syntax_error(desc, lineno, command->first_line,
+									 command->argv[0],
+									 "\\setup is not allowed inside \\if",
+									 NULL, -1);
+					in_setup = true;
+					setup_lineno = lineno;
+					free_command(command);
+					continue;
+				}
+				else if (command->meta == META_ENDSETUP)
+				{
+					if (!in_setup)
+						syntax_error(desc, lineno, command->first_line,
+									 command->argv[0],
+									 "\\endsetup without matching \\setup",
+									 NULL, -1);
+					in_setup = false;
+					free_command(command);
+					continue;
+				}
+				else if (in_setup)
+				{
+					/* only \set is allowed in a setup section */
+					if (command->meta != META_SET)
+						syntax_error(desc, lineno, command->first_line,
+									 command->argv[0],
+									 "meta-command is not allowed in a setup section",
+									 NULL, -1);
+
+					setup_commands[setup_index++] = command;
+				}
+
+				/*
 				 * If this is gset or aset, merge into the preceding command.
 				 * (We don't use a command slot in this case).
 				 */
-				if (command->meta == META_GSET || command->meta == META_ASET)
+				else if (command->meta == META_GSET || command->meta == META_ASET)
 				{
 					Command    *cmd;
 
@@ -6099,8 +6287,17 @@ ParseScript(const char *script, const char *desc, int weight)
 					continue;
 				}
 
-				/* Attach any other backslash command as a new command */
-				ps.commands[index++] = command;
+				else
+				{
+					/* track \if nesting, to forbid \setup inside \if */
+					if (command->meta == META_IF)
+						if_depth++;
+					else if (command->meta == META_ENDIF && if_depth > 0)
+						if_depth--;
+
+					/* Attach any other backslash command as a new command */
+					ps.commands[index++] = command;
+				}
 			}
 		}
 
@@ -6115,13 +6312,39 @@ ParseScript(const char *script, const char *desc, int weight)
 			ps.commands = (Command **)
 				pg_realloc_array(ps.commands, Command *, alloc_num);
 		}
+		if (setup_index >= setup_alloc_num)
+		{
+			setup_alloc_num += COMMANDS_ALLOC_NUM;
+			setup_commands = (Command **)
+				pg_realloc_array(setup_commands, Command *, setup_alloc_num);
+		}
 
 		/* Done if we reached EOF */
 		if (sr == PSCAN_INCOMPLETE || sr == PSCAN_EOL)
 			break;
 	}
 
+	if (in_setup)
+		syntax_error(desc, setup_lineno, NULL, "setup",
+					 "\\setup without matching \\endsetup", NULL, -1);
+
 	ps.commands[index] = NULL;
+
+	if (setup_index > 0)
+	{
+		setup_commands[setup_index] = NULL;
+		ps.setup_commands = setup_commands;
+	}
+	else
+		pg_free(setup_commands);
+
+	/*
+	 * A script without benchmark commands (that is, containing only a setup
+	 * section) is never selected for execution, so exclude it from the
+	 * weighted script selection.
+	 */
+	if (index == 0)
+		ps.weight = 0;
 
 	addScript(&ps);
 
@@ -6290,7 +6513,8 @@ parseScriptWeight(const char *option, char **script)
 static void
 addScript(const ParsedScript *script)
 {
-	if (script->commands == NULL || script->commands[0] == NULL)
+	if ((script->commands == NULL || script->commands[0] == NULL) &&
+		script->setup_commands == NULL)
 		pg_fatal("empty command list for script \"%s\"", script->desc);
 
 	if (num_scripts >= MAX_SCRIPTS)
@@ -6778,6 +7002,8 @@ main(int argc, char **argv)
 		{"exit-on-abort", no_argument, NULL, 16},
 		{"debug", no_argument, NULL, 17},
 		{"continue-on-error", no_argument, NULL, 18},
+		{"skip-setup", no_argument, NULL, 19},
+		{"setup-only", no_argument, NULL, 20},
 		{NULL, 0, NULL, 0}
 	};
 
@@ -6793,6 +7019,8 @@ main(int argc, char **argv)
 	bool		benchmarking_option_set = false;
 	bool		initialization_option_set = false;
 	bool		internal_script_used = false;
+	bool		skip_setup = false; /* skip setup sections of scripts */
+	bool		setup_only = false; /* run only setup sections of scripts */
 
 	CState	   *state;			/* status of clients */
 	TState	   *threads;		/* array of thread */
@@ -7138,6 +7366,14 @@ main(int argc, char **argv)
 				benchmarking_option_set = true;
 				continue_on_error = true;
 				break;
+			case 19:			/* skip-setup */
+				benchmarking_option_set = true;
+				skip_setup = true;
+				break;
+			case 20:			/* setup-only */
+				benchmarking_option_set = true;
+				setup_only = true;
+				break;
 			default:
 				/* getopt_long already emitted a complaint */
 				pg_log_error_hint("Try \"%s --help\" for more information.", progname);
@@ -7162,11 +7398,16 @@ main(int argc, char **argv)
 			if (commands[j]->type == SQL_COMMAND)
 				postprocess_sql_command(commands[j]);
 
+		if ((commands = sql_script[i].setup_commands) != NULL)
+			for (int j = 0; commands[j] != NULL; j++)
+				if (commands[j]->type == SQL_COMMAND)
+					postprocess_setup_sql_command(commands[j]);
+
 		/* cannot overflow: weight is 32b, total_weight 64b */
 		total_weight += sql_script[i].weight;
 	}
 
-	if (total_weight == 0 && !is_init_mode)
+	if (total_weight == 0 && !is_init_mode && !setup_only)
 		pg_fatal("total script weight must not be zero");
 
 	/* show per script stats if several scripts are used */
@@ -7255,6 +7496,9 @@ main(int argc, char **argv)
 		if (initialization_option_set)
 			pg_fatal("some of the specified options cannot be used in benchmarking mode");
 	}
+
+	if (skip_setup && setup_only)
+		pg_fatal("--skip-setup and --setup-only cannot be used together");
 
 	if (nxacts > 0 && duration > 0)
 		pg_fatal("specify either a number of transactions (-t) or a duration (-T), not both");
@@ -7394,6 +7638,16 @@ main(int argc, char **argv)
 			if (!putVariableInt(&state[i].variables, "startup", "random_seed",
 								random_seed))
 				exit(1);
+	}
+
+	/* run setup sections of custom scripts, if any */
+	runSetupScripts(con, state, nclients, skip_setup);
+
+	/* if --setup-only is given, we are done */
+	if (setup_only)
+	{
+		PQfinish(con);
+		exit(0);
 	}
 
 	if (!is_no_vacuum)
