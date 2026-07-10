@@ -33,6 +33,7 @@ OBJS = \
 	dropcmds.o \
 	event_trigger.o \
 	explain.o \
+	explain_copy.o \
 	explain_dr.o \
 	explain_format.o \
 	explain_state.o \

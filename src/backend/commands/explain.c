@@ -377,7 +377,7 @@ standard_ExplainOneQuery(Query *query, int cursorOptions,
 	/* run it (if needed) and produce output */
 	ExplainOnePlan(plan, into, es, queryString, params, queryEnv,
 				   &planduration, (es->buffers ? &bufusage : NULL),
-				   es->memory ? &mem_counters : NULL);
+				   es->memory ? &mem_counters : NULL, NULL);
 }
 
 /*
@@ -467,6 +467,8 @@ ExplainOneUtility(Node *utilityStmt, IntoClause *into, ExplainState *es,
 	else if (IsA(utilityStmt, ExecuteStmt))
 		ExplainExecuteQuery((ExecuteStmt *) utilityStmt, into, es,
 							pstate, params);
+	else if (IsA(utilityStmt, CopyStmt))
+		ExplainCopyStmt(castNode(CopyStmt, utilityStmt), es, pstate, params);
 	else if (IsA(utilityStmt, NotifyStmt))
 	{
 		if (es->format == EXPLAIN_FORMAT_TEXT)
@@ -501,7 +503,8 @@ ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into, ExplainState *es,
 			   const char *queryString, ParamListInfo params,
 			   QueryEnvironment *queryEnv, const instr_time *planduration,
 			   const BufferUsage *bufusage,
-			   const MemoryContextCounters *mem_counters)
+			   const MemoryContextCounters *mem_counters,
+			   const CopyStmt *copystmt)
 {
 	DestReceiver *dest;
 	QueryDesc  *queryDesc;
@@ -604,6 +607,10 @@ ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into, ExplainState *es,
 
 	/* Create textual dump of plan tree */
 	ExplainPrintPlan(es, queryDesc);
+
+	/* Show details of the COPY statement, if we are explaining one */
+	if (copystmt)
+		ExplainPrintCopyInfo(copystmt, es);
 
 	/* Show buffer and/or memory usage in planning */
 	if (peek_buffer_usage(es, bufusage) || mem_counters)

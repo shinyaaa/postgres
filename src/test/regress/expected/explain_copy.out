@@ -1,0 +1,138 @@
+--
+-- Tests for EXPLAIN of COPY statements
+--
+create table explain_copy_tbl (a int, b text);
+insert into explain_copy_tbl values (1, 'one'), (2, 'two');
+-- Plain EXPLAIN does not execute the COPY, and does not access the
+-- source/destination file.
+explain copy explain_copy_tbl from '/no/such/file';
+          QUERY PLAN           
+-------------------------------
+ Copy From on explain_copy_tbl
+   Format: text
+   Source: file
+   File: /no/such/file
+(4 rows)
+
+explain (verbose) copy explain_copy_tbl to '/no/such/file' with (format binary);
+             QUERY PLAN             
+------------------------------------
+ Copy To on public.explain_copy_tbl
+   Format: binary
+   Target: file
+   File: /no/such/file
+(4 rows)
+
+explain copy explain_copy_tbl from stdin with (format csv, on_error ignore);
+          QUERY PLAN           
+-------------------------------
+ Copy From on explain_copy_tbl
+   Format: csv
+   Source: stdin
+   On Error: ignore
+(4 rows)
+
+explain copy explain_copy_tbl (a) from program '/no/such/program';
+          QUERY PLAN           
+-------------------------------
+ Copy From on explain_copy_tbl
+   Format: text
+   Source: program
+   Program: /no/such/program
+(4 rows)
+
+explain copy explain_copy_tbl to stdout;
+         QUERY PLAN          
+-----------------------------
+ Copy To on explain_copy_tbl
+   Format: text
+   Target: stdout
+(3 rows)
+
+-- The plan of the source query of COPY (query) TO is shown.
+explain (costs off) copy (select * from explain_copy_tbl where a > 0) to stdout;
+          QUERY PLAN          
+------------------------------
+ Seq Scan on explain_copy_tbl
+   Filter: (a > 0)
+ Copy To
+   Format: text
+   Target: stdout
+(5 rows)
+
+explain (costs off, format json) copy (select a from explain_copy_tbl) to stdout (format csv);
+                 QUERY PLAN                 
+--------------------------------------------
+ [                                         +
+   {                                       +
+     "Plan": {                             +
+       "Node Type": "Seq Scan",            +
+       "Parallel Aware": false,            +
+       "Async Capable": false,             +
+       "Relation Name": "explain_copy_tbl",+
+       "Alias": "explain_copy_tbl",        +
+       "Disabled": false                   +
+     },                                    +
+     "Copy": {                             +
+       "Format": "csv",                    +
+       "Target": "stdout"                  +
+     }                                     +
+   }                                       +
+ ]
+(1 row)
+
+-- invalid cases
+explain copy explain_copy_no_such_table from stdin;
+ERROR:  relation "explain_copy_no_such_table" does not exist
+explain copy explain_copy_tbl from stdin with (format nosuch);
+ERROR:  COPY format "nosuch" not recognized
+LINE 1: explain copy explain_copy_tbl from stdin with (format nosuch...
+                                                       ^
+explain (analyze) copy explain_copy_tbl from stdin;
+ERROR:  EXPLAIN ANALYZE is not supported for COPY FROM
+explain (analyze) copy explain_copy_tbl to stdout;
+ERROR:  EXPLAIN ANALYZE is not supported for COPY relation TO
+HINT:  Try the COPY (SELECT ...) TO variant.
+explain (analyze) copy (select 1) to stdout;
+ERROR:  EXPLAIN ANALYZE is not supported for COPY TO
+-- Plain EXPLAIN performs the same permission checks as COPY would.
+create role regress_explain_copy;
+grant select, insert on explain_copy_tbl to regress_explain_copy;
+set role regress_explain_copy;
+explain copy explain_copy_tbl from '/no/such/file';	-- fail, no file access
+ERROR:  permission denied to COPY from a file
+DETAIL:  Only roles with privileges of the "pg_read_server_files" role may COPY from a file.
+HINT:  Anyone can COPY to stdout or from stdin. psql's \copy command also works for anyone.
+explain copy explain_copy_tbl from stdin;
+          QUERY PLAN           
+-------------------------------
+ Copy From on explain_copy_tbl
+   Format: text
+   Source: stdin
+(3 rows)
+
+reset role;
+-- Row-level security converts COPY relation TO into a query-based COPY.
+create table explain_copy_rls (a int);
+insert into explain_copy_rls values (1), (-1);
+alter table explain_copy_rls enable row level security;
+create policy explain_copy_policy on explain_copy_rls
+  for select using (a > 0);
+grant select on explain_copy_rls to regress_explain_copy;
+set role regress_explain_copy;
+explain (costs off) copy explain_copy_rls to stdout;
+          QUERY PLAN          
+------------------------------
+ Seq Scan on explain_copy_rls
+   Filter: (a > 0)
+ Copy To
+   Format: text
+   Target: stdout
+(5 rows)
+
+reset role;
+revoke all on explain_copy_tbl from regress_explain_copy;
+revoke all on explain_copy_rls from regress_explain_copy;
+drop role regress_explain_copy;
+drop table explain_copy_rls;
+drop table explain_copy_tbl;

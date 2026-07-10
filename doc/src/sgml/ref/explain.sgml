@@ -350,9 +350,20 @@ ROLLBACK;
       Any <command>SELECT</command>, <command>INSERT</command>, <command>UPDATE</command>,
       <command>DELETE</command>, <command>MERGE</command>,
       <command>VALUES</command>, <command>EXECUTE</command>,
-      <command>DECLARE</command>, <command>CREATE TABLE AS</command>, or
-      <command>CREATE MATERIALIZED VIEW AS</command> statement, whose execution
+      <command>DECLARE</command>, <command>CREATE TABLE AS</command>,
+      <command>CREATE MATERIALIZED VIEW AS</command>, or
+      <command>COPY</command> statement, whose execution
       plan you wish to see.
+     </para>
+     <para>
+      For a <command>COPY</command> statement, <command>EXPLAIN</command>
+      shows a description of the <command>COPY</command> operation; when
+      copying the result of a query with
+      <command>COPY (<replaceable>query</replaceable>) TO</command>, the
+      execution plan of the query is also shown.  Without
+      <literal>ANALYZE</literal>, the <command>COPY</command> source or
+      destination file is not accessed, so a nonexistent file is not
+      detected by plain <command>EXPLAIN</command>.
      </para>
     </listitem>
    </varlistentry>
