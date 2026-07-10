@@ -147,8 +147,6 @@ static void show_instrumentation_count(const char *qlabel, int which,
 static void show_foreignscan_info(ForeignScanState *fsstate, ExplainState *es);
 static const char *explain_get_index_name(Oid indexId);
 static bool peek_buffer_usage(ExplainState *es, const BufferUsage *usage);
-static void show_buffer_usage(ExplainState *es, const BufferUsage *usage);
-static void show_wal_usage(ExplainState *es, const WalUsage *usage);
 static void show_memory_counters(ExplainState *es,
 								 const MemoryContextCounters *mem_counters);
 static void show_result_replacement_info(Result *result, ExplainState *es);
@@ -377,7 +375,7 @@ standard_ExplainOneQuery(Query *query, int cursorOptions,
 	/* run it (if needed) and produce output */
 	ExplainOnePlan(plan, into, es, queryString, params, queryEnv,
 				   &planduration, (es->buffers ? &bufusage : NULL),
-				   es->memory ? &mem_counters : NULL);
+				   es->memory ? &mem_counters : NULL, NULL);
 }
 
 /*
@@ -467,6 +465,8 @@ ExplainOneUtility(Node *utilityStmt, IntoClause *into, ExplainState *es,
 	else if (IsA(utilityStmt, ExecuteStmt))
 		ExplainExecuteQuery((ExecuteStmt *) utilityStmt, into, es,
 							pstate, params);
+	else if (IsA(utilityStmt, CopyStmt))
+		ExplainCopyStmt(castNode(CopyStmt, utilityStmt), es, pstate, params);
 	else if (IsA(utilityStmt, NotifyStmt))
 	{
 		if (es->format == EXPLAIN_FORMAT_TEXT)
@@ -501,7 +501,8 @@ ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into, ExplainState *es,
 			   const char *queryString, ParamListInfo params,
 			   QueryEnvironment *queryEnv, const instr_time *planduration,
 			   const BufferUsage *bufusage,
-			   const MemoryContextCounters *mem_counters)
+			   const MemoryContextCounters *mem_counters,
+			   const CopyStmt *copystmt)
 {
 	DestReceiver *dest;
 	QueryDesc  *queryDesc;
@@ -604,6 +605,10 @@ ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into, ExplainState *es,
 
 	/* Create textual dump of plan tree */
 	ExplainPrintPlan(es, queryDesc);
+
+	/* Show details of the COPY statement, if we are explaining one */
+	if (copystmt)
+		ExplainPrintCopyInfo(copystmt, es);
 
 	/* Show buffer and/or memory usage in planning */
 	if (peek_buffer_usage(es, bufusage) || mem_counters)
@@ -4288,7 +4293,7 @@ peek_buffer_usage(ExplainState *es, const BufferUsage *usage)
 /*
  * Show buffer usage details.  This better be sync with peek_buffer_usage.
  */
-static void
+void
 show_buffer_usage(ExplainState *es, const BufferUsage *usage)
 {
 	if (es->format == EXPLAIN_FORMAT_TEXT)
@@ -4457,7 +4462,7 @@ show_buffer_usage(ExplainState *es, const BufferUsage *usage)
 /*
  * Show WAL usage details.
  */
-static void
+void
 show_wal_usage(ExplainState *es, const WalUsage *usage)
 {
 	if (es->format == EXPLAIN_FORMAT_TEXT)

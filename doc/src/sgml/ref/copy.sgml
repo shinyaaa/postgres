@@ -585,6 +585,13 @@ COPY <replaceable class="parameter">count</replaceable>
   <title>Notes</title>
 
    <para>
+    <xref linkend="sql-explain"/> can be used to display a description of
+    a <command>COPY</command> command, including the execution plan of the
+    source query of <literal>COPY
+    (<replaceable class="parameter">query</replaceable>) TO</literal>.
+   </para>
+
+   <para>
     <command>COPY TO</command> can be used with plain
     tables, populated materialized views, and partitioned tables.
     For non-partitioned tables, COPY <replaceable class="parameter">table</replaceable>

@@ -41,28 +41,37 @@
 #include "utils/rls.h"
 
 /*
- *	 DoCopy executes the SQL COPY statement
+ * ProcessCopyTarget
+ *		Prepare the target of a COPY statement for execution
  *
- * Either unload or reload contents of table <relation>, depending on <from>.
- * (<from> = true means we are inserting into the table.)  In the "TO" case
- * we also support copying the output of an arbitrary SELECT, INSERT, UPDATE
- * or DELETE query.
- *
- * If <pipe> is false, transfer is between the table and the file named
- * <filename>.  Otherwise, transfer is between the table and our regular
- * input/output stream. The latter could be either stdin/stdout or a
- * socket, depending on whether we're running under Postmaster control.
+ * This performs the permission checks and preparatory transformations
+ * needed before executing a COPY statement: checking the right to use
+ * COPY TO/FROM a file or program, opening and locking the target relation
+ * (if any), transforming and validating the WHERE clause, checking
+ * privileges on the target columns, and converting the statement into a
+ * query-based COPY when row-level security is enabled on the target
+ * relation.
  *
  * Do not allow a Postgres user without the 'pg_read_server_files' or
  * 'pg_write_server_files' role to read from or write to a file.
  *
  * Do not allow the copy if user doesn't have proper permission to access
  * the table or the specifically requested columns.
+ *
+ * The results are returned in *rel_p (the opened target relation, or NULL
+ * when the COPY uses a query), *relid_p (the OID of the target relation,
+ * or InvalidOid), *query_p (the source query for a query-based COPY TO,
+ * or NULL) and *whereClause_p (the transformed WHERE clause for COPY
+ * FROM, or NULL).
+ *
+ * When *rel_p is set, the relation is left open and locked; the caller is
+ * responsible for closing it (keeping the lock until end of transaction).
  */
 void
-DoCopy(ParseState *pstate, const CopyStmt *stmt,
-	   int stmt_location, int stmt_len,
-	   uint64 *processed)
+ProcessCopyTarget(ParseState *pstate, const CopyStmt *stmt,
+				  int stmt_location, int stmt_len,
+				  Relation *rel_p, Oid *relid_p,
+				  RawStmt **query_p, Node **whereClause_p)
 {
 	bool		is_from = stmt->is_from;
 	bool		pipe = (stmt->filename == NULL);
@@ -353,6 +362,39 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 		relid = InvalidOid;
 		rel = NULL;
 	}
+
+	*rel_p = rel;
+	*relid_p = relid;
+	*query_p = query;
+	*whereClause_p = whereClause;
+}
+
+/*
+ *	 DoCopy executes the SQL COPY statement
+ *
+ * Either unload or reload contents of table <relation>, depending on <from>.
+ * (<from> = true means we are inserting into the table.)  In the "TO" case
+ * we also support copying the output of an arbitrary SELECT, INSERT, UPDATE
+ * or DELETE query.
+ *
+ * If <pipe> is false, transfer is between the table and the file named
+ * <filename>.  Otherwise, transfer is between the table and our regular
+ * input/output stream. The latter could be either stdin/stdout or a
+ * socket, depending on whether we're running under Postmaster control.
+ */
+void
+DoCopy(ParseState *pstate, const CopyStmt *stmt,
+	   int stmt_location, int stmt_len,
+	   uint64 *processed)
+{
+	bool		is_from = stmt->is_from;
+	Relation	rel;
+	Oid			relid;
+	RawStmt    *query;
+	Node	   *whereClause;
+
+	ProcessCopyTarget(pstate, stmt, stmt_location, stmt_len,
+					  &rel, &relid, &query, &whereClause);
 
 	if (is_from)
 	{

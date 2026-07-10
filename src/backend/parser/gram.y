@@ -12853,7 +12853,8 @@ ExplainableStmt:
 			| CreateAsStmt
 			| CreateMatViewStmt
 			| RefreshMatViewStmt
-			| ExecuteStmt					/* by default all are $$=$1 */
+			| ExecuteStmt
+			| CopyStmt						/* by default all are $$=$1 */
 		;
 
 /*****************************************************************************

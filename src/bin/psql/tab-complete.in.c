@@ -4516,7 +4516,7 @@ match_previous_words(int pattern_id,
  */
 	else if (Matches("EXPLAIN"))
 		COMPLETE_WITH("SELECT", "INSERT INTO", "DELETE FROM", "UPDATE", "DECLARE",
-					  "MERGE INTO", "EXECUTE", "ANALYZE", "VERBOSE");
+					  "MERGE INTO", "EXECUTE", "COPY", "ANALYZE", "VERBOSE");
 	else if (HeadMatches("EXPLAIN", "(*") &&
 			 !HeadMatches("EXPLAIN", "(*)"))
 	{
@@ -4538,12 +4538,12 @@ match_previous_words(int pattern_id,
 	}
 	else if (Matches("EXPLAIN", "ANALYZE"))
 		COMPLETE_WITH("SELECT", "INSERT INTO", "DELETE FROM", "UPDATE", "DECLARE",
-					  "MERGE INTO", "EXECUTE", "VERBOSE");
+					  "MERGE INTO", "EXECUTE", "COPY", "VERBOSE");
 	else if (Matches("EXPLAIN", "(*)") ||
 			 Matches("EXPLAIN", "VERBOSE") ||
 			 Matches("EXPLAIN", "ANALYZE", "VERBOSE"))
 		COMPLETE_WITH("SELECT", "INSERT INTO", "DELETE FROM", "UPDATE", "DECLARE",
-					  "MERGE INTO", "EXECUTE");
+					  "MERGE INTO", "EXECUTE", "COPY");
 
 /* FETCH && MOVE */
 

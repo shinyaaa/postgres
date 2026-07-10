@@ -770,6 +770,89 @@ EndCopy(CopyToState cstate)
 }
 
 /*
+ * CopyToTransformQuery
+ *		Run parse analysis and rewrite on the source query of a COPY TO
+ *		command, and check that it is something COPY can handle.
+ *
+ * Note this also acquires sufficient locks on the source table(s).
+ */
+Query *
+CopyToTransformQuery(ParseState *pstate, RawStmt *raw_query)
+{
+	List	   *rewritten;
+	Query	   *query;
+
+	rewritten = pg_analyze_and_rewrite_fixedparams(raw_query,
+												   pstate->p_sourcetext, NULL, 0,
+												   NULL);
+
+	/* check that we got back something we can work with */
+	if (rewritten == NIL)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("DO INSTEAD NOTHING rules are not supported for COPY")));
+	}
+	else if (list_length(rewritten) > 1)
+	{
+		ListCell   *lc;
+
+		/* examine queries to determine which error message to issue */
+		foreach(lc, rewritten)
+		{
+			Query	   *q = lfirst_node(Query, lc);
+
+			if (q->querySource == QSRC_QUAL_INSTEAD_RULE)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("conditional DO INSTEAD rules are not supported for COPY")));
+			if (q->querySource == QSRC_NON_INSTEAD_RULE)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("DO ALSO rules are not supported for COPY")));
+		}
+
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("multi-statement DO INSTEAD rules are not supported for COPY")));
+	}
+
+	query = linitial_node(Query, rewritten);
+
+	/* The grammar allows SELECT INTO, but we don't support that */
+	if (query->utilityStmt != NULL &&
+		IsA(query->utilityStmt, CreateTableAsStmt))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("COPY (SELECT INTO) is not supported")));
+
+	/* The only other utility command we could see is NOTIFY */
+	if (query->utilityStmt != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("COPY query must not be a utility command")));
+
+	/*
+	 * Similarly the grammar doesn't enforce the presence of a RETURNING
+	 * clause, but this is required here.
+	 */
+	if (query->commandType != CMD_SELECT &&
+		query->returningList == NIL)
+	{
+		Assert(query->commandType == CMD_INSERT ||
+			   query->commandType == CMD_UPDATE ||
+			   query->commandType == CMD_DELETE ||
+			   query->commandType == CMD_MERGE);
+
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("COPY query must have a RETURNING clause")));
+	}
+
+	return query;
+}
+
+/*
  * Setup CopyToState to read tuples from a table or a query for COPY TO.
  *
  * 'rel': Relation to be copied
@@ -906,7 +989,6 @@ BeginCopyTo(ParseState *pstate,
 	}
 	else
 	{
-		List	   *rewritten;
 		Query	   *query;
 		PlannedStmt *plan;
 		DestReceiver *dest;
@@ -914,76 +996,7 @@ BeginCopyTo(ParseState *pstate,
 		cstate->rel = NULL;
 		cstate->partitions = NIL;
 
-		/*
-		 * Run parse analysis and rewrite.  Note this also acquires sufficient
-		 * locks on the source table(s).
-		 */
-		rewritten = pg_analyze_and_rewrite_fixedparams(raw_query,
-													   pstate->p_sourcetext, NULL, 0,
-													   NULL);
-
-		/* check that we got back something we can work with */
-		if (rewritten == NIL)
-		{
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("DO INSTEAD NOTHING rules are not supported for COPY")));
-		}
-		else if (list_length(rewritten) > 1)
-		{
-			ListCell   *lc;
-
-			/* examine queries to determine which error message to issue */
-			foreach(lc, rewritten)
-			{
-				Query	   *q = lfirst_node(Query, lc);
-
-				if (q->querySource == QSRC_QUAL_INSTEAD_RULE)
-					ereport(ERROR,
-							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							 errmsg("conditional DO INSTEAD rules are not supported for COPY")));
-				if (q->querySource == QSRC_NON_INSTEAD_RULE)
-					ereport(ERROR,
-							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							 errmsg("DO ALSO rules are not supported for COPY")));
-			}
-
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("multi-statement DO INSTEAD rules are not supported for COPY")));
-		}
-
-		query = linitial_node(Query, rewritten);
-
-		/* The grammar allows SELECT INTO, but we don't support that */
-		if (query->utilityStmt != NULL &&
-			IsA(query->utilityStmt, CreateTableAsStmt))
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("COPY (SELECT INTO) is not supported")));
-
-		/* The only other utility command we could see is NOTIFY */
-		if (query->utilityStmt != NULL)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("COPY query must not be a utility command")));
-
-		/*
-		 * Similarly the grammar doesn't enforce the presence of a RETURNING
-		 * clause, but this is required here.
-		 */
-		if (query->commandType != CMD_SELECT &&
-			query->returningList == NIL)
-		{
-			Assert(query->commandType == CMD_INSERT ||
-				   query->commandType == CMD_UPDATE ||
-				   query->commandType == CMD_DELETE ||
-				   query->commandType == CMD_MERGE);
-
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("COPY query must have a RETURNING clause")));
-		}
+		query = CopyToTransformQuery(pstate, raw_query);
 
 		/* plan the query */
 		plan = pg_plan_query(query, pstate->p_sourcetext,

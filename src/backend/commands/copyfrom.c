@@ -35,6 +35,7 @@
 #include "commands/trigger.h"
 #include "executor/execPartition.h"
 #include "executor/executor.h"
+#include "executor/instrument.h"
 #include "executor/nodeModifyTable.h"
 #include "executor/tuptable.h"
 #include "foreign/fdwapi.h"
@@ -481,12 +482,14 @@ CopyMultiInsertBufferFlush(CopyMultiInsertInfo *miinfo,
 			TupleTableSlot **rslots;
 
 			/* insert into foreign table: let the FDW do it */
+			CopyFromInstrStartPhase(cstate);
 			rslots =
 				resultRelInfo->ri_FdwRoutine->ExecForeignBatchInsert(estate,
 																	 resultRelInfo,
 																	 &slots[sent],
 																	 NULL,
 																	 &inserted);
+			CopyFromInstrStopPhase(cstate, COPY_FROM_PHASE_INSERT);
 
 			sent += size;
 
@@ -553,12 +556,14 @@ CopyMultiInsertBufferFlush(CopyMultiInsertInfo *miinfo,
 		 * context before calling it.
 		 */
 		oldcontext = MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
+		CopyFromInstrStartPhase(cstate);
 		table_multi_insert(resultRelInfo->ri_RelationDesc,
 						   slots,
 						   nused,
 						   mycid,
 						   ti_options,
 						   buffer->bistate);
+		CopyFromInstrStopPhase(cstate, COPY_FROM_PHASE_INSERT);
 		MemoryContextSwitchTo(oldcontext);
 
 		for (i = 0; i < nused; i++)
@@ -572,10 +577,12 @@ CopyMultiInsertBufferFlush(CopyMultiInsertInfo *miinfo,
 				List	   *recheckIndexes;
 
 				cstate->cur_lineno = buffer->linenos[i];
+				CopyFromInstrStartPhase(cstate);
 				recheckIndexes =
 					ExecInsertIndexTuples(resultRelInfo,
 										  estate, 0, buffer->slots[i],
 										  NIL, NULL);
+				CopyFromInstrStopPhase(cstate, COPY_FROM_PHASE_INDEX);
 				ExecARInsertTriggers(estate, resultRelInfo,
 									 slots[i], recheckIndexes,
 									 cstate->transition_capture);
@@ -775,6 +782,58 @@ CopyMultiInsertInfoStore(CopyMultiInsertInfo *miinfo, ResultRelInfo *rri,
 }
 
 /*
+ * Attach EXPLAIN ANALYZE instrumentation to a COPY FROM operation.  Must be
+ * called between BeginCopyFrom() and CopyFrom().
+ */
+void
+CopyFromSetInstrumentation(CopyFromState cstate, CopyFromInstrumentation *instr)
+{
+	cstate->instr = instr;
+}
+
+/*
+ * Collect the per-trigger statistics of the given result relations into the
+ * EXPLAIN ANALYZE instrumentation, in the current memory context.  This has
+ * to be done before the executor state of the COPY FROM operation is
+ * destroyed.
+ */
+static void
+CopyFromCollectTriggerStats(CopyFromInstrumentation *instr, List *resultrels)
+{
+	ListCell   *lc;
+
+	foreach(lc, resultrels)
+	{
+		ResultRelInfo *rInfo = (ResultRelInfo *) lfirst(lc);
+
+		if (!rInfo->ri_TrigDesc || !rInfo->ri_TrigInstrument)
+			continue;
+
+		for (int nt = 0; nt < rInfo->ri_TrigDesc->numtriggers; nt++)
+		{
+			Trigger    *trig = rInfo->ri_TrigDesc->triggers + nt;
+			TriggerInstrumentation *tginstr = rInfo->ri_TrigInstrument + nt;
+			CopyFromTriggerStats *stats;
+
+			/* ignore triggers that were never invoked */
+			if (tginstr->firings == 0)
+				continue;
+
+			stats = palloc0_object(CopyFromTriggerStats);
+			stats->trigger_name = pstrdup(trig->tgname);
+			if (OidIsValid(trig->tgconstraint))
+				stats->constraint_name = get_constraint_name(trig->tgconstraint);
+			stats->relation_name =
+				pstrdup(RelationGetRelationName(rInfo->ri_RelationDesc));
+			stats->firings = tginstr->firings;
+			stats->total = tginstr->instr.total;
+
+			instr->triggers = lappend(instr->triggers, stats);
+		}
+	}
+}
+
+/*
  * Copy FROM file to relation.
  */
 uint64
@@ -909,6 +968,16 @@ CopyFrom(CopyFromState cstate)
 
 		ti_options |= TABLE_INSERT_FROZEN;
 	}
+
+	/*
+	 * If EXPLAIN ANALYZE instrumentation is attached, request trigger
+	 * instrumentation; InitResultRelInfo then sets up ri_TrigInstrument for
+	 * the target relation as well as for any partitions we route tuples to,
+	 * and trigger.c collects the statistics.
+	 */
+	if (cstate->instr)
+		estate->es_instrument = cstate->instr->collect_timing ?
+			INSTRUMENT_TIMER : INSTRUMENT_ROWS;
 
 	/*
 	 * We need a ResultRelInfo so we can use the regular executor's
@@ -1148,8 +1217,13 @@ CopyFrom(CopyFromState cstate)
 		ExecClearTuple(myslot);
 
 		/* Directly store the values/nulls array in the slot */
+		CopyFromInstrStartPhase(cstate);
 		if (!NextCopyFrom(cstate, econtext, myslot->tts_values, myslot->tts_isnull))
+		{
+			CopyFromInstrStopPhase(cstate, COPY_FROM_PHASE_INPUT);
 			break;
+		}
+		CopyFromInstrStopPhase(cstate, COPY_FROM_PHASE_INPUT);
 
 		if (cstate->opts.on_error == COPY_ON_ERROR_IGNORE &&
 			cstate->escontext->error_occurred)
@@ -1408,10 +1482,12 @@ CopyFrom(CopyFromState cstate)
 					/* OK, store the tuple */
 					if (resultRelInfo->ri_FdwRoutine != NULL)
 					{
+						CopyFromInstrStartPhase(cstate);
 						myslot = resultRelInfo->ri_FdwRoutine->ExecForeignInsert(estate,
 																				 resultRelInfo,
 																				 myslot,
 																				 NULL);
+						CopyFromInstrStopPhase(cstate, COPY_FROM_PHASE_INSERT);
 
 						if (myslot == NULL) /* "do nothing" */
 							continue;	/* next tuple please */
@@ -1426,14 +1502,20 @@ CopyFrom(CopyFromState cstate)
 					else
 					{
 						/* OK, store the tuple and create index entries for it */
+						CopyFromInstrStartPhase(cstate);
 						table_tuple_insert(resultRelInfo->ri_RelationDesc,
 										   myslot, mycid, ti_options, bistate);
+						CopyFromInstrStopPhase(cstate, COPY_FROM_PHASE_INSERT);
 
 						if (resultRelInfo->ri_NumIndices > 0)
+						{
+							CopyFromInstrStartPhase(cstate);
 							recheckIndexes = ExecInsertIndexTuples(resultRelInfo,
 																   estate, 0,
 																   myslot, NIL,
 																   NULL);
+							CopyFromInstrStopPhase(cstate, COPY_FROM_PHASE_INDEX);
+						}
 					}
 
 					/* AFTER ROW INSERT Triggers */
@@ -1492,6 +1574,25 @@ CopyFrom(CopyFromState cstate)
 
 	/* Handle queued AFTER triggers */
 	AfterTriggerEndQuery(estate);
+
+	/*
+	 * Hand the collected statistics over to the attached EXPLAIN ANALYZE
+	 * instrumentation, if any, before the executor state goes away.
+	 */
+	if (cstate->instr)
+	{
+		CopyFromInstrumentation *ci = cstate->instr;
+
+		ci->excluded = excluded;
+		ci->skipped = cstate->num_errors;
+		ci->show_relname =
+			(list_length(estate->es_opened_result_relations) > 1 ||
+			 estate->es_tuple_routing_result_relations != NIL ||
+			 estate->es_trig_target_relations != NIL);
+		CopyFromCollectTriggerStats(ci, estate->es_opened_result_relations);
+		CopyFromCollectTriggerStats(ci, estate->es_tuple_routing_result_relations);
+		CopyFromCollectTriggerStats(ci, estate->es_trig_target_relations);
+	}
 
 	ExecResetTupleTable(estate->es_tupleTable, false);
 

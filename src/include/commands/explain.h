@@ -69,7 +69,13 @@ extern void ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into,
 						   ParamListInfo params, QueryEnvironment *queryEnv,
 						   const instr_time *planduration,
 						   const BufferUsage *bufusage,
-						   const MemoryContextCounters *mem_counters);
+						   const MemoryContextCounters *mem_counters,
+						   const CopyStmt *copystmt);
+
+/* in commands/explain_copy.c */
+extern void ExplainCopyStmt(CopyStmt *stmt, ExplainState *es,
+							ParseState *pstate, ParamListInfo params);
+extern void ExplainPrintCopyInfo(const CopyStmt *copystmt, ExplainState *es);
 
 extern void ExplainPrintPlan(ExplainState *es, QueryDesc *queryDesc);
 extern void ExplainPrintTriggers(ExplainState *es,
@@ -81,5 +87,8 @@ extern void ExplainPrintJITSummary(ExplainState *es,
 extern void ExplainQueryText(ExplainState *es, QueryDesc *queryDesc);
 extern void ExplainQueryParameters(ExplainState *es,
 								   ParamListInfo params, int maxlen);
+
+extern void show_buffer_usage(ExplainState *es, const BufferUsage *usage);
+extern void show_wal_usage(ExplainState *es, const WalUsage *usage);
 
 #endif							/* EXPLAIN_H */
