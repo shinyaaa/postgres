@@ -365,6 +365,13 @@ ROLLBACK;
       destination file is not accessed, so a nonexistent file is not
       detected by plain <command>EXPLAIN</command>.
      </para>
+     <para>
+      <command>EXPLAIN ANALYZE</command> of a
+      <command>COPY (<replaceable>query</replaceable>) TO</command> statement
+      executes the source query, but does not produce the
+      <command>COPY</command> output: no file is written, and no data is
+      sent to the client.
+     </para>
     </listitem>
    </varlistentry>
   </variablelist>

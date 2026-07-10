@@ -75,12 +75,14 @@ ExplainCopyStmt(CopyStmt *stmt, ExplainState *es,
 	}
 	else if (query != NULL)
 	{
-		/* COPY (query) TO, or COPY relation TO converted because of RLS */
-		if (es->analyze)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("EXPLAIN ANALYZE is not supported for COPY TO")));
-
+		/*
+		 * COPY (query) TO, or COPY relation TO converted because of RLS.
+		 *
+		 * With ANALYZE, the source query is executed, but the COPY output is
+		 * not produced: no file is written, and no data is sent to the
+		 * client.  This parallels EXPLAIN ANALYZE discarding the rows a
+		 * SELECT would return.
+		 */
 		ExplainCopyToQuery(stmt, query, relid, es, pstate, params);
 	}
 	else

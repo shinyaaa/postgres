@@ -16,12 +16,19 @@ explain copy explain_copy_tbl to stdout;
 explain (costs off) copy (select * from explain_copy_tbl where a > 0) to stdout;
 explain (costs off, format json) copy (select a from explain_copy_tbl) to stdout (format csv);
 
+-- EXPLAIN ANALYZE of a query-based COPY TO executes the source query,
+-- but produces no COPY output: no file is written, and no data is sent
+-- to the client.
+explain (analyze, costs off, timing off, summary off, buffers off)
+  copy (select * from explain_copy_tbl where a > 0) to stdout;
+explain (analyze, costs off, timing off, summary off, buffers off)
+  copy (select a from explain_copy_tbl) to '/no/such/dir/file';
+
 -- invalid cases
 explain copy explain_copy_no_such_table from stdin;
 explain copy explain_copy_tbl from stdin with (format nosuch);
 explain (analyze) copy explain_copy_tbl from stdin;
 explain (analyze) copy explain_copy_tbl to stdout;
-explain (analyze) copy (select 1) to stdout;
 
 -- Plain EXPLAIN performs the same permission checks as COPY would.
 create role regress_explain_copy;
