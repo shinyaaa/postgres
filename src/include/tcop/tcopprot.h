@@ -40,6 +40,16 @@ typedef enum
 extern PGDLLIMPORT bool Log_disconnections;
 extern PGDLLIMPORT int log_statement;
 
+/* Flags for log_min_duration_statement_phases value */
+#define LOG_DURATION_PHASE_PARSE	0x01
+#define LOG_DURATION_PHASE_BIND		0x02
+#define LOG_DURATION_PHASE_EXECUTE	0x04
+#define LOG_DURATION_PHASE_ALL \
+	(LOG_DURATION_PHASE_PARSE | LOG_DURATION_PHASE_BIND | \
+	 LOG_DURATION_PHASE_EXECUTE)
+
+extern PGDLLIMPORT int log_min_duration_statement_phases;
+
 /* Flags for restrict_nonsystem_relation_kind value */
 #define RESTRICT_RELKIND_VIEW			0x01
 #define RESTRICT_RELKIND_FOREIGN_TABLE	0x02
@@ -86,7 +96,7 @@ pg_noreturn extern void PostgresMain(const char *dbname,
 									 const char *username);
 extern void ResetUsage(void);
 extern void ShowUsage(const char *title);
-extern int	check_log_duration(char *msec_str, bool was_logged);
+extern int	check_log_duration(char *msec_str, bool was_logged, int phase);
 extern void set_debug_options(int debug_flag,
 							  GucContext context, GucSource source);
 extern bool set_plan_disabling_options(const char *arg,

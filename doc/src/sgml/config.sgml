@@ -7542,6 +7542,55 @@ local0.*    /var/log/postgresql
        </listitem>
       </varlistentry>
 
+     <varlistentry id="guc-log-min-duration-statement-phases" xreflabel="log_min_duration_statement_phases">
+      <term><varname>log_min_duration_statement_phases</varname> (<type>string</type>)
+      <indexterm>
+       <primary><varname>log_min_duration_statement_phases</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+       <listitem>
+        <para>
+         Selects the statement processing phases that are subject to
+         <xref linkend="guc-log-min-duration-statement"/> and
+         <xref linkend="guc-log-min-duration-sample"/>.  For clients using
+         extended query protocol, the durations of the Parse, Bind, and
+         Execute steps are checked and logged independently, and this
+         parameter restricts which of those steps are considered for
+         duration logging.  The value is a comma-separated list of one or
+         more of <literal>parse</literal>, <literal>bind</literal>,
+         <literal>execute</literal>, and <literal>all</literal>.
+         The default is <literal>all</literal>, which logs every phase and
+         corresponds to the historical behavior.
+         Statements issued via simple query protocol are processed in a
+         single step and are treated as the <literal>execute</literal>
+         phase.
+         Only superusers and users with the appropriate <literal>SET</literal>
+         privilege can change this setting.
+        </para>
+
+        <para>
+         This parameter is useful in combination with
+         <xref linkend="auto-explain"/>.  Since
+         <varname>auto_explain.log_min_duration</varname> reports only the
+         execution phase, slow Parse or Bind steps cannot be detected by
+         <application>auto_explain</application> alone, while enabling
+         <varname>log_min_duration_statement</varname> in addition would
+         log the execution duration twice.  Setting this parameter to
+         <literal>parse, bind</literal> lets
+         <varname>log_min_duration_statement</varname> report slow Parse
+         and Bind steps while leaving execution logging to
+         <application>auto_explain</application>, avoiding duplicated log
+         entries and inflated duration totals in log analyzers.
+        </para>
+
+        <para>
+         This parameter does not affect <xref linkend="guc-log-duration"/>
+         or <xref linkend="guc-log-transaction-sample-rate"/>, which log
+         all phases unconditionally.
+        </para>
+       </listitem>
+      </varlistentry>
+
      <varlistentry id="guc-log-min-duration-sample" xreflabel="log_min_duration_sample">
       <term><varname>log_min_duration_sample</varname> (<type>integer</type>)
       <indexterm>

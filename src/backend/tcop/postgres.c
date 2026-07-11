@@ -101,6 +101,9 @@ bool		Log_disconnections = false;
 
 int			log_statement = LOGSTMT_NONE;
 
+/* flags for statement phases subject to min-duration logging */
+int			log_min_duration_statement_phases = LOG_DURATION_PHASE_ALL;
+
 /* wait N seconds to allow attach from a debugger */
 int			PostAuthDelay = 0;
 
@@ -1378,9 +1381,10 @@ exec_simple_query(const char *query_string)
 		NullCommand(dest);
 
 	/*
-	 * Emit duration logging if appropriate.
+	 * Emit duration logging if appropriate.  Simple query processing counts
+	 * as the "execute" phase.
 	 */
-	switch (check_log_duration(msec_str, was_logged))
+	switch (check_log_duration(msec_str, was_logged, LOG_DURATION_PHASE_EXECUTE))
 	{
 		case 1:
 			ereport(LOG,
@@ -1623,7 +1627,7 @@ exec_parse_message(const char *query_string,	/* string to execute */
 	/*
 	 * Emit duration logging if appropriate.
 	 */
-	switch (check_log_duration(msec_str, false))
+	switch (check_log_duration(msec_str, false, LOG_DURATION_PHASE_PARSE))
 	{
 		case 1:
 			ereport(LOG,
@@ -2107,7 +2111,7 @@ exec_bind_message(StringInfo input_message)
 	/*
 	 * Emit duration logging if appropriate.
 	 */
-	switch (check_log_duration(msec_str, false))
+	switch (check_log_duration(msec_str, false, LOG_DURATION_PHASE_BIND))
 	{
 		case 1:
 			ereport(LOG,
@@ -2390,7 +2394,7 @@ exec_execute_message(const char *portal_name, long max_rows)
 	/*
 	 * Emit duration logging if appropriate.
 	 */
-	switch (check_log_duration(msec_str, was_logged))
+	switch (check_log_duration(msec_str, was_logged, LOG_DURATION_PHASE_EXECUTE))
 	{
 		case 1:
 			ereport(LOG,
@@ -2473,9 +2477,14 @@ check_log_statement(List *stmt_list)
  *
  * was_logged should be true if caller already logged query details (this
  * essentially prevents 2 from being returned).
+ *
+ * phase identifies the statement processing phase (one of the
+ * LOG_DURATION_PHASE_* flags) whose duration is being checked.  Phases not
+ * selected by log_min_duration_statement_phases are not subject to
+ * log_min_duration_statement and log_min_duration_sample.
  */
 int
-check_log_duration(char *msec_str, bool was_logged)
+check_log_duration(char *msec_str, bool was_logged, int phase)
 {
 	if (log_duration || log_min_duration_sample >= 0 ||
 		log_min_duration_statement >= 0 || xact_is_sampled)
@@ -2483,6 +2492,7 @@ check_log_duration(char *msec_str, bool was_logged)
 		long		secs;
 		int			usecs;
 		int			msecs;
+		bool		phase_enabled;
 		bool		exceeded_duration;
 		bool		exceeded_sample_duration;
 		bool		in_sample = false;
@@ -2492,20 +2502,24 @@ check_log_duration(char *msec_str, bool was_logged)
 							&secs, &usecs);
 		msecs = usecs / 1000;
 
+		phase_enabled = (log_min_duration_statement_phases & phase) != 0;
+
 		/*
 		 * This odd-looking test for log_min_duration_* being exceeded is
 		 * designed to avoid integer overflow with very long durations: don't
 		 * compute secs * 1000 until we've verified it will fit in int.
 		 */
-		exceeded_duration = (log_min_duration_statement == 0 ||
-							 (log_min_duration_statement > 0 &&
-							  (secs > log_min_duration_statement / 1000 ||
-							   secs * 1000 + msecs >= log_min_duration_statement)));
+		exceeded_duration = (phase_enabled &&
+							 (log_min_duration_statement == 0 ||
+							  (log_min_duration_statement > 0 &&
+							   (secs > log_min_duration_statement / 1000 ||
+								secs * 1000 + msecs >= log_min_duration_statement))));
 
-		exceeded_sample_duration = (log_min_duration_sample == 0 ||
-									(log_min_duration_sample > 0 &&
-									 (secs > log_min_duration_sample / 1000 ||
-									  secs * 1000 + msecs >= log_min_duration_sample)));
+		exceeded_sample_duration = (phase_enabled &&
+									(log_min_duration_sample == 0 ||
+									 (log_min_duration_sample > 0 &&
+									  (secs > log_min_duration_sample / 1000 ||
+									   secs * 1000 + msecs >= log_min_duration_sample))));
 
 		/*
 		 * Do not log if log_statement_sample_rate = 0. Log a sample if
@@ -3839,6 +3853,82 @@ assign_restrict_nonsystem_relation_kind(const char *newval, void *extra)
 	int		   *flags = (int *) extra;
 
 	restrict_nonsystem_relation_kind = *flags;
+}
+
+/*
+ * GUC check_hook for log_min_duration_statement_phases
+ */
+bool
+check_log_min_duration_statement_phases(char **newval, void **extra,
+										GucSource source)
+{
+	char	   *rawstring;
+	List	   *elemlist;
+	ListCell   *l;
+	int			flags = 0;
+
+	/* Need a modifiable copy of string */
+	rawstring = pstrdup(*newval);
+
+	if (!SplitIdentifierString(rawstring, ',', &elemlist))
+	{
+		/* syntax error in list */
+		GUC_check_errdetail("List syntax is invalid.");
+		pfree(rawstring);
+		list_free(elemlist);
+		return false;
+	}
+
+	foreach(l, elemlist)
+	{
+		char	   *tok = (char *) lfirst(l);
+
+		if (pg_strcasecmp(tok, "parse") == 0)
+			flags |= LOG_DURATION_PHASE_PARSE;
+		else if (pg_strcasecmp(tok, "bind") == 0)
+			flags |= LOG_DURATION_PHASE_BIND;
+		else if (pg_strcasecmp(tok, "execute") == 0)
+			flags |= LOG_DURATION_PHASE_EXECUTE;
+		else if (pg_strcasecmp(tok, "all") == 0)
+			flags |= LOG_DURATION_PHASE_ALL;
+		else
+		{
+			GUC_check_errdetail("Unrecognized key word: \"%s\".", tok);
+			pfree(rawstring);
+			list_free(elemlist);
+			return false;
+		}
+	}
+
+	if (flags == 0)
+	{
+		GUC_check_errdetail("Must specify at least one statement phase.");
+		pfree(rawstring);
+		list_free(elemlist);
+		return false;
+	}
+
+	pfree(rawstring);
+	list_free(elemlist);
+
+	/* Save the flags in *extra, for use by the assign function */
+	*extra = guc_malloc(LOG, sizeof(int));
+	if (!*extra)
+		return false;
+	*((int *) *extra) = flags;
+
+	return true;
+}
+
+/*
+ * GUC assign_hook for log_min_duration_statement_phases
+ */
+void
+assign_log_min_duration_statement_phases(const char *newval, void *extra)
+{
+	int		   *flags = (int *) extra;
+
+	log_min_duration_statement_phases = *flags;
 }
 
 /*

@@ -303,9 +303,10 @@ HandleFunctionRequest(StringInfo msgBuf)
 	PopActiveSnapshot();
 
 	/*
-	 * Emit duration logging if appropriate.
+	 * Emit duration logging if appropriate.  A fastpath function call counts
+	 * as the "execute" phase.
 	 */
-	switch (check_log_duration(msec_str, was_logged))
+	switch (check_log_duration(msec_str, was_logged, LOG_DURATION_PHASE_EXECUTE))
 	{
 		case 1:
 			ereport(LOG,

@@ -624,6 +624,7 @@ static char *server_version_string;
 static int	server_version_num;
 static char *debug_io_direct_string;
 static char *restrict_nonsystem_relation_kind_string;
+static char *log_min_duration_statement_phases_string;
 static char *log_min_messages_string;
 
 #ifdef HAVE_SYSLOG

@@ -595,6 +595,11 @@
                                         # statements running at least this number
                                         # of milliseconds
 
+#log_min_duration_statement_phases = 'all'      # statement phases subject to
+                                        # log_min_duration_statement and
+                                        # log_min_duration_sample; combination
+                                        # of parse, bind, execute, or all
+
 #log_min_duration_sample = -1           # -1 is disabled, 0 logs a sample of statements
                                         # and their durations, > 0 logs only a sample of
                                         # statements running at least this number

@@ -78,6 +78,10 @@ extern bool check_log_destination(char **newval, void **extra,
 								  GucSource source);
 extern void assign_log_destination(const char *newval, void *extra);
 extern const char *show_log_file_mode(void);
+extern bool check_log_min_duration_statement_phases(char **newval, void **extra,
+													GucSource source);
+extern void assign_log_min_duration_statement_phases(const char *newval,
+													 void *extra);
 extern bool check_log_stats(bool *newval, void **extra, GucSource source);
 extern bool check_log_timezone(char **newval, void **extra, GucSource source);
 extern void assign_log_timezone(const char *newval, void *extra);
