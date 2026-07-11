@@ -218,7 +218,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BCBC
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BCBD
 
 typedef struct PgStat_ArchiverStats
 {
@@ -279,7 +279,9 @@ typedef struct PgStat_CheckpointerStats
 typedef enum IOObject
 {
 	IOOBJECT_RELATION,
+	IOOBJECT_SLRU,
 	IOOBJECT_TEMP_RELATION,
+	IOOBJECT_TWOPHASE,
 	IOOBJECT_WAL,
 } IOObject;
 

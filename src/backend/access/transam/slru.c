@@ -68,6 +68,7 @@
 #include "access/xlogutils.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "storage/bufmgr.h"
 #include "storage/fd.h"
 #include "storage/shmem.h"
 #include "storage/shmem_internal.h"
@@ -858,6 +859,7 @@ SlruPhysicalReadPage(SlruDesc *ctl, int64 pageno, int slotno)
 	off_t		offset = rpageno * BLCKSZ;
 	char		path[MAXPGPATH];
 	int			fd;
+	instr_time	io_start;
 
 	SlruFileName(ctl, path, segno);
 
@@ -886,6 +888,9 @@ SlruPhysicalReadPage(SlruDesc *ctl, int64 pageno, int slotno)
 	}
 
 	errno = 0;
+
+	io_start = pgstat_prepare_io_time(track_io_timing);
+
 	pgstat_report_wait_start(WAIT_EVENT_SLRU_READ);
 	if (pg_pread(fd, shared->page_buffer[slotno], BLCKSZ, offset) != BLCKSZ)
 	{
@@ -896,6 +901,9 @@ SlruPhysicalReadPage(SlruDesc *ctl, int64 pageno, int slotno)
 		return false;
 	}
 	pgstat_report_wait_end();
+
+	pgstat_count_io_op_time(IOOBJECT_SLRU, IOCONTEXT_NORMAL, IOOP_READ,
+							io_start, 1, BLCKSZ);
 
 	if (CloseTransientFile(fd) != 0)
 	{
@@ -930,6 +938,7 @@ SlruPhysicalWritePage(SlruDesc *ctl, int64 pageno, int slotno, SlruWriteAll fdat
 	off_t		offset = rpageno * BLCKSZ;
 	char		path[MAXPGPATH];
 	int			fd = -1;
+	instr_time	io_start;
 
 	/* update the stats counter of written pages */
 	pgstat_count_slru_blocks_written(shared->slru_stats_idx);
@@ -1038,6 +1047,9 @@ SlruPhysicalWritePage(SlruDesc *ctl, int64 pageno, int slotno, SlruWriteAll fdat
 	}
 
 	errno = 0;
+
+	io_start = pgstat_prepare_io_time(track_io_timing);
+
 	pgstat_report_wait_start(WAIT_EVENT_SLRU_WRITE);
 	if (pg_pwrite(fd, shared->page_buffer[slotno], BLCKSZ, offset) != BLCKSZ)
 	{
@@ -1053,6 +1065,9 @@ SlruPhysicalWritePage(SlruDesc *ctl, int64 pageno, int slotno, SlruWriteAll fdat
 	}
 	pgstat_report_wait_end();
 
+	pgstat_count_io_op_time(IOOBJECT_SLRU, IOCONTEXT_NORMAL, IOOP_WRITE,
+							io_start, 1, BLCKSZ);
+
 	/* Queue up a sync request for the checkpointer. */
 	if (ctl->options.sync_handler != SYNC_HANDLER_NONE)
 	{
@@ -1062,6 +1077,8 @@ SlruPhysicalWritePage(SlruDesc *ctl, int64 pageno, int slotno, SlruWriteAll fdat
 		if (!RegisterSyncRequest(&tag, SYNC_REQUEST, false))
 		{
 			/* No space to enqueue sync request.  Do it synchronously. */
+			io_start = pgstat_prepare_io_time(track_io_timing);
+
 			pgstat_report_wait_start(WAIT_EVENT_SLRU_SYNC);
 			if (pg_fsync(fd) != 0)
 			{
@@ -1072,6 +1089,9 @@ SlruPhysicalWritePage(SlruDesc *ctl, int64 pageno, int slotno, SlruWriteAll fdat
 				return false;
 			}
 			pgstat_report_wait_end();
+
+			pgstat_count_io_op_time(IOOBJECT_SLRU, IOCONTEXT_NORMAL,
+									IOOP_FSYNC, io_start, 1, 0);
 		}
 	}
 
@@ -1886,6 +1906,7 @@ SlruSyncFileTag(SlruDesc *ctl, const FileTag *ftag, char *path)
 	int			fd;
 	int			save_errno;
 	int			result;
+	instr_time	io_start;
 
 	SlruFileName(ctl, path, ftag->segno);
 
@@ -1893,12 +1914,17 @@ SlruSyncFileTag(SlruDesc *ctl, const FileTag *ftag, char *path)
 	if (fd < 0)
 		return -1;
 
+	io_start = pgstat_prepare_io_time(track_io_timing);
+
 	pgstat_report_wait_start(WAIT_EVENT_SLRU_FLUSH_SYNC);
 	result = pg_fsync(fd);
 	pgstat_report_wait_end();
 	save_errno = errno;
 
 	CloseTransientFile(fd);
+
+	pgstat_count_io_op_time(IOOBJECT_SLRU, IOCONTEXT_NORMAL, IOOP_FSYNC,
+							io_start, 1, 0);
 
 	errno = save_errno;
 	return result;

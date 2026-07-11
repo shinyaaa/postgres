@@ -96,6 +96,7 @@
 #include "pgstat.h"
 #include "replication/origin.h"
 #include "replication/syncrep.h"
+#include "storage/bufmgr.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/md.h"
@@ -1309,6 +1310,7 @@ ReadTwoPhaseFile(FullTransactionId fxid, bool missing_ok)
 	pg_crc32c	calc_crc,
 				file_crc;
 	int			r;
+	instr_time	io_start;
 
 	TwoPhaseFilePath(path, fxid);
 
@@ -1357,6 +1359,8 @@ ReadTwoPhaseFile(FullTransactionId fxid, bool missing_ok)
 	 */
 	buf = (char *) palloc(stat.st_size);
 
+	io_start = pgstat_prepare_io_time(track_io_timing);
+
 	pgstat_report_wait_start(WAIT_EVENT_TWOPHASE_FILE_READ);
 	r = read(fd, buf, stat.st_size);
 	if (r != stat.st_size)
@@ -1372,6 +1376,9 @@ ReadTwoPhaseFile(FullTransactionId fxid, bool missing_ok)
 	}
 
 	pgstat_report_wait_end();
+
+	pgstat_count_io_op_time(IOOBJECT_TWOPHASE, IOCONTEXT_NORMAL, IOOP_READ,
+							io_start, 1, stat.st_size);
 
 	if (CloseTransientFile(fd) != 0)
 		ereport(ERROR,
@@ -1750,6 +1757,7 @@ RecreateTwoPhaseFile(FullTransactionId fxid, void *content, int len)
 	char		path[MAXPGPATH];
 	pg_crc32c	statefile_crc;
 	int			fd;
+	instr_time	io_start;
 
 	/* Recompute CRC */
 	INIT_CRC32C(statefile_crc);
@@ -1767,6 +1775,9 @@ RecreateTwoPhaseFile(FullTransactionId fxid, void *content, int len)
 
 	/* Write content and CRC */
 	errno = 0;
+
+	io_start = pgstat_prepare_io_time(track_io_timing);
+
 	pgstat_report_wait_start(WAIT_EVENT_TWOPHASE_FILE_WRITE);
 	if (write(fd, content, len) != len)
 	{
@@ -1788,16 +1799,24 @@ RecreateTwoPhaseFile(FullTransactionId fxid, void *content, int len)
 	}
 	pgstat_report_wait_end();
 
+	pgstat_count_io_op_time(IOOBJECT_TWOPHASE, IOCONTEXT_NORMAL, IOOP_WRITE,
+							io_start, 1, len + sizeof(pg_crc32c));
+
 	/*
 	 * We must fsync the file because the end-of-replay checkpoint will not do
 	 * so, there being no GXACT in shared memory yet to tell it to.
 	 */
+	io_start = pgstat_prepare_io_time(track_io_timing);
+
 	pgstat_report_wait_start(WAIT_EVENT_TWOPHASE_FILE_SYNC);
 	if (pg_fsync(fd) != 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not fsync file \"%s\": %m", path)));
 	pgstat_report_wait_end();
+
+	pgstat_count_io_op_time(IOOBJECT_TWOPHASE, IOCONTEXT_NORMAL, IOOP_FSYNC,
+							io_start, 1, 0);
 
 	if (CloseTransientFile(fd) != 0)
 		ereport(ERROR,

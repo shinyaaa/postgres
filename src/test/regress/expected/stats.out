@@ -19,12 +19,14 @@ backend_type|object|context
 autovacuum launcher|relation|bulkread
 autovacuum launcher|relation|init
 autovacuum launcher|relation|normal
+autovacuum launcher|slru|normal
 autovacuum launcher|wal|init
 autovacuum launcher|wal|normal
 autovacuum worker|relation|bulkread
 autovacuum worker|relation|init
 autovacuum worker|relation|normal
 autovacuum worker|relation|vacuum
+autovacuum worker|slru|normal
 autovacuum worker|wal|init
 autovacuum worker|wal|normal
 background worker|relation|bulkread
@@ -32,7 +34,9 @@ background worker|relation|bulkwrite
 background worker|relation|init
 background worker|relation|normal
 background worker|relation|vacuum
+background worker|slru|normal
 background worker|temp relation|normal
+background worker|twophase|normal
 background worker|wal|init
 background worker|wal|normal
 background writer|relation|init
@@ -41,6 +45,8 @@ background writer|wal|init
 background writer|wal|normal
 checkpointer|relation|init
 checkpointer|relation|normal
+checkpointer|slru|normal
+checkpointer|twophase|normal
 checkpointer|wal|init
 checkpointer|wal|normal
 client backend|relation|bulkread
@@ -48,7 +54,9 @@ client backend|relation|bulkwrite
 client backend|relation|init
 client backend|relation|normal
 client backend|relation|vacuum
+client backend|slru|normal
 client backend|temp relation|normal
+client backend|twophase|normal
 client backend|wal|init
 client backend|wal|normal
 datachecksums launcher|relation|bulkread
@@ -56,6 +64,7 @@ datachecksums launcher|relation|bulkwrite
 datachecksums launcher|relation|init
 datachecksums launcher|relation|normal
 datachecksums launcher|relation|vacuum
+datachecksums launcher|slru|normal
 datachecksums launcher|temp relation|normal
 datachecksums launcher|wal|init
 datachecksums launcher|wal|normal
@@ -64,6 +73,7 @@ datachecksums worker|relation|bulkwrite
 datachecksums worker|relation|init
 datachecksums worker|relation|normal
 datachecksums worker|relation|vacuum
+datachecksums worker|slru|normal
 datachecksums worker|temp relation|normal
 datachecksums worker|wal|init
 datachecksums worker|wal|normal
@@ -80,6 +90,7 @@ slotsync worker|relation|bulkwrite
 slotsync worker|relation|init
 slotsync worker|relation|normal
 slotsync worker|relation|vacuum
+slotsync worker|slru|normal
 slotsync worker|temp relation|normal
 slotsync worker|wal|init
 slotsync worker|wal|normal
@@ -88,6 +99,8 @@ standalone backend|relation|bulkwrite
 standalone backend|relation|init
 standalone backend|relation|normal
 standalone backend|relation|vacuum
+standalone backend|slru|normal
+standalone backend|twophase|normal
 standalone backend|wal|init
 standalone backend|wal|normal
 startup|relation|bulkread
@@ -95,6 +108,8 @@ startup|relation|bulkwrite
 startup|relation|init
 startup|relation|normal
 startup|relation|vacuum
+startup|slru|normal
+startup|twophase|normal
 startup|wal|init
 startup|wal|normal
 walreceiver|wal|init
@@ -104,14 +119,16 @@ walsender|relation|bulkwrite
 walsender|relation|init
 walsender|relation|normal
 walsender|relation|vacuum
+walsender|slru|normal
 walsender|temp relation|normal
+walsender|twophase|normal
 walsender|wal|init
 walsender|wal|normal
 walsummarizer|wal|init
 walsummarizer|wal|normal
 walwriter|wal|init
 walwriter|wal|normal
-(95 rows)
+(112 rows)
 \a
 -- List of registered statistics kinds.
 SELECT id, name, fixed_amount,
@@ -1605,6 +1622,80 @@ SELECT :io_sum_wal_normal_after_writes > :io_sum_wal_normal_before_writes;
 SELECT current_setting('fsync') = 'off'
   OR current_setting('wal_sync_method') IN ('open_sync', 'open_datasync')
   OR :io_sum_wal_normal_after_fsyncs > :io_sum_wal_normal_before_fsyncs;
+ ?column? 
+----------
+ t
+(1 row)
+
+-- Test that the following operations are tracked in pg_stat_io:
+-- - writes and fsyncs of two-phase transaction state files during a
+--   checkpoint
+-- - reads of two-phase transaction state files when committing a prepared
+--   transaction after a checkpoint
+-- - writes and fsyncs of dirty SLRU pages (here, the commit log) during a
+--   checkpoint
+SELECT sum(writes) AS writes, sum(fsyncs) AS fsyncs
+  FROM pg_stat_io
+  WHERE object = 'twophase' \gset io_sum_twophase_before_
+SELECT sum(reads) AS io_sum_twophase_before_reads
+  FROM pg_stat_io WHERE object = 'twophase' \gset
+SELECT sum(writes) AS writes, sum(fsyncs) AS fsyncs
+  FROM pg_stat_io
+  WHERE object = 'slru' \gset io_sum_slru_before_
+BEGIN;
+CREATE TABLE test_io_twophase(a int);
+PREPARE TRANSACTION 'test_io_stats_2pc';
+-- A checkpoint writes out and fsyncs the state files of transactions
+-- prepared before its redo horizon.
+CHECKPOINT;
+-- Committing the prepared transaction after the checkpoint reads the state
+-- file back and marks the transaction as committed in the commit log,
+-- dirtying an SLRU page.
+COMMIT PREPARED 'test_io_stats_2pc';
+DROP TABLE test_io_twophase;
+-- This checkpoint writes out and queues an fsync of the dirty commit log
+-- page.
+CHECKPOINT;
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT sum(writes) AS writes, sum(fsyncs) AS fsyncs
+  FROM pg_stat_io
+  WHERE object = 'twophase' \gset io_sum_twophase_after_
+SELECT :io_sum_twophase_after_writes > :io_sum_twophase_before_writes;
+ ?column? 
+----------
+ t
+(1 row)
+
+SELECT :io_sum_twophase_after_fsyncs > :io_sum_twophase_before_fsyncs;
+ ?column? 
+----------
+ t
+(1 row)
+
+SELECT sum(reads) AS io_sum_twophase_after_reads
+  FROM pg_stat_io WHERE object = 'twophase' \gset
+SELECT :io_sum_twophase_after_reads > :io_sum_twophase_before_reads;
+ ?column? 
+----------
+ t
+(1 row)
+
+SELECT sum(writes) AS writes, sum(fsyncs) AS fsyncs
+  FROM pg_stat_io
+  WHERE object = 'slru' \gset io_sum_slru_after_
+SELECT :io_sum_slru_after_writes > :io_sum_slru_before_writes;
+ ?column? 
+----------
+ t
+(1 row)
+
+SELECT current_setting('fsync') = 'off'
+  OR :io_sum_slru_after_fsyncs > :io_sum_slru_before_fsyncs;
  ?column? 
 ----------
  t

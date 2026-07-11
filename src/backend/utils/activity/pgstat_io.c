@@ -111,8 +111,9 @@ pgstat_prepare_io_time(bool track_io_guc)
  * Like pgstat_count_io_op() except it also accumulates time.
  *
  * The calls related to pgstat_count_buffer_*() are for pgstat_database.  As
- * pg_stat_database only counts block read and write times, these are done for
- * IOOP_READ, IOOP_WRITE and IOOP_EXTEND.
+ * pg_stat_database only counts block read and write times of relation blocks,
+ * these are done for IOOP_READ, IOOP_WRITE and IOOP_EXTEND on
+ * IOOBJECT_RELATION and IOOBJECT_TEMP_RELATION.
  *
  * pgBufferUsage is used for EXPLAIN.  pgBufferUsage has write and read stats
  * for shared, local and temporary blocks.  pg_stat_io does not track the
@@ -129,7 +130,8 @@ pgstat_count_io_op_time(IOObject io_object, IOContext io_context, IOOp io_op,
 		INSTR_TIME_SET_CURRENT(io_time);
 		INSTR_TIME_SUBTRACT(io_time, start_time);
 
-		if (io_object != IOOBJECT_WAL)
+		if (io_object == IOOBJECT_RELATION ||
+			io_object == IOOBJECT_TEMP_RELATION)
 		{
 			if (io_op == IOOP_WRITE || io_op == IOOP_EXTEND)
 			{
@@ -264,8 +266,12 @@ pgstat_get_io_object_name(IOObject io_object)
 	{
 		case IOOBJECT_RELATION:
 			return "relation";
+		case IOOBJECT_SLRU:
+			return "slru";
 		case IOOBJECT_TEMP_RELATION:
 			return "temp relation";
+		case IOOBJECT_TWOPHASE:
+			return "twophase";
 		case IOOBJECT_WAL:
 			return "wal";
 	}
@@ -413,6 +419,37 @@ pgstat_tracks_io_object(BackendType bktype, IOObject io_object,
 		return false;
 
 	/*
+	 * IO on SLRUs and on two-phase state files bypasses shared buffers and is
+	 * done without a BufferAccessStrategy, so it is only counted in the
+	 * IOCONTEXT_NORMAL IOContext.
+	 */
+	if ((io_object == IOOBJECT_SLRU || io_object == IOOBJECT_TWOPHASE) &&
+		io_context != IOCONTEXT_NORMAL)
+		return false;
+
+	/*
+	 * The background writer only operates on shared buffers, so it will never
+	 * do IO on SLRUs or two-phase state files. IO workers only process
+	 * asynchronous IO requests, which are currently issued for permanent and
+	 * temporary relations only.
+	 */
+	if ((bktype == B_BG_WRITER || bktype == B_IO_WORKER) &&
+		(io_object == IOOBJECT_SLRU || io_object == IOOBJECT_TWOPHASE))
+		return false;
+
+	/*
+	 * Two-phase state files are only read by processes that can execute
+	 * COMMIT/ROLLBACK PREPARED and by the startup process during recovery,
+	 * and are only written (and fsync'd) by the processes that can perform a
+	 * checkpoint.
+	 */
+	if (io_object == IOOBJECT_TWOPHASE &&
+		!(bktype == B_BACKEND || bktype == B_BG_WORKER ||
+		  bktype == B_CHECKPOINTER || bktype == B_STARTUP ||
+		  bktype == B_STANDALONE_BACKEND || bktype == B_WAL_SENDER))
+		return false;
+
+	/*
 	 * Currently, IO on temporary relations can only occur in the
 	 * IOCONTEXT_NORMAL IOContext.
 	 */
@@ -508,6 +545,26 @@ pgstat_tracks_io_op(BackendType bktype, IOObject io_object,
 		(bktype == B_WAL_RECEIVER || bktype == B_BG_WRITER ||
 		 bktype == B_AUTOVAC_LAUNCHER || bktype == B_AUTOVAC_WORKER ||
 		 bktype == B_WAL_WRITER))
+		return false;
+
+	/*
+	 * IO on SLRUs and on two-phase state files is done directly on files
+	 * without going through shared buffers, so only reads, writes and fsyncs
+	 * are tracked for them.
+	 */
+	if ((io_object == IOOBJECT_SLRU || io_object == IOOBJECT_TWOPHASE) &&
+		!(io_op == IOOP_READ || io_op == IOOP_WRITE || io_op == IOOP_FSYNC))
+		return false;
+
+	/*
+	 * Two-phase state files are only written and fsync'd as part of a
+	 * checkpoint or during WAL replay; backend-like processes only ever read
+	 * them back when finishing a prepared transaction.
+	 */
+	if (io_object == IOOBJECT_TWOPHASE &&
+		(bktype == B_BACKEND || bktype == B_BG_WORKER ||
+		 bktype == B_WAL_SENDER) &&
+		(io_op == IOOP_WRITE || io_op == IOOP_FSYNC))
 		return false;
 
 	/*

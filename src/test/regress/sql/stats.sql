@@ -729,6 +729,51 @@ SELECT current_setting('fsync') = 'off'
   OR current_setting('wal_sync_method') IN ('open_sync', 'open_datasync')
   OR :io_sum_wal_normal_after_fsyncs > :io_sum_wal_normal_before_fsyncs;
 
+-- Test that the following operations are tracked in pg_stat_io:
+-- - writes and fsyncs of two-phase transaction state files during a
+--   checkpoint
+-- - reads of two-phase transaction state files when committing a prepared
+--   transaction after a checkpoint
+-- - writes and fsyncs of dirty SLRU pages (here, the commit log) during a
+--   checkpoint
+SELECT sum(writes) AS writes, sum(fsyncs) AS fsyncs
+  FROM pg_stat_io
+  WHERE object = 'twophase' \gset io_sum_twophase_before_
+SELECT sum(reads) AS io_sum_twophase_before_reads
+  FROM pg_stat_io WHERE object = 'twophase' \gset
+SELECT sum(writes) AS writes, sum(fsyncs) AS fsyncs
+  FROM pg_stat_io
+  WHERE object = 'slru' \gset io_sum_slru_before_
+BEGIN;
+CREATE TABLE test_io_twophase(a int);
+PREPARE TRANSACTION 'test_io_stats_2pc';
+-- A checkpoint writes out and fsyncs the state files of transactions
+-- prepared before its redo horizon.
+CHECKPOINT;
+-- Committing the prepared transaction after the checkpoint reads the state
+-- file back and marks the transaction as committed in the commit log,
+-- dirtying an SLRU page.
+COMMIT PREPARED 'test_io_stats_2pc';
+DROP TABLE test_io_twophase;
+-- This checkpoint writes out and queues an fsync of the dirty commit log
+-- page.
+CHECKPOINT;
+SELECT pg_stat_force_next_flush();
+SELECT sum(writes) AS writes, sum(fsyncs) AS fsyncs
+  FROM pg_stat_io
+  WHERE object = 'twophase' \gset io_sum_twophase_after_
+SELECT :io_sum_twophase_after_writes > :io_sum_twophase_before_writes;
+SELECT :io_sum_twophase_after_fsyncs > :io_sum_twophase_before_fsyncs;
+SELECT sum(reads) AS io_sum_twophase_after_reads
+  FROM pg_stat_io WHERE object = 'twophase' \gset
+SELECT :io_sum_twophase_after_reads > :io_sum_twophase_before_reads;
+SELECT sum(writes) AS writes, sum(fsyncs) AS fsyncs
+  FROM pg_stat_io
+  WHERE object = 'slru' \gset io_sum_slru_after_
+SELECT :io_sum_slru_after_writes > :io_sum_slru_before_writes;
+SELECT current_setting('fsync') = 'off'
+  OR :io_sum_slru_after_fsyncs > :io_sum_slru_before_fsyncs;
+
 -- Change the tablespace so that the table is rewritten directly, then SELECT
 -- from it to cause it to be read back into shared buffers.
 SELECT sum(reads) AS io_sum_shared_before_reads
