@@ -548,6 +548,15 @@ postgres   27093  0.0  0.0  30096  2752 ?        Ss   11:34   0:00 postgres: ser
      </row>
 
      <row>
+      <entry><structname>pg_stat_role</structname><indexterm><primary>pg_stat_role</primary></indexterm></entry>
+      <entry>One row per role, showing statistics about sessions and
+       transactions of that role. See
+       <link linkend="monitoring-pg-stat-role">
+       <structname>pg_stat_role</structname></link> for details.
+      </entry>
+     </row>
+
+     <row>
       <entry><structname>pg_stat_slru</structname><indexterm><primary>pg_stat_slru</primary></indexterm></entry>
       <entry>One row per SLRU, showing statistics of operations. See
        <link linkend="monitoring-pg-stat-slru-view">
@@ -2561,6 +2570,99 @@ description | Waiting for a newly initialized WAL file to reach durable storage
        <literal>NOT DEFERRABLE</literal> unique constraints during the
        application of changes. See <xref linkend="conflict-multiple-unique-conflicts"/>
        for details about this conflict.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>stats_reset</structfield> <type>timestamp with time zone</type>
+      </para>
+      <para>
+       Time at which these statistics were last reset
+      </para></entry>
+     </row>
+    </tbody>
+   </tgroup>
+  </table>
+
+ </sect2>
+
+ <sect2 id="monitoring-pg-stat-role">
+  <title><structname>pg_stat_role</structname></title>
+
+  <indexterm>
+   <primary>pg_stat_role</primary>
+  </indexterm>
+
+  <para>
+   The <structname>pg_stat_role</structname> view will contain one row per
+   role, showing cumulative statistics about the activity of sessions that
+   logged in as that role.  Activity is attributed to the login role of a
+   session; <command>SET ROLE</command> and <literal>SECURITY
+   DEFINER</literal> functions do not change the role activity is counted
+   for.  Only client sessions are counted, not background processes such as
+   autovacuum workers.
+  </para>
+
+  <table id="pg-stat-role" xreflabel="pg_stat_role">
+   <title><structname>pg_stat_role</structname> View</title>
+   <tgroup cols="1">
+    <thead>
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       Column Type
+      </para>
+      <para>
+       Description
+      </para></entry>
+     </row>
+    </thead>
+
+    <tbody>
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>roleid</structfield> <type>oid</type>
+      </para>
+      <para>
+       OID of the role
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>rolname</structfield> <type>name</type>
+      </para>
+      <para>
+       Name of the role
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>sessions</structfield> <type>bigint</type>
+      </para>
+      <para>
+       Number of sessions established by this role
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>xact_commit</structfield> <type>bigint</type>
+      </para>
+      <para>
+       Number of transactions in sessions of this role that have been
+       committed
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>xact_rollback</structfield> <type>bigint</type>
+      </para>
+      <para>
+       Number of transactions in sessions of this role that have been
+       rolled back
       </para></entry>
      </row>
 
@@ -5978,6 +6080,26 @@ description | Waiting for a newly initialized WAL file to reach durable storage
         <structname>pg_stat_subscription_stats</structname> view to zero. If
         the argument is <literal>NULL</literal>, reset statistics for all
         subscriptions.
+       </para>
+       <para>
+        This function is restricted to superusers by default, but other users
+        can be granted EXECUTE to run the function.
+       </para></entry>
+      </row>
+
+      <row>
+       <entry role="func_table_entry"><para role="func_signature">
+        <indexterm>
+          <primary>pg_stat_reset_role_stats</primary>
+        </indexterm>
+        <function>pg_stat_reset_role_stats</function> ( <type>oid</type> )
+        <returnvalue>void</returnvalue>
+       </para>
+       <para>
+        Resets statistics for a single role shown in the
+        <structname>pg_stat_role</structname> view to zero. If
+        the argument is <literal>NULL</literal>, reset statistics for all
+        roles.
        </para>
        <para>
         This function is restricted to superusers by default, but other users

@@ -382,6 +382,23 @@ static const PgStat_KindInfo pgstat_kind_builtin_infos[PGSTAT_KIND_BUILTIN_SIZE]
 		.reset_timestamp_cb = pgstat_backend_reset_timestamp_cb,
 	},
 
+	[PGSTAT_KIND_ROLE] = {
+		.name = "role",
+
+		.fixed_amount = false,
+		.write_to_file = true,
+		/* so pg_stat_role entries can be seen in all databases */
+		.accessed_across_databases = true,
+
+		.shared_size = sizeof(PgStatShared_Role),
+		.shared_data_off = offsetof(PgStatShared_Role, stats),
+		.shared_data_len = sizeof(((PgStatShared_Role *) 0)->stats),
+		.pending_size = sizeof(PgStat_StatRoleEntry),
+
+		.flush_pending_cb = pgstat_role_flush_cb,
+		.reset_timestamp_cb = pgstat_role_reset_timestamp_cb,
+	},
+
 	/* stats for fixed-numbered (mostly 1) objects */
 
 	[PGSTAT_KIND_ARCHIVER] = {
@@ -786,6 +803,7 @@ pgstat_report_stat(bool force)
 	}
 
 	pgstat_update_dbstats(now);
+	pgstat_update_role_stats();
 
 	/* don't wait for lock acquisition when !force */
 	nowait = !force;

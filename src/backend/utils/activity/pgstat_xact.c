@@ -42,6 +42,7 @@ AtEOXact_PgStat(bool isCommit, bool parallel)
 	PgStat_SubXactStatus *xact_state;
 
 	AtEOXact_PgStat_Database(isCommit, parallel);
+	AtEOXact_PgStat_Role(isCommit, parallel);
 
 	/* handle transactional stats information */
 	xact_state = pgStatXactStack;

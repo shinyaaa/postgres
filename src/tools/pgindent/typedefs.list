@@ -2329,6 +2329,7 @@ PgStatShared_IO
 PgStatShared_Lock
 PgStatShared_Relation
 PgStatShared_ReplSlot
+PgStatShared_Role
 PgStatShared_SLRU
 PgStatShared_Subscription
 PgStatShared_Wal
@@ -2363,6 +2364,7 @@ PgStat_StatCustomVarEntry
 PgStat_StatDBEntry
 PgStat_StatFuncEntry
 PgStat_StatReplSlotEntry
+PgStat_StatRoleEntry
 PgStat_StatSubEntry
 PgStat_StatTabEntry
 PgStat_StatsFileOp

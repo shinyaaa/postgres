@@ -519,6 +519,12 @@ typedef struct PgStatShared_Subscription
 	PgStat_StatSubEntry stats;
 } PgStatShared_Subscription;
 
+typedef struct PgStatShared_Role
+{
+	PgStatShared_Common header;
+	PgStat_StatRoleEntry stats;
+} PgStatShared_Role;
+
 typedef struct PgStatShared_ReplSlot
 {
 	PgStatShared_Common header;
@@ -845,6 +851,16 @@ extern bool pgstat_wal_flush_cb(bool nowait);
 extern void pgstat_wal_init_shmem_cb(void *stats);
 extern void pgstat_wal_reset_all_cb(TimestampTz ts);
 extern void pgstat_wal_snapshot_cb(void);
+
+
+/*
+ * Functions in pgstat_role.c
+ */
+
+extern void AtEOXact_PgStat_Role(bool isCommit, bool parallel);
+extern void pgstat_update_role_stats(void);
+extern bool pgstat_role_flush_cb(PgStat_EntryRef *entry_ref, bool nowait);
+extern void pgstat_role_reset_timestamp_cb(PgStatShared_Common *header, TimestampTz ts);
 
 
 /*
