@@ -4497,6 +4497,7 @@ PostgresMain(const char *dbname, const char *username)
 		on_proc_exit(log_disconnections, 0);
 
 	pgstat_report_connect(MyDatabaseId);
+	pgstat_report_role_connect(GetSessionUserId());
 
 	/* Perform initialization specific to a WAL sender process. */
 	if (am_walsender)

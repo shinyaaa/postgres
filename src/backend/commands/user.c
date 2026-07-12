@@ -32,6 +32,7 @@
 #include "commands/user.h"
 #include "libpq/crypt.h"
 #include "miscadmin.h"
+#include "pgstat.h"
 #include "port/pg_bitutils.h"
 #include "storage/lmgr.h"
 #include "utils/acl.h"
@@ -605,6 +606,9 @@ CreateRole(ParseState *pstate, CreateRoleStmt *stmt)
 
 	/* Post creation hook for new role */
 	InvokeObjectPostCreateHook(AuthIdRelationId, roleid, 0);
+
+	/* Create the statistics entry for the new role */
+	pgstat_create_role(roleid);
 
 	/*
 	 * Close pg_authid, but keep lock till commit.
@@ -1325,6 +1329,9 @@ DropRole(DropRoleStmt *stmt)
 		 * Remove settings for this role.
 		 */
 		DropSetting(InvalidOid, roleid);
+
+		/* Drop the statistics entry for this role */
+		pgstat_drop_role(roleid);
 	}
 
 	/*

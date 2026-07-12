@@ -218,7 +218,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BCBC
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BCBD
 
 typedef struct PgStat_ArchiverStats
 {
@@ -447,6 +447,14 @@ typedef struct PgStat_StatSubEntry
 	PgStat_Counter conflict_count[CONFLICT_NUM_TYPES];
 	TimestampTz stat_reset_timestamp;
 } PgStat_StatSubEntry;
+
+typedef struct PgStat_StatRoleEntry
+{
+	PgStat_Counter sessions;
+	PgStat_Counter xact_commit;
+	PgStat_Counter xact_rollback;
+	TimestampTz stat_reset_timestamp;
+} PgStat_StatRoleEntry;
 
 typedef struct PgStat_StatTabEntry
 {
@@ -810,6 +818,16 @@ extern void pgstat_count_slru_truncate(int slru_idx);
 extern const char *pgstat_get_slru_name(int slru_idx);
 extern int	pgstat_get_slru_index(const char *name);
 extern PgStat_SLRUStats *pgstat_fetch_slru(void);
+
+
+/*
+ * Functions in pgstat_role.c
+ */
+
+extern void pgstat_create_role(Oid roleid);
+extern void pgstat_drop_role(Oid roleid);
+extern void pgstat_report_role_connect(Oid roleid);
+extern PgStat_StatRoleEntry *pgstat_fetch_stat_role_entry(Oid roleid);
 
 
 /*

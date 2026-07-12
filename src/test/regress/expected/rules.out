@@ -2274,6 +2274,14 @@ pg_stat_replication_slots| SELECT s.slot_name,
    FROM pg_replication_slots r,
     LATERAL pg_stat_get_replication_slot((r.slot_name)::text) s(slot_name, spill_txns, spill_count, spill_bytes, stream_txns, stream_count, stream_bytes, mem_exceeded_count, total_txns, total_bytes, slotsync_skip_count, slotsync_last_skip, stats_reset)
   WHERE (r.datoid IS NOT NULL);
+pg_stat_role| SELECT rs.roleid,
+    r.rolname,
+    rs.sessions,
+    rs.xact_commit,
+    rs.xact_rollback,
+    rs.stats_reset
+   FROM pg_roles r,
+    LATERAL pg_stat_get_role_stats(r.oid) rs(roleid, sessions, xact_commit, xact_rollback, stats_reset);
 pg_stat_slru| SELECT name,
     blks_zeroed,
     blks_hit,

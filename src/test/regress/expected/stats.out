@@ -127,14 +127,15 @@ SELECT id, name, fixed_amount,
   4 | replslot     | f            | t         | t
   5 | subscription | f            | t         | t
   6 | backend      | f            | t         | f
-  7 | archiver     | t            | f         | t
-  8 | bgwriter     | t            | f         | t
-  9 | checkpointer | t            | f         | t
- 10 | io           | t            | f         | t
- 11 | lock         | t            | f         | t
- 12 | slru         | t            | f         | t
- 13 | wal          | t            | f         | t
-(13 rows)
+  7 | role         | f            | t         | t
+  8 | archiver     | t            | f         | t
+  9 | bgwriter     | t            | f         | t
+ 10 | checkpointer | t            | f         | t
+ 11 | io           | t            | f         | t
+ 12 | lock         | t            | f         | t
+ 13 | slru         | t            | f         | t
+ 14 | wal          | t            | f         | t
+(14 rows)
 
 -- ensure that both seqscan and indexscan plans are allowed
 SET enable_seqscan TO on;
@@ -1495,6 +1496,101 @@ SELECT pg_stat_get_subscription_stats(NULL);
  pg_stat_get_subscription_stats 
 --------------------------------
  
+(1 row)
+
+SELECT pg_stat_get_role_stats(NULL);
+ pg_stat_get_role_stats 
+------------------------
+ 
+(1 row)
+
+-- Test per-role statistics
+CREATE ROLE regress_stats_role1;
+SELECT oid AS stats_test_role1_oid FROM pg_roles
+  WHERE rolname = 'regress_stats_role1' \gset
+-- creating a role also creates its stats entry, with all-zero counters;
+-- stats_reset is NULL until the entry is explicitly reset
+SELECT pg_stat_have_stats('role', 0, :stats_test_role1_oid);
+ pg_stat_have_stats 
+--------------------
+ t
+(1 row)
+
+SELECT sessions, xact_commit, xact_rollback,
+       stats_reset IS NOT NULL AS has_stats_reset
+  FROM pg_stat_role WHERE rolname = 'regress_stats_role1';
+ sessions | xact_commit | xact_rollback | has_stats_reset 
+----------+-------------+---------------+-----------------
+        0 |           0 |             0 | f
+(1 row)
+
+-- stats entry of a rolled back CREATE ROLE is dropped again
+BEGIN;
+CREATE ROLE regress_stats_role2;
+SELECT oid AS stats_test_role2_oid FROM pg_roles
+  WHERE rolname = 'regress_stats_role2' \gset
+ROLLBACK;
+SELECT pg_stat_have_stats('role', 0, :stats_test_role2_oid);
+ pg_stat_have_stats 
+--------------------
+ f
+(1 row)
+
+-- this session's activity is attributed to its login role
+BEGIN;
+SELECT 1 AS dummy;
+ dummy 
+-------
+     1
+(1 row)
+
+COMMIT;
+BEGIN;
+SELECT 1 AS dummy;
+ dummy 
+-------
+     1
+(1 row)
+
+ROLLBACK;
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT sessions > 0 AS has_sessions, xact_commit > 0 AS has_xact_commit,
+       xact_rollback > 0 AS has_xact_rollback
+  FROM pg_stat_role WHERE rolname = current_user;
+ has_sessions | has_xact_commit | has_xact_rollback 
+--------------+-----------------+-------------------
+ t            | t               | t
+(1 row)
+
+-- resetting stats of a single role sets a new reset timestamp
+SELECT pg_stat_reset_role_stats(:stats_test_role1_oid);
+ pg_stat_reset_role_stats 
+--------------------------
+ 
+(1 row)
+
+SELECT sessions, xact_commit, xact_rollback,
+       stats_reset IS NOT NULL AS has_stats_reset
+  FROM pg_stat_role WHERE rolname = 'regress_stats_role1';
+ sessions | xact_commit | xact_rollback | has_stats_reset 
+----------+-------------+---------------+-----------------
+        0 |           0 |             0 | t
+(1 row)
+
+-- invalid role OID is rejected
+SELECT pg_stat_reset_role_stats(0);
+ERROR:  invalid role OID 0
+-- dropping a role also drops its stats entry
+DROP ROLE regress_stats_role1;
+SELECT pg_stat_have_stats('role', 0, :stats_test_role1_oid);
+ pg_stat_have_stats 
+--------------------
+ f
 (1 row)
 
 -- Test that the following operations are tracked in pg_stat_io and in

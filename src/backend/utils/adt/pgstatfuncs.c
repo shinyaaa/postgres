@@ -2151,6 +2151,31 @@ pg_stat_reset_subscription_stats(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
+/* Reset role stats (a specific one or all of them) */
+Datum
+pg_stat_reset_role_stats(PG_FUNCTION_ARGS)
+{
+	Oid			roleid;
+
+	if (PG_ARGISNULL(0))
+	{
+		/* Clear all role stats */
+		pgstat_reset_of_kind(PGSTAT_KIND_ROLE);
+	}
+	else
+	{
+		roleid = PG_GETARG_OID(0);
+
+		if (!OidIsValid(roleid))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("invalid role OID %u", roleid)));
+		pgstat_reset(PGSTAT_KIND_ROLE, InvalidOid, roleid);
+	}
+
+	PG_RETURN_VOID();
+}
+
 Datum
 pg_stat_get_archiver(PG_FUNCTION_ARGS)
 {
@@ -2379,6 +2404,71 @@ pg_stat_get_subscription_stats(PG_FUNCTION_ARGS)
 		values[i] = TimestampTzGetDatum(subentry->stat_reset_timestamp);
 
 	Assert(i + 1 == PG_STAT_GET_SUBSCRIPTION_STATS_COLS);
+
+	/* Returns the record as Datum */
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
+/*
+ * Get the statistics for the given role. If the role statistics are not
+ * available, return all-zeros stats.
+ */
+Datum
+pg_stat_get_role_stats(PG_FUNCTION_ARGS)
+{
+#define PG_STAT_GET_ROLE_STATS_COLS	5
+	Oid			roleid = PG_GETARG_OID(0);
+	TupleDesc	tupdesc;
+	Datum		values[PG_STAT_GET_ROLE_STATS_COLS] = {0};
+	bool		nulls[PG_STAT_GET_ROLE_STATS_COLS] = {0};
+	PgStat_StatRoleEntry *roleentry;
+	PgStat_StatRoleEntry allzero;
+	int			i = 0;
+
+	/* Get role stats */
+	roleentry = pgstat_fetch_stat_role_entry(roleid);
+
+	/* Initialise attributes information in the tuple descriptor */
+	tupdesc = CreateTemplateTupleDesc(PG_STAT_GET_ROLE_STATS_COLS);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 1, "roleid",
+					   OIDOID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 2, "sessions",
+					   INT8OID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 3, "xact_commit",
+					   INT8OID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 4, "xact_rollback",
+					   INT8OID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 5, "stats_reset",
+					   TIMESTAMPTZOID, -1, 0);
+	TupleDescFinalize(tupdesc);
+	BlessTupleDesc(tupdesc);
+
+	if (!roleentry)
+	{
+		/* If the role is not found, initialise its stats */
+		memset(&allzero, 0, sizeof(PgStat_StatRoleEntry));
+		roleentry = &allzero;
+	}
+
+	/* roleid */
+	values[i++] = ObjectIdGetDatum(roleid);
+
+	/* sessions */
+	values[i++] = Int64GetDatum(roleentry->sessions);
+
+	/* xact_commit */
+	values[i++] = Int64GetDatum(roleentry->xact_commit);
+
+	/* xact_rollback */
+	values[i++] = Int64GetDatum(roleentry->xact_rollback);
+
+	/* stats_reset */
+	if (roleentry->stat_reset_timestamp == 0)
+		nulls[i] = true;
+	else
+		values[i] = TimestampTzGetDatum(roleentry->stat_reset_timestamp);
+
+	Assert(i + 1 == PG_STAT_GET_ROLE_STATS_COLS);
 
 	/* Returns the record as Datum */
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));

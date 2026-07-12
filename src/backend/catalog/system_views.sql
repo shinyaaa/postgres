@@ -1561,6 +1561,17 @@ CREATE VIEW pg_stat_subscription_stats AS
     FROM pg_subscription as s,
          pg_stat_get_subscription_stats(s.oid) as ss;
 
+CREATE VIEW pg_stat_role AS
+    SELECT
+        rs.roleid,
+        r.rolname,
+        rs.sessions,
+        rs.xact_commit,
+        rs.xact_rollback,
+        rs.stats_reset
+    FROM pg_roles as r,
+         pg_stat_get_role_stats(r.oid) as rs;
+
 CREATE VIEW pg_wait_events AS
     SELECT * FROM pg_get_wait_events();
 
