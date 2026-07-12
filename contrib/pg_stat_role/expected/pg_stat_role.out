@@ -1,0 +1,351 @@
+--
+-- Tests for pg_stat_role
+--
+-- Note on the expected statement counts: utility statements are charged
+-- to the user that executes them, so a RESET ROLE issued while SET ROLE
+-- is in effect is counted for the role being reset.
+--
+CREATE EXTENSION pg_stat_role;
+SET pg_stat_role.track = on;
+-- Roles and a table used throughout the test
+CREATE ROLE pgsr_role1;
+CREATE ROLE pgsr_role2;
+CREATE ROLE pgsr_nopriv;
+CREATE TABLE pgsr_tab AS SELECT g AS a FROM generate_series(1, 1000) g;
+GRANT SELECT, INSERT ON pgsr_tab TO pgsr_role1, pgsr_role2;
+--
+-- Privileges: reading and resetting the statistics requires more than
+-- an ordinary role.
+--
+SET ROLE pgsr_nopriv;
+SELECT count(*) FROM pg_stat_role;			-- fail
+ERROR:  permission denied for view pg_stat_role
+SELECT count(*) FROM pg_stat_role_entries();	-- fail
+ERROR:  permission denied for function pg_stat_role_entries
+SELECT pg_stat_role_reset();				-- fail
+ERROR:  permission denied for function pg_stat_role_reset
+SELECT pg_stat_role_gc();					-- fail
+ERROR:  permission denied for function pg_stat_role_gc
+RESET ROLE;
+--
+-- Basic attribution: statements and rows are charged to the role that
+-- ran them.
+--
+SELECT pg_stat_role_reset();
+ pg_stat_role_reset 
+--------------------
+ 
+(1 row)
+
+SET ROLE pgsr_role1;
+SELECT count(*) FROM pgsr_tab;
+ count 
+-------
+  1000
+(1 row)
+
+SELECT count(*) FROM pgsr_tab;
+ count 
+-------
+  1000
+(1 row)
+
+RESET ROLE;
+SET ROLE pgsr_role2;
+INSERT INTO pgsr_tab VALUES (0);
+RESET ROLE;
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+-- pgsr_role1: 2 SELECTs + RESET ROLE; pgsr_role2: INSERT + RESET ROLE
+SELECT rolname, statements, rows FROM pg_stat_role
+  WHERE rolname IN ('pgsr_role1', 'pgsr_role2') ORDER BY rolname;
+  rolname   | statements | rows 
+------------+------------+------
+ pgsr_role1 |          3 |    2
+ pgsr_role2 |          2 |    1
+(2 rows)
+
+-- The reader touched blocks, the writer generated WAL
+SELECT shared_blks_hit + shared_blks_read > 0 AS read_blocks,
+       total_exec_time > 0 AS has_exec_time,
+       cpu_user_time >= 0 AND cpu_system_time >= 0 AS cpu_sane
+  FROM pg_stat_role WHERE rolname = 'pgsr_role1';
+ read_blocks | has_exec_time | cpu_sane 
+-------------+---------------+----------
+ t           | t             | t
+(1 row)
+
+SELECT wal_records > 0 AS wrote_wal,
+       wal_bytes > 0 AS wrote_wal_bytes
+  FROM pg_stat_role WHERE rolname = 'pgsr_role2';
+ wrote_wal | wrote_wal_bytes 
+-----------+-----------------
+ t         | t
+(1 row)
+
+--
+-- Nested statements: SQL run inside a function must not be counted
+-- separately from the calling statement.
+--
+CREATE FUNCTION pgsr_nested() RETURNS bigint LANGUAGE plpgsql AS
+$$
+DECLARE r bigint;
+BEGIN
+  SELECT count(*) INTO r FROM pgsr_tab;
+  SELECT count(*) INTO r FROM pgsr_tab;
+  RETURN r;
+END
+$$;
+SELECT pg_stat_role_reset();
+ pg_stat_role_reset 
+--------------------
+ 
+(1 row)
+
+SET ROLE pgsr_role1;
+SELECT pgsr_nested() > 0 AS ok;
+ ok 
+----
+ t
+(1 row)
+
+RESET ROLE;
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+-- 2 statements (the function call and RESET ROLE), not 4
+SELECT statements, rows FROM pg_stat_role WHERE rolname = 'pgsr_role1';
+ statements | rows 
+------------+------
+          2 |    1
+(1 row)
+
+--
+-- SECURITY DEFINER: the whole statement is charged to the caller as of
+-- statement start, not to the function owner.
+--
+CREATE FUNCTION pgsr_secdef() RETURNS bigint LANGUAGE sql SECURITY DEFINER
+AS 'SELECT count(*) FROM pgsr_tab';
+ALTER FUNCTION pgsr_secdef() OWNER TO pgsr_role2;
+SELECT pg_stat_role_reset();
+ pg_stat_role_reset 
+--------------------
+ 
+(1 row)
+
+SET ROLE pgsr_role1;
+SELECT pgsr_secdef() > 0 AS ok;
+ ok 
+----
+ t
+(1 row)
+
+RESET ROLE;
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT rolname, statements, rows FROM pg_stat_role
+  WHERE rolname IN ('pgsr_role1', 'pgsr_role2') ORDER BY rolname;
+  rolname   | statements | rows 
+------------+------------+------
+ pgsr_role1 |          2 |    1
+ pgsr_role2 |          0 |    0
+(2 rows)
+
+--
+-- Parallel query: worker backends must not inflate the statement and
+-- row counts.
+--
+-- encourage use of parallel plans
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET max_parallel_workers_per_gather = 2;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM pgsr_tab;
+                   QUERY PLAN                    
+-------------------------------------------------
+ Finalize Aggregate
+   ->  Gather
+         Workers Planned: 2
+         ->  Partial Aggregate
+               ->  Parallel Seq Scan on pgsr_tab
+(5 rows)
+
+SELECT pg_stat_role_reset();
+ pg_stat_role_reset 
+--------------------
+ 
+(1 row)
+
+SET ROLE pgsr_role1;
+SELECT count(*) FROM pgsr_tab;
+ count 
+-------
+  1001
+(1 row)
+
+RESET ROLE;
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+-- 2 statements (SELECT and RESET ROLE), 1 row
+SELECT statements, rows FROM pg_stat_role WHERE rolname = 'pgsr_role1';
+ statements | rows 
+------------+------
+          2 |    1
+(1 row)
+
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+RESET max_parallel_workers_per_gather;
+--
+-- pg_stat_role.track = off disables collection
+--
+SELECT pg_stat_role_reset();
+ pg_stat_role_reset 
+--------------------
+ 
+(1 row)
+
+SET pg_stat_role.track = off;
+SET ROLE pgsr_role1;
+SELECT count(*) FROM pgsr_tab;
+ count 
+-------
+  1001
+(1 row)
+
+RESET ROLE;
+SET pg_stat_role.track = on;
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT statements FROM pg_stat_role WHERE rolname = 'pgsr_role1';
+ statements 
+------------
+          0
+(1 row)
+
+--
+-- Resetting a single role leaves the others alone
+--
+SELECT pg_stat_role_reset();
+ pg_stat_role_reset 
+--------------------
+ 
+(1 row)
+
+SET ROLE pgsr_role1;
+SELECT count(*) FROM pgsr_tab;
+ count 
+-------
+  1001
+(1 row)
+
+RESET ROLE;
+SET ROLE pgsr_role2;
+SELECT count(*) FROM pgsr_tab;
+ count 
+-------
+  1001
+(1 row)
+
+RESET ROLE;
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_stat_role_reset((SELECT oid FROM pg_roles WHERE rolname = 'pgsr_role1'));
+ pg_stat_role_reset 
+--------------------
+ 
+(1 row)
+
+SELECT rolname, statements, stats_reset IS NOT NULL AS has_reset
+  FROM pg_stat_role
+  WHERE rolname IN ('pgsr_role1', 'pgsr_role2') ORDER BY rolname;
+  rolname   | statements | has_reset 
+------------+------------+-----------
+ pgsr_role1 |          0 | t
+ pgsr_role2 |          2 | t
+(2 rows)
+
+--
+-- DROP ROLE removes the role's entry; a rolled-back DROP ROLE does not.
+--
+CREATE ROLE pgsr_dropme;
+GRANT SELECT ON pgsr_tab TO pgsr_dropme;
+SET ROLE pgsr_dropme;
+SELECT count(*) FROM pgsr_tab;
+ count 
+-------
+  1001
+(1 row)
+
+RESET ROLE;
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT count(*) FROM pg_stat_role WHERE rolname = 'pgsr_dropme';
+ count 
+-------
+     1
+(1 row)
+
+BEGIN;
+DROP OWNED BY pgsr_dropme;
+DROP ROLE pgsr_dropme;
+ROLLBACK;
+SELECT count(*) FROM pg_stat_role WHERE rolname = 'pgsr_dropme';
+ count 
+-------
+     1
+(1 row)
+
+DROP OWNED BY pgsr_dropme;
+DROP ROLE pgsr_dropme;
+-- no entry left behind for a role missing from pg_roles
+SELECT count(*) FROM pg_stat_role_entries() e
+  WHERE NOT EXISTS (SELECT 1 FROM pg_roles r WHERE r.oid = e.roleid);
+ count 
+-------
+     0
+(1 row)
+
+-- and consequently nothing for the garbage collector to do
+SELECT pg_stat_role_gc();
+ pg_stat_role_gc 
+-----------------
+               0
+(1 row)
+
+-- Cleanup
+DROP FUNCTION pgsr_nested();
+DROP FUNCTION pgsr_secdef();
+DROP TABLE pgsr_tab;
+DROP ROLE pgsr_role1;
+DROP ROLE pgsr_role2;
+DROP ROLE pgsr_nopriv;
+DROP EXTENSION pg_stat_role;
