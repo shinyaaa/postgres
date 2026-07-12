@@ -1,0 +1,5 @@
+# pg_stat_role extension
+comment = 'cumulative per-role resource usage statistics'
+default_version = '1.0'
+module_pathname = '$libdir/pg_stat_role'
+relocatable = true
