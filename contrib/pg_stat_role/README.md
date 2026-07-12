@@ -182,7 +182,8 @@ explicitly granted.
 - CPU time of parallel workers that do not go through the executor
   (parallel `CREATE INDEX`, parallel `VACUUM`) is not captured — their
   buffer and WAL usage *is*, via the leader. This is a limitation of
-  the current hook placement, not of the statistics API; see Roadmap.
+  the current hook placement, not of the statistics API; see the next
+  section.
 - Background processing (autovacuum, checkpointer, WAL writer,
   bgwriter) is not attributed to any role.
 - Statements that fail with an error are not counted (`ExecutorEnd`
@@ -192,6 +193,54 @@ explicitly granted.
   tracked may be attributed to that statement or dropped for the
   suspended portal; `FETCH` statements themselves are measured as
   utility statements. `pg_stat_kcache` shares this limitation.
+
+## What an in-core implementation would solve
+
+Most of the limitations above are artifacts of living outside the
+server — consequences of *where extensions can place code*, not of the
+per-role statistics design or of the custom cumulative statistics API.
+They are collected here because they double as the argument for an
+eventual built-in `PGSTAT_KIND_ROLE`:
+
+- **Kind ID collision.** A built-in kind has its own reserved ID;
+  the `PGSTAT_KIND_EXPERIMENTAL` clash and the registration ceremony
+  disappear entirely.
+- **CPU of executor-less parallel workers.** The extension only runs
+  when one of its hooks fires, and parallel `CREATE INDEX` / `VACUUM`
+  workers fire none of them. Core code has no such constraint: it can
+  sample `getrusage()` in `ParallelWorkerMain` or at process exit for
+  *every* worker type. (Even as an extension this is not a hard wall —
+  the custom-stats `init_backend_cb` runs in all processes attached to
+  the statistics system, parallel workers included, so a process-exit
+  flush could cover them. It is merely fiddly: the callback may run
+  after the final pending flush, so it must write to the shared entry
+  directly, and it must not double-count workers already measured by
+  the executor hooks.)
+- **Loading requirements and stats retention.** The extension must be
+  in `shared_preload_libraries`; if the server ever starts without it,
+  the saved per-role statistics are discarded from the stats file and
+  `DROP ROLE` runs without the cleanup hook — which is the only reason
+  `pg_stat_role_gc()` exists. A built-in kind is always present, so
+  entries can neither be orphaned nor thrown away, and the GC function
+  becomes unnecessary (the drop would live in `DropRole()` itself,
+  like the built-in transactional stats drops for tables).
+- **Statements that fail with an error.** Hooks only observe
+  successful completion (`ExecutorEnd`); the server could account the
+  resources consumed by failed statements from its error path as well.
+- **Cursor / portal interleaving.** The hooks approximate statement
+  boundaries from the outside with one static snapshot slot; the
+  server owns the portal machinery and could keep exact per-portal
+  usage (as it already does for `EXPLAIN` instrumentation), removing
+  the mis-attribution cases described above.
+
+What in-core implementation would *not* change: the attribution model
+(charging `SECURITY DEFINER` work to the caller is a design decision,
+not a technical constraint), the loss of statistics on a crash
+(inherent to PostgreSQL's cumulative statistics), the missing
+context-switch counters on Windows (an OS API gap), and whether
+background work such as autovacuum should be attributed to anyone —
+that too is a design decision, though core would at least have the
+option.
 
 ## Overhead
 
@@ -240,12 +289,9 @@ reset, and `DROP ROLE` cleanup (including rollback).
 ## Roadmap
 
 - Reserve a permanent custom stats kind ID.
-- Capture CPU time of executor-less parallel workers: the custom-stats
-  `init_backend_cb` runs in every process attached to the statistics
-  system (parallel workers included), so a process-exit flush of
-  whole-process `getrusage()` can cover them; an in-core
-  implementation would instead instrument `ParallelWorkerMain` /
-  process exit directly.
+- Capture CPU time of executor-less parallel workers via
+  `init_backend_cb` plus a process-exit flush (see *What an in-core
+  implementation would solve* for the approach and its pitfalls).
 - Optional database×role keying.
 - Optional attribution of maintenance work (autovacuum) to table
   owners.
