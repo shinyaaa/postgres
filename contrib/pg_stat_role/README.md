@@ -128,8 +128,23 @@ are not granted to anyone by default.
 
 ## Benchmarks
 
-A `pgbench` comparison across client counts (all clients connecting as
-the same role, the worst case for shared-entry contention) is planned
-before proposing this for core; the pending-flush batching described
-above is expected to keep the overhead in the noise, as it does for the
-built-in per-database statistics.
+`pgbench -S` (select-only, scale 10, 10 s runs, best of 2 rounds), all
+clients connecting as the same role — the worst case for both
+per-statement overhead (many tiny statements) and shared-entry
+contention.  Run on a 4-core container against an assert-enabled
+(`cassert`) build, so treat the numbers as indicative only:
+
+| clients | track=on (tps) | track=off (tps) | delta |
+| ---: | ---: | ---: | ---: |
+| 1 | 5190 | 5443 | −4.6% |
+| 4 | 34743 | 34542 | +0.6% |
+| 16 | 26706 | 27291 | −2.1% |
+| 32 | 26823 | 27069 | −0.9% |
+
+The single-client delta is the per-statement bookkeeping (two
+`getrusage()` calls plus clock reads per statement); at higher client
+counts the difference is within run-to-run noise, and throughput shows
+no collapse when 32 clients hammer the same shared entry — as expected,
+since each backend flushes its pending deltas at most about once per
+second.  A proper multi-socket benchmark on an optimized build should
+accompany any in-core proposal.
