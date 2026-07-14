@@ -72,6 +72,12 @@ typedef struct
  * corresponding element of cached_role (always including the cached_role
  * itself).  There's a separate cache for each RoleRecurseType, with the
  * corresponding semantics.
+ *
+ * The lists are kept in breadth-first order for the benefit of callers that
+ * care about the ordering (see roles_is_member_of).  In addition, we keep a
+ * sorted array of the same OIDs (cached_roles_sorted, with cached_num_roles
+ * valid entries) so that simple membership checks can use binary search
+ * instead of a linear list scan (see cached_roles_contains).
  */
 enum RoleRecurseType
 {
@@ -81,6 +87,8 @@ enum RoleRecurseType
 };
 static Oid	cached_role[] = {InvalidOid, InvalidOid, InvalidOid};
 static List *cached_roles[] = {NIL, NIL, NIL};
+static Oid *cached_roles_sorted[] = {NULL, NULL, NULL};
+static int	cached_num_roles[] = {0, 0, 0};
 static uint32 cached_db_hash;
 
 /*
@@ -5174,7 +5182,9 @@ roles_list_append(List *roles_list, bloom_filter **bf, Oid role)
  * the next call of roles_is_member_of()!
  *
  * For the benefit of select_best_grantor, the result is defined to be
- * in breadth-first order, ie, closer relationships earlier.
+ * in breadth-first order, ie, closer relationships earlier.  A sorted
+ * copy of the result is cached alongside the list so that simple
+ * membership checks can use binary search; see cached_roles_contains.
  *
  * If admin_of is not InvalidOid, this function sets *admin_role, either
  * to the OID of the first role in the result list that directly possesses
@@ -5189,6 +5199,9 @@ roles_is_member_of(Oid roleid, enum RoleRecurseType type,
 	List	   *roles_list;
 	ListCell   *l;
 	List	   *new_cached_roles;
+	Oid		   *new_sorted_roles;
+	int			new_num_roles;
+	int			idx;
 	MemoryContext oldctx;
 	bloom_filter *bf = NULL;
 
@@ -5293,15 +5306,55 @@ roles_is_member_of(Oid roleid, enum RoleRecurseType type,
 	list_free(roles_list);
 
 	/*
-	 * Now safe to assign to state variable
+	 * Also build a sorted array of the same role OIDs, so that membership
+	 * checks in cached_roles_contains() can use binary search rather than
+	 * scanning the list linearly.
+	 */
+	new_num_roles = list_length(new_cached_roles);
+	new_sorted_roles = (Oid *)
+		MemoryContextAlloc(TopMemoryContext, new_num_roles * sizeof(Oid));
+	idx = 0;
+	foreach_oid(r, new_cached_roles)
+		new_sorted_roles[idx++] = r;
+	qsort(new_sorted_roles, new_num_roles, sizeof(Oid), oid_cmp);
+
+	/*
+	 * Now safe to assign to state variables
 	 */
 	cached_role[type] = InvalidOid; /* just paranoia */
 	list_free(cached_roles[type]);
 	cached_roles[type] = new_cached_roles;
+	if (cached_roles_sorted[type])
+		pfree(cached_roles_sorted[type]);
+	cached_roles_sorted[type] = new_sorted_roles;
+	cached_num_roles[type] = new_num_roles;
 	cached_role[type] = roleid;
 
 	/* And now we can return the answer */
 	return cached_roles[type];
+}
+
+/*
+ * cached_roles_contains
+ *		Is "role" among the roles that "member" is a member of, according
+ *		to the given recursion type?
+ *
+ * This populates the membership cache for "member" if necessary (via
+ * roles_is_member_of), then binary-searches the sorted-array form of the
+ * cache.  This is a faster alternative to searching the List returned by
+ * roles_is_member_of() when only a yes/no membership answer is needed.
+ */
+static bool
+cached_roles_contains(Oid member, enum RoleRecurseType type, Oid role)
+{
+	/* Ensure the cache is valid for member (cheap if it already is) */
+	(void) roles_is_member_of(member, type, InvalidOid, NULL);
+
+	Assert(cached_role[type] == member);
+	Assert(cached_num_roles[type] == list_length(cached_roles[type]));
+
+	return bsearch(&role, cached_roles_sorted[type], cached_num_roles[type],
+				   sizeof(Oid), oid_cmp) != NULL;
 }
 
 
@@ -5328,9 +5381,7 @@ has_privs_of_role(Oid member, Oid role)
 	 * Find all the roles that member has the privileges of, including
 	 * multi-level recursion, then see if target role is any one of them.
 	 */
-	return list_member_oid(roles_is_member_of(member, ROLERECURSE_PRIVS,
-											  InvalidOid, NULL),
-						   role);
+	return cached_roles_contains(member, ROLERECURSE_PRIVS, role);
 }
 
 /*
@@ -5362,9 +5413,7 @@ member_can_set_role(Oid member, Oid role)
 	 * Find all the roles that member can access via SET ROLE, including
 	 * multi-level recursion, then see if target role is any one of them.
 	 */
-	return list_member_oid(roles_is_member_of(member, ROLERECURSE_SETROLE,
-											  InvalidOid, NULL),
-						   role);
+	return cached_roles_contains(member, ROLERECURSE_SETROLE, role);
 }
 
 /*
@@ -5408,9 +5457,7 @@ is_member_of_role(Oid member, Oid role)
 	 * Find all the roles that member is a member of, including multi-level
 	 * recursion, then see if target role is any one of them.
 	 */
-	return list_member_oid(roles_is_member_of(member, ROLERECURSE_MEMBERS,
-											  InvalidOid, NULL),
-						   role);
+	return cached_roles_contains(member, ROLERECURSE_MEMBERS, role);
 }
 
 /*
@@ -5432,9 +5479,7 @@ is_member_of_role_nosuper(Oid member, Oid role)
 	 * Find all the roles that member is a member of, including multi-level
 	 * recursion, then see if target role is any one of them.
 	 */
-	return list_member_oid(roles_is_member_of(member, ROLERECURSE_MEMBERS,
-											  InvalidOid, NULL),
-						   role);
+	return cached_roles_contains(member, ROLERECURSE_MEMBERS, role);
 }
 
 
