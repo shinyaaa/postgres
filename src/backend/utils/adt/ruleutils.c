@@ -12767,8 +12767,16 @@ get_json_table_plan(TableFunc *tf, JsonTablePlan *plan, deparse_context *context
 		{
 			appendStringInfoString(context->buf,
 								   s->outerJoin ? " OUTER " : " INNER ");
+
+			/*
+			 * The grammar allows only a bare path name or a parenthesized
+			 * plan on the right side of OUTER/INNER, so a child that is
+			 * itself a join --- either a sibling join or a path scan with
+			 * its own child --- must be parenthesized.
+			 */
 			get_json_table_plan(tf, s->child, context,
-								IsA(s->child, JsonTableSiblingJoin));
+								IsA(s->child, JsonTableSiblingJoin) ||
+								castNode(JsonTablePathScan, s->child)->child != NULL);
 		}
 	}
 	else if (IsA(plan, JsonTableSiblingJoin))

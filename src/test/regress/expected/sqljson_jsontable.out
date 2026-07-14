@@ -1583,6 +1583,52 @@ EXPLAIN (COSTS OFF, VERBOSE) SELECT * FROM jsonb_table_view;
 DROP VIEW jsonb_table_view;
 DROP VIEW jsonb_table_view_nested;
 DROP DOMAIN jsonb_test_domain;
+-- Test deparsing of a PLAN clause on a multi-level chain of nested paths;
+-- the child plan of OUTER/INNER must be parenthesized if it is not a bare
+-- path name, or the deparsed definition would not re-parse (pg_dump/restore
+-- would then fail).
+CREATE VIEW jsonb_table_view_plan_chain AS
+SELECT * FROM JSON_TABLE(
+	jsonb '[{"a": 1, "b": [{"c": 2, "d": [3, 4]}]}]', '$[*]' AS p0
+	COLUMNS (
+		a int PATH '$.a',
+		NESTED PATH '$.b[*]' AS p1 COLUMNS (
+			c int PATH '$.c',
+			NESTED PATH '$.d[*]' AS p11 COLUMNS (
+				d int PATH '$'
+			)
+		)
+	)
+	PLAN (p0 OUTER (p1 INNER p11))
+);
+\sv jsonb_table_view_plan_chain
+CREATE OR REPLACE VIEW public.jsonb_table_view_plan_chain AS
+ SELECT a,
+    c,
+    d
+   FROM JSON_TABLE(
+            '[{"a": 1, "b": [{"c": 2, "d": [3, 4]}]}]'::jsonb, '$[*]' AS p0
+            COLUMNS (
+                a integer PATH '$."a"',
+                NESTED PATH '$."b"[*]' AS p1
+                COLUMNS (
+                    c integer PATH '$."c"',
+                    NESTED PATH '$."d"[*]' AS p11
+                    COLUMNS (
+                        d integer PATH '$'
+                    )
+                )
+            )
+            PLAN (p0 OUTER (p1 INNER p11))
+        )
+SELECT * FROM jsonb_table_view_plan_chain;
+ a | c | d 
+---+---+---
+ 1 | 2 | 3
+ 1 | 2 | 4
+(2 rows)
+
+DROP VIEW jsonb_table_view_plan_chain;
 CREATE TABLE s (js jsonb);
 INSERT INTO s VALUES
 	('{"a":{"za":[{"z1": [11,2222]},{"z21": [22, 234,2345]},{"z22": [32, 204,145]}]},"c": 3}'),
