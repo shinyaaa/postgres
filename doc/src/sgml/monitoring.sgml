@@ -1506,10 +1506,32 @@ description | Waiting for a newly initialized WAL file to reach durable storage
         <listitem>
          <para>
           <literal>quorum</literal>: This standby server is considered as a candidate
-          for quorum standbys.
+          for quorum standbys.  See
+          <structfield>quorum_synced</structfield> to check whether this
+          standby server is one of the quorum members whose responses are
+          currently releasing waiting transactions.
          </para>
         </listitem>
        </itemizedlist>
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>quorum_synced</structfield> <type>boolean</type>
+      </para>
+      <para>
+       True if this standby server is one of the quorum members whose
+       responses are currently releasing transactions waiting for
+       quorum-based synchronous replication, that is, its reported flush
+       position is not behind the flush position confirmed by the whole
+       quorum.  False if this standby server is a candidate for quorum
+       standbys but is not such a member at the moment, for example because
+       its flush position lags behind those of the other candidates.  Since
+       the quorum can be formed from different standbys at every moment,
+       this value can change frequently.  This is NULL unless quorum-based
+       synchronous replication is in use and this standby server is listed
+       in <xref linkend="guc-synchronous-standby-names"/>.
       </para></entry>
      </row>
 

@@ -8,9 +8,9 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 
-# Query checking sync_priority and sync_state of each standby
+# Query checking sync_priority, sync_state and quorum_synced of each standby
 my $check_sql =
-  "SELECT application_name, sync_priority, sync_state FROM pg_stat_replication ORDER BY application_name;";
+  "SELECT application_name, sync_priority, sync_state, quorum_synced FROM pg_stat_replication ORDER BY application_name;";
 
 # Check that sync_state of each standby is expected (waiting till it is).
 # If $setting is given, synchronous_standby_names is set to it and
@@ -83,9 +83,9 @@ start_standby_and_wait($node_primary, $node_standby_3);
 # Check that sync_state is determined correctly when
 # synchronous_standby_names is specified in old syntax.
 test_sync_state(
-	$node_primary, qq(standby1|1|sync
-standby2|2|potential
-standby3|0|async),
+	$node_primary, qq(standby1|1|sync|
+standby2|2|potential|
+standby3|0|async|),
 	'old syntax of synchronous_standby_names',
 	'standby1,standby2');
 
@@ -95,9 +95,9 @@ standby3|0|async),
 # it's stored in the head of WalSnd array which manages
 # all the standbys though they have the same priority.
 test_sync_state(
-	$node_primary, qq(standby1|1|sync
-standby2|1|potential
-standby3|1|potential),
+	$node_primary, qq(standby1|1|sync|
+standby2|1|potential|
+standby3|1|potential|),
 	'asterisk in synchronous_standby_names',
 	'*');
 
@@ -116,8 +116,8 @@ start_standby_and_wait($node_primary, $node_standby_3);
 # Specify 2 as the number of sync standbys.
 # Check that two standbys are in 'sync' state.
 test_sync_state(
-	$node_primary, qq(standby2|2|sync
-standby3|3|sync),
+	$node_primary, qq(standby2|2|sync|
+standby3|3|sync|),
 	'2 synchronous standbys',
 	'2(standby1,standby2,standby3)');
 
@@ -135,20 +135,20 @@ $node_standby_4->start;
 # standby3 appearing later represents potential, and standby4 is
 # in 'async' state because it's not in the list.
 test_sync_state(
-	$node_primary, qq(standby1|1|sync
-standby2|2|sync
-standby3|3|potential
-standby4|0|async),
+	$node_primary, qq(standby1|1|sync|
+standby2|2|sync|
+standby3|3|potential|
+standby4|0|async|),
 	'2 sync, 1 potential, and 1 async');
 
 # Check that sync_state of each standby is determined correctly
 # when num_sync exceeds the number of names of potential sync standbys
 # specified in synchronous_standby_names.
 test_sync_state(
-	$node_primary, qq(standby1|0|async
-standby2|4|sync
-standby3|3|sync
-standby4|1|sync),
+	$node_primary, qq(standby1|0|async|
+standby2|4|sync|
+standby3|3|sync|
+standby4|1|sync|),
 	'num_sync exceeds the num of potential sync standbys',
 	'6(standby4,standby0,standby3,standby2)');
 
@@ -159,20 +159,20 @@ standby4|1|sync),
 # second standby listed first in the WAL sender array, which is
 # standby2 in this case.
 test_sync_state(
-	$node_primary, qq(standby1|1|sync
-standby2|2|sync
-standby3|2|potential
-standby4|2|potential),
+	$node_primary, qq(standby1|1|sync|
+standby2|2|sync|
+standby3|2|potential|
+standby4|2|potential|),
 	'asterisk before another standby name',
 	'2(standby1,*,standby2)');
 
 # Check that the setting of '2(*)' chooses standby2 and standby3 that are stored
 # earlier in WalSnd array as sync standbys.
 test_sync_state(
-	$node_primary, qq(standby1|1|potential
-standby2|1|sync
-standby3|1|sync
-standby4|1|potential),
+	$node_primary, qq(standby1|1|potential|
+standby2|1|sync|
+standby3|1|sync|
+standby4|1|potential|),
 	'multiple standbys having the same priority are chosen as sync',
 	'2(*)');
 
@@ -182,28 +182,38 @@ $node_standby_3->stop;
 # Check that the state of standby1 stored earlier in WalSnd array than
 # standby4 is transited from potential to sync.
 test_sync_state(
-	$node_primary, qq(standby1|1|sync
-standby2|1|sync
-standby4|1|potential),
+	$node_primary, qq(standby1|1|sync|
+standby2|1|sync|
+standby4|1|potential|),
 	'potential standby found earlier in array is promoted to sync');
 
 # Check that standby1 and standby2 are chosen as sync standbys
 # based on their priorities.
 test_sync_state(
-	$node_primary, qq(standby1|1|sync
-standby2|2|sync
-standby4|0|async),
+	$node_primary, qq(standby1|1|sync|
+standby2|2|sync|
+standby4|0|async|),
 	'priority-based sync replication specified by FIRST keyword',
 	'FIRST 2(standby1, standby2)');
 
 # Check that all the listed standbys are considered as candidates
 # for sync standbys in a quorum-based sync replication.
 test_sync_state(
-	$node_primary, qq(standby1|1|quorum
-standby2|1|quorum
-standby4|0|async),
+	$node_primary, qq(standby1|1|quorum|t
+standby2|1|quorum|t
+standby4|0|async|),
 	'2 quorum and 1 async',
 	'ANY 2(standby1, standby2)');
+
+# Check that quorum_synced is false for all the candidates when the
+# requested number of sync standbys exceeds the number of candidates,
+# since no responses can release waiting transactions in that case.
+test_sync_state(
+	$node_primary, qq(standby1|1|quorum|f
+standby2|1|quorum|f
+standby4|0|async|),
+	'quorum requiring more standbys than candidates has no synced members',
+	'ANY 3(standby1, standby2)');
 
 # Start Standby3 which will be considered in 'quorum' state.
 $node_standby_3->start;
@@ -211,10 +221,10 @@ $node_standby_3->start;
 # Check that the setting of 'ANY 2(*)' chooses all standbys as
 # candidates for quorum sync standbys.
 test_sync_state(
-	$node_primary, qq(standby1|1|quorum
-standby2|1|quorum
-standby3|1|quorum
-standby4|1|quorum),
+	$node_primary, qq(standby1|1|quorum|t
+standby2|1|quorum|t
+standby3|1|quorum|t
+standby4|1|quorum|t),
 	'all standbys are considered as candidates for quorum sync standbys',
 	'ANY 2(*)');
 

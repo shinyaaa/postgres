@@ -1333,6 +1333,10 @@ synchronous_standby_names = 'ANY 2 (s1, s2, s3)'
     in the list will be used as candidates for synchronous standbys.
     Even if one of them should fail, the other standbys will keep performing
     the role of candidates of synchronous standby.
+    The <literal>quorum_synced</literal> column of the
+    <structname>pg_stat_replication</structname> view shows which of the
+    candidates are the quorum members whose responses are currently
+    releasing transactions waiting for synchronous replication.
    </para>
 
    <para>

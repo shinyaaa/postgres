@@ -64,6 +64,7 @@
 #include "catalog/pg_authid.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
+#include "common/int.h"
 #include "funcapi.h"
 #include "libpq/libpq.h"
 #include "libpq/pqformat.h"
@@ -4230,16 +4231,29 @@ offset_to_interval(TimeOffset offset)
 }
 
 /*
+ * qsort comparator to sort XLogRecPtr array in descending order.
+ */
+static int
+cmp_lsn_desc(const void *a, const void *b)
+{
+	XLogRecPtr	lsn1 = *((const XLogRecPtr *) a);
+	XLogRecPtr	lsn2 = *((const XLogRecPtr *) b);
+
+	return pg_cmp_u64(lsn2, lsn1);
+}
+
+/*
  * Returns activity of walsenders, including pids and xlog locations sent to
  * standby servers.
  */
 Datum
 pg_stat_get_wal_senders(PG_FUNCTION_ARGS)
 {
-#define PG_STAT_GET_WAL_SENDERS_COLS	12
+#define PG_STAT_GET_WAL_SENDERS_COLS	13
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	SyncRepStandbyData *sync_standbys;
 	int			num_standbys;
+	XLogRecPtr	quorum_flush_lsn = InvalidXLogRecPtr;
 	int			i;
 
 	InitMaterializedSRF(fcinfo, 0);
@@ -4249,6 +4263,30 @@ pg_stat_get_wal_senders(PG_FUNCTION_ARGS)
 	 * date before we're done, but we'll use the data anyway.
 	 */
 	num_standbys = SyncRepGetCandidateStandbys(&sync_standbys);
+
+	/*
+	 * In quorum-based sync replication, transactions waiting for synchronous
+	 * replication are released once num_sync candidates have confirmed a
+	 * given position, so the position confirmed by the whole quorum is the
+	 * num_sync-th latest flush position among the candidates.  Compute it
+	 * here, to report which candidates are currently members of the quorum
+	 * releasing waiting transactions.  (Note that all the candidates have a
+	 * valid flush position; SyncRepGetCandidateStandbys() guarantees that.)
+	 */
+	if (num_standbys > 0 &&
+		SyncRepConfig->syncrep_method == SYNC_REP_QUORUM &&
+		num_standbys >= SyncRepConfig->num_sync)
+	{
+		XLogRecPtr *flush_array = palloc_array(XLogRecPtr, num_standbys);
+
+		for (i = 0; i < num_standbys; i++)
+			flush_array[i] = sync_standbys[i].flush;
+
+		qsort(flush_array, num_standbys, sizeof(XLogRecPtr), cmp_lsn_desc);
+		quorum_flush_lsn = flush_array[SyncRepConfig->num_sync - 1];
+
+		pfree(flush_array);
+	}
 
 	for (i = 0; i < max_wal_senders; i++)
 	{
@@ -4379,10 +4417,31 @@ pg_stat_get_wal_senders(PG_FUNCTION_ARGS)
 			else
 				values[10] = CStringGetTextDatum("potential");
 
-			if (replyTime == 0)
+			/*
+			 * In quorum-based sync replication, report whether this standby
+			 * is one of the quorum members whose responses are currently
+			 * releasing transactions waiting for synchronous replication.
+			 * That's the case if it is a candidate and its flush position is
+			 * not behind the position confirmed by the whole quorum.  Unlike
+			 * sync_state, this changes as the standbys overtake each other,
+			 * but that's exactly the point: it shows the momentary set of
+			 * standbys the quorum is being formed from.
+			 *
+			 * This is NULL in priority-based sync replication and for
+			 * standbys not listed in synchronous_standby_names.
+			 */
+			if (priority == 0 || SyncRepConfig == NULL ||
+				SyncRepConfig->syncrep_method != SYNC_REP_QUORUM)
 				nulls[11] = true;
 			else
-				values[11] = TimestampTzGetDatum(replyTime);
+				values[11] = BoolGetDatum(is_sync_standby &&
+										  XLogRecPtrIsValid(quorum_flush_lsn) &&
+										  flush >= quorum_flush_lsn);
+
+			if (replyTime == 0)
+				nulls[12] = true;
+			else
+				values[12] = TimestampTzGetDatum(replyTime);
 		}
 
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc,
