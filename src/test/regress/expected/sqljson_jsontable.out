@@ -541,6 +541,14 @@ FROM
 	JSON_TABLE(vals.js::jsonb, '$' COLUMNS (a int PATH '$' ERROR ON ERROR)) jt
 		ON true;
 ERROR:  invalid input syntax for type integer: "err"
+-- ... the column evaluation error is handled per-column (default NULL ON
+-- ERROR), so this returns a row with a NULL value rather than failing
+SELECT * FROM JSON_TABLE(jsonb '"a"', '$' COLUMNS (a int PATH '$') ERROR ON ERROR) jt;
+ a 
+---
+  
+(1 row)
+
 SELECT * FROM JSON_TABLE(jsonb '1', '$' COLUMNS (a int PATH '$.a' ERROR ON EMPTY)) jt;
 ERROR:  no SQL/JSON item found for specified path of column "a"
 SELECT * FROM JSON_TABLE(jsonb '1', '$' COLUMNS (a int PATH 'strict $.a' ERROR ON ERROR) ERROR ON ERROR) jt;
@@ -1868,7 +1876,7 @@ CREATE OR REPLACE VIEW public.json_table_view9 AS
    FROM JSON_TABLE(
             '"a"'::text, '$' AS json_table_path_0
             COLUMNS (
-                a text PATH '$' NULL ON EMPTY
+                a text PATH '$'
             ) ERROR ON ERROR
         )
 DROP VIEW json_table_view8, json_table_view9;

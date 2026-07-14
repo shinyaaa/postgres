@@ -261,6 +261,9 @@ FROM
 		LEFT OUTER JOIN
 	JSON_TABLE(vals.js::jsonb, '$' COLUMNS (a int PATH '$' ERROR ON ERROR)) jt
 		ON true;
+-- ... the column evaluation error is handled per-column (default NULL ON
+-- ERROR), so this returns a row with a NULL value rather than failing
+SELECT * FROM JSON_TABLE(jsonb '"a"', '$' COLUMNS (a int PATH '$') ERROR ON ERROR) jt;
 
 SELECT * FROM JSON_TABLE(jsonb '1', '$' COLUMNS (a int PATH '$.a' ERROR ON EMPTY)) jt;
 SELECT * FROM JSON_TABLE(jsonb '1', '$' COLUMNS (a int PATH 'strict $.a' ERROR ON ERROR) ERROR ON ERROR) jt;
