@@ -533,27 +533,88 @@ transformJsonTableColumn(JsonTableColumn *jtc, Node *contextItemExpr,
 	return jfexpr;
 }
 
-static JsonTableColumn *
-findNestedJsonTableColumn(List *columns, const char *pathname)
+/*
+ * Find the node of the given plan that governs the nested path 'pathname':
+ * either a JSTP_SIMPLE node naming it, or a JSTP_JOINED parent/child join
+ * whose left side names it.
+ */
+static JsonTablePlanSpec *
+findNestedPlanSpec(JsonTablePlanSpec *planspec, const char *pathname)
 {
-	ListCell   *lc;
-
-	foreach(lc, columns)
+	if (planspec->plan_type == JSTP_SIMPLE)
 	{
-		JsonTableColumn *jtc = castNode(JsonTableColumn, lfirst(lc));
+		if (strcmp(planspec->pathname, pathname) == 0)
+			return planspec;
+	}
+	else if (planspec->plan_type == JSTP_JOINED)
+	{
+		if (planspec->join_type == JSTP_JOIN_INNER ||
+			planspec->join_type == JSTP_JOIN_OUTER)
+		{
+			Assert(planspec->plan1->plan_type == JSTP_SIMPLE);
+			if (strcmp(planspec->plan1->pathname, pathname) == 0)
+				return planspec;
+		}
+		else
+		{
+			JsonTablePlanSpec *ret = findNestedPlanSpec(planspec->plan1,
+														pathname);
 
-		if (jtc->coltype == JTC_NESTED &&
-			jtc->pathspec->name &&
-			!strcmp(jtc->pathspec->name, pathname))
-			return jtc;
+			if (ret == NULL)
+				ret = findNestedPlanSpec(planspec->plan2, pathname);
+			return ret;
+		}
 	}
 
 	return NULL;
 }
 
 /*
+ * Build the plan tree for the given plan spec by assembling the previously
+ * transformed plans of the individual nested paths (given as parallel lists
+ * of path names and plans) in the shape given by the PLAN clause.
+ */
+static JsonTablePlan *
+buildJsonTablePlan(JsonTablePlanSpec *planspec, List *pathNames,
+				   List *pathPlans)
+{
+	const char *pathname;
+	ListCell   *lcn,
+			   *lcp;
+
+	if (planspec->plan_type == JSTP_JOINED &&
+		(planspec->join_type == JSTP_JOIN_UNION ||
+		 planspec->join_type == JSTP_JOIN_CROSS))
+		return makeJsonTableSiblingJoin(planspec->join_type == JSTP_JOIN_CROSS,
+										buildJsonTablePlan(planspec->plan1,
+														   pathNames,
+														   pathPlans),
+										buildJsonTablePlan(planspec->plan2,
+														   pathNames,
+														   pathPlans));
+
+	pathname = planspec->plan_type == JSTP_SIMPLE ?
+		planspec->pathname : planspec->plan1->pathname;
+
+	forboth(lcn, pathNames, lcp, pathPlans)
+	{
+		if (strcmp((const char *) lfirst(lcn), pathname) == 0)
+			return (JsonTablePlan *) lfirst(lcp);
+	}
+
+	/* Should have been caught in validateJsonTableChildPlan() */
+	elog(ERROR, "nested path %s was not found in nested columns list",
+		 pathname);
+	return NULL;				/* keep compiler quiet */
+}
+
+/*
  * Recursively transform nested columns and create child plan(s) that will be
  * used to evaluate their row patterns.
+ *
+ * The nested columns themselves are always transformed in their declaration
+ * order, so that the JSON_TABLE's output columns follow the order of the
+ * COLUMNS clause no matter in which order a PLAN clause mentions the paths.
  *
  * Default plan is transformed into a cross/union join of its nested columns.
  * Simple and outer/inner plans are transformed into a JsonTablePlan by
@@ -566,13 +627,14 @@ transformJsonTableNestedColumns(JsonTableParseContext *cxt,
 								List *columns,
 								List *passingArgs)
 {
-	JsonTableColumn *jtc = NULL;
+	List	   *pathNames = NIL;
+	List	   *pathPlans = NIL;
+	ListCell   *lc;
 
 	if (!planspec || planspec->plan_type == JSTP_DEFAULT)
 	{
 		/* unspecified or default plan */
 		JsonTablePlan *plan = NULL;
-		ListCell   *lc;
 		bool		cross = planspec && (planspec->join_type & JSTP_JOIN_CROSS);
 
 		/*
@@ -607,47 +669,43 @@ transformJsonTableNestedColumns(JsonTableParseContext *cxt,
 
 		return plan;
 	}
-	else if (planspec->plan_type == JSTP_SIMPLE)
-	{
-		jtc = findNestedJsonTableColumn(columns, planspec->pathname);
-	}
-	else if (planspec->plan_type == JSTP_JOINED)
-	{
-		if (planspec->join_type == JSTP_JOIN_INNER ||
-			planspec->join_type == JSTP_JOIN_OUTER)
-		{
-			Assert(planspec->plan1->plan_type == JSTP_SIMPLE);
-			jtc = findNestedJsonTableColumn(columns, planspec->plan1->pathname);
-		}
-		else
-		{
-			JsonTablePlan *lplan = transformJsonTableNestedColumns(cxt,
-																   planspec->plan1,
-																   columns,
-																   passingArgs);
-			JsonTablePlan *rplan = transformJsonTableNestedColumns(cxt,
-																   planspec->plan2,
-																   columns,
-																   passingArgs);
 
-			return makeJsonTableSiblingJoin(planspec->join_type == JSTP_JOIN_CROSS,
-											lplan, rplan);
-		}
-	}
-	else
+	if (planspec->plan_type != JSTP_SIMPLE &&
+		planspec->plan_type != JSTP_JOINED)
 		elog(ERROR, "invalid JSON_TABLE plan type %d", planspec->plan_type);
 
-	if (!jtc)
-		ereport(ERROR,
-				(errcode(ERRCODE_SYNTAX_ERROR),
-				 errmsg("invalid JSON_TABLE plan clause"),
-				 errdetail("PATH name was %s not found in nested columns list.",
-						   planspec->pathname),
-				 parser_errposition(cxt->pstate, planspec->location)));
+	/*
+	 * A specific plan.  Transform the nested columns in declaration order,
+	 * looking up the plan spec node governing each of them, and remember the
+	 * resulting plans by path name.
+	 */
+	foreach(lc, columns)
+	{
+		JsonTableColumn *col = castNode(JsonTableColumn, lfirst(lc));
+		JsonTablePlanSpec *colplanspec;
 
-	return transformJsonTableColumns(cxt, planspec, jtc->columns,
-									 passingArgs,
-									 jtc->pathspec);
+		if (col->coltype != JTC_NESTED)
+			continue;
+
+		/* Unnamed paths have been given a name during plan validation. */
+		Assert(col->pathspec->name != NULL);
+		colplanspec = findNestedPlanSpec(planspec, col->pathspec->name);
+
+		/* Should have been caught in validateJsonTableChildPlan() */
+		if (colplanspec == NULL)
+			elog(ERROR, "plan node for nested path %s was not found in plan clause",
+				 col->pathspec->name);
+
+		pathNames = lappend(pathNames, col->pathspec->name);
+		pathPlans = lappend(pathPlans,
+							transformJsonTableColumns(cxt, colplanspec,
+													  col->columns,
+													  passingArgs,
+													  col->pathspec));
+	}
+
+	/* Finally, assemble the plan tree in the shape given by the plan. */
+	return buildJsonTablePlan(planspec, pathNames, pathPlans);
 }
 
 /*

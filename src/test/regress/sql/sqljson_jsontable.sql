@@ -625,7 +625,8 @@ from
                )
                plan (p outer (pb union pc))
        ) jt;
--- specific plan (p outer (pc union pb))
+-- specific plan (p outer (pc union pb)); output columns must keep their
+-- declaration order (b before c), only the row order follows the plan
 select
        jt.*
 from

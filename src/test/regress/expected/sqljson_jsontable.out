@@ -1005,7 +1005,7 @@ SELECT * FROM JSON_TABLE(
        )
        PLAN (p0 OUTER ((p1 INNER (p12 CROSS p11)) CROSS (p2 INNER p21)))
 ) jt;
- bar | foo | baz 
+ foo | bar | baz 
 -----+-----+-----
 (0 rows)
 
@@ -1127,7 +1127,8 @@ from
  4 | -1 | 2 |   
 (11 rows)
 
--- specific plan (p outer (pc union pb))
+-- specific plan (p outer (pc union pb)); output columns must keep their
+-- declaration order (b before c), only the row order follows the plan
 select
        jt.*
 from
@@ -1142,19 +1143,19 @@ from
                )
                plan (p outer (pc union pb))
        ) jt;
- n | a  | c  | b 
----+----+----+---
- 1 |  1 |    |  
- 2 |  2 | 10 |  
- 2 |  2 |    |  
- 2 |  2 | 20 |  
- 2 |  2 |    | 1
- 2 |  2 |    | 2
- 2 |  2 |    | 3
- 3 |  3 |    | 1
- 3 |  3 |    | 2
- 4 | -1 |    | 1
- 4 | -1 |    | 2
+ n | a  | b | c  
+---+----+---+----
+ 1 |  1 |   |   
+ 2 |  2 |   | 10
+ 2 |  2 |   |   
+ 2 |  2 |   | 20
+ 2 |  2 | 1 |   
+ 2 |  2 | 2 |   
+ 2 |  2 | 3 |   
+ 3 |  3 | 1 |   
+ 3 |  3 | 2 |   
+ 4 | -1 | 1 |   
+ 4 | -1 | 2 |   
 (11 rows)
 
 -- default plan (inner, union)
