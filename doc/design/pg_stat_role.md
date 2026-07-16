@@ -320,9 +320,190 @@ SECURITY DEFINER 関数が行ごとに呼ばれれば、行ごとに `GetUserId(
 
 ---
 
-## 4. ビュー定義
+## 4. カラム設計
 
-### 4.1 `pg_stat_role`
+### 4.1 カラム選定の方針
+
+1. **`pg_stat_database` との照合可能性を最優先する。**
+   ロールに帰属可能な既存カウンタは、`pg_stat_database` と同じ列名・
+   同じ型・同じ単位で提供する。運用者は
+   「Σ pg_stat_role.x ≒ Σ pg_stat_database.x」という突合を必ず行うため、
+   命名や単位の独自改良 (§4.2) はしない。
+2. **累積カウンタのみを載せる。** `numbackends` のような時点値は
+   累積ビューに混ぜない (時点値は `pg_stat_activity` の集約で得られる)。
+3. **計上コストが自明に小さいものだけを Phase 1 に含める。**
+   具体的には (i) 既存のセッショングローバルカウンタ
+   (`pgBufferUsage`, `pgWalUsage`) の差分スナップショットで取れるもの、
+   (ii) 既存の低頻度報告関数 (`pgstat_report_*`) への1行追加で取れるもの。
+   リレーション別ペンディングの畳み込みを要する `tup_*` 系は Phase 2 (§4.5)。
+4. **各カウンタの帰属タイミングを明文化する** (§4.3 の「帰属」列)。
+   原則は「計上ポイント実行時点の帰属ロール」だが、セッション終了系
+   カウンタのみ例外を設ける (§4.3-h)。
+
+### 4.2 命名の決定
+
+- **`roleid`** — 候補は `userid` (`pg_stat_statements` の前例)、
+  `usesysid` (`pg_stat_activity` の前例)、`roleid` (`pg_auth_members` の
+  前例) の3つ。**`roleid` を採る。** 理由: (i) 本ビューには `NOLOGIN` の
+  グループロールも行を持ちうる (`SET ROLE` の対象になるため)。"user" 系の
+  名前はログイン可能ロールを連想させ誤解を招く。(ii) `usesysid` は
+  廃止済み `pg_user` 由来の歴史的遺物で、新規採用する理由がない。
+- **`rolname`** — `pg_authid.rolname` をそのまま使う
+  (`datname` / `subname` と同じ「カタログ列名を流用する」流儀)。
+  `rolename` などへの正規化はしない。
+- **`blks_read` / `blks_hit`、時間列の `double precision` ミリ秒** —
+  `pg_stat_database` の略記・型・単位に合わせる。`pg_stat_io` の新しい
+  流儀 (`reads` / `hits`、`numeric` マイクロ秒) とは不整合になるが、
+  本ビューの照合相手は `pg_stat_database` であり、そちらとの一貫性を優先。
+- **`wal_records` / `wal_fpi` / `wal_bytes`** — `pg_stat_wal` および
+  `pg_stat_statements` の列名・型 (`wal_bytes` は uint64 のため `numeric`)
+  に合わせる。
+
+### 4.3 カラム一覧 (Phase 1)
+
+凡例 — 帰属: **[T]** = 計上ポイント実行時点の帰属ロール /
+**[C]** = 接続時点の帰属ロール (= セッションロール) /
+**[S]** = バケット切替時に時間・差分を分割して各ロールへ
+
+| # | 列名 | 型 | 単位 | 計上ポイント | 帰属 |
+|---|---|---|---|---|---|
+| 1 | `roleid` | `oid` | — | (`pg_roles.oid`) | — |
+| 2 | `rolname` | `name` | — | (`pg_roles.rolname`) | — |
+| 3 | `xact_commit` | `bigint` | 回 | `AtEOXact_PgStat()` | [T] |
+| 4 | `xact_rollback` | `bigint` | 回 | `AtEOXact_PgStat()` | [T] |
+| 5 | `blks_read` | `bigint` | ブロック | `pgBufferUsage` 差分 | [S] |
+| 6 | `blks_hit` | `bigint` | ブロック | `pgBufferUsage` 差分 | [S] |
+| 7 | `blk_read_time` | `double precision` | ms | `pgBufferUsage` 差分 | [S] |
+| 8 | `blk_write_time` | `double precision` | ms | `pgBufferUsage` 差分 | [S] |
+| 9 | `wal_records` | `bigint` | 件 | `pgWalUsage` 差分 | [S] |
+| 10 | `wal_fpi` | `bigint` | 件 | `pgWalUsage` 差分 | [S] |
+| 11 | `wal_bytes` | `numeric` | バイト | `pgWalUsage` 差分 | [S] |
+| 12 | `temp_files` | `bigint` | 個 | `pgstat_report_tempfile()` | [T] |
+| 13 | `temp_bytes` | `bigint` | バイト | `pgstat_report_tempfile()` | [T] |
+| 14 | `deadlocks` | `bigint` | 回 | `pgstat_report_deadlock()` | [T] |
+| 15 | `session_time` | `double precision` | ms | 状態遷移時の時間計上 | [S] |
+| 16 | `active_time` | `double precision` | ms | 同上 | [S] |
+| 17 | `idle_in_transaction_time` | `double precision` | ms | 同上 | [S] |
+| 18 | `sessions` | `bigint` | 個 | `pgstat_report_connect()` | [C] |
+| 19 | `sessions_abandoned` | `bigint` | 個 | `pgstat_report_disconnect()` | [C] |
+| 20 | `sessions_fatal` | `bigint` | 個 | `pgstat_report_disconnect()` | [C] |
+| 21 | `sessions_killed` | `bigint` | 個 | `pgstat_report_disconnect()` | [C] |
+| 22 | `parallel_workers_to_launch` | `bigint` | 個 | `pgstat_update_parallel_workers_stats()` | [T] |
+| 23 | `parallel_workers_launched` | `bigint` | 個 | 同上 | [T] |
+| 24 | `stats_reset` | `timestamptz` | — | リセット時 | — |
+
+グループごとの詳細仕様:
+
+**(a) 識別列 (#1-2)**
+`pg_roles` との JOIN で得る (統計エントリ側には持たない)。ドロップ済み
+ロールの遺残エントリは JOIN で自然に非表示になる。`rolname` は表示用の
+利便であり、主キーはあくまで `roleid` (ロール名変更で行の同一性は不変)。
+
+**(b) トランザクション (#3-4)**
+コミット/アボート処理時点 ([T]) の帰属ロールに計上する。
+`SET LOCAL ROLE` 中のコミットは、統計計上が GUC 巻き戻しより先に走るため
+LOCAL 先のロールに帰属する (§3.6-b の規約通り。文書化必須)。
+2PC は `pg_stat_database` と同じ扱い: `COMMIT PREPARED` を実行した
+セッションの帰属ロールに `xact_commit` が付く (PREPARE したロールでは
+ない)。パラレルワーカー自身のトランザクションは `pg_stat_database` 同様
+計上しない。
+
+**(c) ブロック I/O (#5-8)**
+`pgBufferUsage` の shared block カウンタ
+(`shared_blks_read/hit`, `shared_blk_read_time/write_time`) の
+差分スナップショット方式 ([S]): バケット切替時 (§5.3) と統計フラッシュ時に
+前回スナップショットとの差分を現帰属ロールへ計上する。
+
+- **`pg_stat_database` とは計測系統が異なることを文書化する。**
+  `pg_stat_database.blks_*` はリレーション統計の畳み込み由来
+  (テーブル/インデックスアクセスのみ) だが、本ビューはカタログアクセス等を
+  含む全 shared buffer アクセスを数える。したがって
+  Σ `pg_stat_role.blks_read` ≥ Σ `pg_stat_database.blks_read` となる。
+  系統を混ぜて「一致しない」と混乱させないための明記であり、
+  むしろ資源計上としてはこちらが正確 (カタログ参照もそのロールの消費)。
+- ローカルバッファ (一時テーブル) は Phase 1 では数えない
+  (`pg_stat_database` にも相当列はなく、必要なら将来 `local_blks_*` を追加)。
+- `blk_read_time` / `blk_write_time` は `track_io_timing = off` のとき 0
+  (`pg_stat_database` と同じ)。差分スナップショットの副産物として
+  取れるため Phase 1 に含める (初版設計からの変更点。§5.5 参照)。
+
+**(d) WAL (#9-11)**
+`pgWalUsage` の差分スナップショット ([S])。`pg_stat_database` には
+存在しない列だが追加する。理由: U1 (チャージバック) では書き込み量の
+ロール別把握が本質的で、`wal_bytes` はストレージ・レプリケーション帯域の
+コストに直結する。計上機構は (c) とスナップショットを共有するため
+追加コストは実質ゼロ。列仕様は `pg_stat_wal` と同一なのでクラスタ全体値
+(`pg_stat_wal`) との突合も自然にできる。
+
+**(e) 一時ファイル (#12-13)**
+`pgstat_report_tempfile()` は一時ファイル削除時 (クエリ終了時) に走る。
+その時点 ([T]) の帰属ロールに計上。関数 `SET` 句などでクエリ内に帰属が
+変わった場合も「報告時点のロール」という単一規約で処理する。
+
+**(f) デッドロック (#14)**
+`pgstat_report_deadlock()` 時点 ([T])。デッドロックエラーを受けた側の
+セッションの帰属ロールに計上される (原因を作った側ではない) ことを
+文書化する。
+
+**(g) 時間 (#15-17)**
+`backend_status.c` の状態遷移処理 (`backend_status.c:610` 付近) で計上。
+バケット切替時に経過時間を旧ロールへ締めるため、1セッションの時間が
+複数ロールに分割されうる ([S])。これは仕様であり機能である —
+プーラ環境で「テナントごとの実行時間」が取れる (§3.6-c)。
+内部はマイクロ秒の `PgStat_Counter`、表示は `pg_stat_database` に合わせ
+`double precision` ミリ秒。
+
+**(h) セッション数 (#18-21) — 帰属規約の唯一の例外**
+`sessions` は接続確立時のロール ([C]、事実上ログインロール) に計上する。
+終了系 3 列 (`sessions_abandoned` / `sessions_fatal` / `sessions_killed`)
+は切断時に走るが、**切断時点の帰属ロールではなく接続時点のロール [C] に
+計上する**。理由:
+
+- 行内不変条件
+  `sessions_abandoned + sessions_fatal + sessions_killed ≤ sessions` を
+  ロールごとに成立させるため。切断時のロールに付けると、
+  `SET ROLE tenant_x` 中に kill されたセッションが
+  「`sessions = 0` なのに `sessions_killed = 1`」という行を作り、
+  監視クエリ (kill 率 = killed / sessions など) が破綻する。
+- 「セッションの開始と終了は同じ主体の事象」という直観に沿う。
+
+実装は接続時の帰属ロールを別変数に保持するだけ (§5.3)。
+なお `SET SESSION AUTHORIZATION` してもセッション数は再カウントしない。
+
+**(i) パラレルワーカー (#22-23)**
+リーダーのクエリ終了時 ([T])。`pg_stat_database` の同名列 (PG18 追加) と
+同じソースから取る。
+
+**(j) `stats_reset` (#24)**
+エントリ生成時は NULL、`pg_stat_reset_role_stats()` 実行時に設定
+(`pg_stat_database.stats_reset` と同じ挙動)。
+
+### 4.4 計上スコープ (どのプロセスが計上するか)
+
+| プロセス | 計上 | 理由 |
+|---|---|---|
+| 通常のクライアントバックエンド | ○ | 本ビューの対象 |
+| パラレルワーカー | × | (i) バッファ/WAL 使用量は `ExecParallelFinish()` → `InstrAccumParallelQuery()` (`execParallel.c:1262`, `instrument.c:299`) が**常に**リーダーの `pgBufferUsage` / `pgWalUsage` に合算するため、ワーカー側でも差分計上すると二重計上になる。リーダー側で一括計上する (パラレルバキューム等の合算機構も同様)。(ii) トランザクション数は `pg_stat_database` と同じく除外 |
+| autovacuum ワーカー | × | 帰属ロールが実質ブートストラップスーパーユーザーに固定され、そこへ I/O を積んでも監視上の意味がない。autovacuum の I/O は `pg_stat_io` が backend type 軸で既にカバー |
+| walsender / バックグラウンドワーカー | × | セッション統計の対象外 (`pgstat_should_report_connstat()`、`pgstat_database.c:387` と同じ線引き) |
+
+判定は「`pgstat_report_connect()` が接続を数えるプロセス
+(= 通常のクライアントバックエンド) でのみロール統計を有効化する」に
+一本化し、`pg_stat_database` のセッション統計と同じ境界を使う。
+
+### 4.5 採用しなかった / 先送りしたカラム
+
+| 列 | 判定 | 理由 |
+|---|---|---|
+| `tup_returned` / `tup_fetched` / `tup_inserted` / `tup_updated` / `tup_deleted` | **Phase 2** | リレーション別ペンディングのフラッシュ時に DB エントリへ畳み込む既存構造 (`pgstat_relation.c`) では、計上発生時とフラッシュ時で帰属ロールが乖離しうる。バケットクローズ時の強制畳み込みが必要で、Phase 1 の複雑さを不当に上げる。追加時は #6 (`blks_hit`) の直後に置く (メジャーリリース間の列順変更は許容) |
+| `numbackends` 相当 | 不採用 | 時点値。`SELECT usename, count(*) FROM pg_stat_activity GROUP BY 1` で得られる。ただし `pg_stat_activity.usename` はセッションロール軸なので、厳密な「現在の帰属ロール別接続数」は取れないことをドキュメントに注記 |
+| `conflicts` + リカバリ競合内訳 | 不採用 | スタンバイ限定の事象で、`pg_stat_database_conflicts` が DB 軸で提供済み。ロール軸の需要が示されたら将来追加可能 (計上点 `pgstat_report_recovery_conflict()` に1行足すだけ) |
+| `checksum_failures` / `last_checksum_failure` | 不採用 | ストレージ破損はロールの資源消費でも行動でもなく、「どのロールが踏んだか」に監視価値がない |
+| `last_autovac_time` 等 | 対象外 | DB/リレーション固有の概念 |
+| クエリ実行数・実行時間 | 不採用 | `pg_stat_statements` の領分 (userid 軸で既に取れる)。コアの本ビューはセッション/トランザクション/資源系に限定 |
+| I/O 詳細 (evictions, fsyncs, hits by context...) | 不採用 | `pg_stat_io` の backend type 軸の領分。軸の直交性 (role × 概要 vs backend type × 詳細) を保つ |
+
+### 4.6 ビュー定義 (DDL)
 
 `src/backend/catalog/system_views.sql` に追加:
 
@@ -335,19 +516,26 @@ CREATE VIEW pg_stat_role AS
         s.xact_rollback,
         s.blks_read,
         s.blks_hit,
+        s.blk_read_time,
+        s.blk_write_time,
+        s.wal_records,
+        s.wal_fpi,
+        s.wal_bytes,
         s.temp_files,
         s.temp_bytes,
         s.deadlocks,
-        s.sessions,
         s.session_time,
         s.active_time,
         s.idle_in_transaction_time,
+        s.sessions,
+        s.sessions_abandoned,
+        s.sessions_fatal,
+        s.sessions_killed,
         s.parallel_workers_to_launch,
         s.parallel_workers_launched,
         s.stats_reset
     FROM pg_roles r,
-         LATERAL pg_stat_get_role_stats(r.oid) AS s
-    WHERE s.sessions > 0 OR s.xact_commit > 0 OR s.stats_reset IS NOT NULL;
+         LATERAL pg_stat_get_role_stats(r.oid) AS s;
 ```
 
 設計メモ:
@@ -356,26 +544,37 @@ CREATE VIEW pg_stat_role AS
   superuser 以外読めないため、ビューが一般ユーザーに対して空になる
   事故を避ける (`pg_stat_database` が world-readable な `pg_database` を
   JOIN しているのと同じ構図)。
-- 統計エントリを持たないロール (一度も接続していない等) の行の扱いは
-  2案ある: (i) 全ロールをゼロ値で出す、(ii) エントリのあるロールだけ出す。
+- **統計エントリを持たないロールは行を出さない。**
   `pg_stat_database` は全 DB を出す前例だが、ロールは DB より遥かに
-  多くなりうる (LDAP 同期環境で数千など) ため、**エントリ保有ロールのみ**
-  を出す方に倒す。上記 WHERE はその近似であり、実装では
-  `pg_stat_get_role_stats()` がエントリ不在時に 0 行を返す形
-  (`pg_stat_get_subscription_stats` 型の SRF) にして WHERE を不要にする。
-- 列は `pg_stat_database` のロールに帰属可能なサブセット + セッション系。
-  リレーション由来の `tup_*` 系は初期実装から外す (§5.5)。
-- ドロップ済みロールの遺残エントリは JOIN で自然に隠れる
-  (掃除自体は §5.6 で行う)。
+  多くなりうる (LDAP 同期環境で数千など) うえ、大半が一度も活動しない。
+  `pg_stat_get_role_stats()` がエントリ不在時に 0 行を返す
+  (`pg_stat_get_subscription_stats` 型の SRF) ことで LATERAL JOIN が
+  自然にフィルタになる。
 
-### 4.2 サポート関数
+### 4.7 サポート関数と不変条件
 
 `src/include/catalog/pg_proc.dat` に追加:
 
 | 関数 | 戻り値 | 説明 |
 |---|---|---|
-| `pg_stat_get_role_stats(oid)` | `record` (0/1行) | 指定ロールの全カウンタ。エントリ不在なら 0 行 |
+| `pg_stat_get_role_stats(oid)` | `setof record` (0/1行、OUT 列は §4.3 の #3-24) | 指定ロールの全カウンタ。エントリ不在なら 0 行。`provolatile = 's'`, `proparallel = 'r'` (他の pgstat SRF と同じ。`stats_fetch_consistency` によるスナップショットが自動で効く) |
 | `pg_stat_reset_role_stats(oid)` | `void` | 指定ロールの統計をリセット (`pg_stat_reset_subscription_stats` と同型)。NULL で全ロール分リセット |
+
+**行内不変条件 (テストで検証する):**
+
+- `sessions_abandoned + sessions_fatal + sessions_killed ≤ sessions`
+  (§4.3-h の帰属規約 [C] により保証)
+- `active_time + idle_in_transaction_time ≤ session_time`
+  (報告粒度による誤差を除く。`pg_stat_database` と同水準)
+
+**クラスタ全体値との照合 (ドキュメントに明記する):**
+
+- Σ `xact_commit` / Σ `sessions` 等 ≒ `pg_stat_database` の合計
+  (フラッシュタイミング差と §4.4 のスコープ差のみ)
+- Σ `blks_*` は `pg_stat_database` の合計と**一致しない** (§4.3-c、
+  計測系統が異なる)
+- Σ `wal_*` ≒ `pg_stat_wal` のバックエンド由来分
+  (バックグラウンドプロセスの WAL は含まない)
 
 ---
 
@@ -443,13 +642,21 @@ typedef struct PgStat_StatRoleEntry
     PgStat_Counter xact_rollback;
     PgStat_Counter blks_read;
     PgStat_Counter blks_hit;
+    PgStat_Counter blk_read_time;   /* microseconds */
+    PgStat_Counter blk_write_time;  /* microseconds */
+    PgStat_Counter wal_records;
+    PgStat_Counter wal_fpi;
+    uint64         wal_bytes;
     PgStat_Counter temp_files;
     PgStat_Counter temp_bytes;
     PgStat_Counter deadlocks;
-    PgStat_Counter sessions;
     PgStat_Counter session_time;            /* microseconds */
     PgStat_Counter active_time;             /* microseconds */
     PgStat_Counter idle_in_transaction_time;    /* microseconds */
+    PgStat_Counter sessions;
+    PgStat_Counter sessions_abandoned;
+    PgStat_Counter sessions_fatal;
+    PgStat_Counter sessions_killed;
     PgStat_Counter parallel_workers_to_launch;
     PgStat_Counter parallel_workers_launched;
 
@@ -468,7 +675,10 @@ typedef struct PgStat_StatRoleEntry
 
 ```c
 /* pgstat_role.c */
-static Oid pgstat_attribution_roleid = InvalidOid;
+static Oid pgstat_attribution_roleid = InvalidOid;  /* 現在の帰属ロール */
+static Oid pgstat_connect_roleid = InvalidOid;      /* 接続時の帰属ロール
+                                                     * (§4.3-h のセッション
+                                                     * 終了系カウンタ専用) */
 ```
 
 更新契機は2箇所のみ:
@@ -497,13 +707,17 @@ static Oid pgstat_attribution_roleid = InvalidOid;
 | カウンタ | 計上ポイント (既存関数に追記) |
 |---|---|
 | `xact_commit` / `xact_rollback` | `AtEOXact_PgStat()` (現在 DB エントリに計上している箇所) |
-| `sessions` | `pgstat_report_connect()` (`pgstat_database.c`) |
+| `sessions` | `pgstat_report_connect()` (`pgstat_database.c`)。同時に `pgstat_connect_roleid` を確定 |
+| `sessions_abandoned` / `sessions_fatal` / `sessions_killed` | `pgstat_report_disconnect()`。`pgstat_connect_roleid` に計上 (§4.3-h) |
 | `session_time`, `active_time`, `idle_in_transaction_time` | `pgstat_count_conn_*` マクロ群 (`pgstat.h:675` 付近、呼び出し元は `backend_status.c:610` の状態遷移処理)。既存マクロを DB/ロール両建てに拡張 |
 | `temp_files` / `temp_bytes` | `pgstat_report_tempfile()` |
 | `deadlocks` | `pgstat_report_deadlock()` |
-| `blks_read` / `blks_hit` | `pgBufferUsage` のスナップショット差分。バケットクローズ時 (§5.3) と `pgstat_report_stat()` のフラッシュ時に、前回スナップショットとの差分を現帰属ロールに計上 |
+| `blks_read` / `blks_hit` / `blk_read_time` / `blk_write_time` | `pgBufferUsage` のスナップショット差分。バケットクローズ時 (§5.3) と `pgstat_report_stat()` のフラッシュ時に、前回スナップショットとの差分を現帰属ロールに計上 |
+| `wal_records` / `wal_fpi` / `wal_bytes` | `pgWalUsage` のスナップショット差分 (上と同じタイミングで一括処理) |
 | `parallel_workers_*` | `pgstat_update_parallel_workers_stats()` |
 
+計上はすべて §4.4 のスコープ判定 (通常のクライアントバックエンドのみ、
+パラレルワーカー除外) の内側で行う。
 ペンディングは標準機構 (`pgstat_prep_pending_entry()`) をそのまま使う。
 通常のバックエンドでは同時にペンディングを持つロールエントリは
 高々 1〜2 個 (SET ROLE 直後のみ 2 個) であり、フラッシュコストは
@@ -512,8 +726,8 @@ static Oid pgstat_attribution_roleid = InvalidOid;
 
 ### 5.5 初期実装から除外するカウンタ (Phase 2)
 
-`tup_returned/fetched/inserted/updated/deleted` と `blk_read_time` /
-`blk_write_time` は初期実装から外す。理由:
+`tup_returned/fetched/inserted/updated/deleted` は初期実装から外す
+(§4.5)。理由:
 
 - `tup_*` はリレーション別ペンディング (`pgstat_relation.c`) の
   フラッシュ時に DB エントリへ畳み込まれる構造であり、フラッシュ時点の
@@ -522,6 +736,11 @@ static Oid pgstat_attribution_roleid = InvalidOid;
   初期パッチの複雑さを不当に上げる。
 - コミュニティ投稿時のパッチ分割 (レビュー容易性) の観点でも、
   コア機構 + 基本カウンタを Phase 1 とするのが妥当。
+
+なお初版設計で Phase 2 としていた `blk_read_time` / `blk_write_time` は、
+`pgBufferUsage` 差分スナップショット (§4.3-c) の副産物として追加コストなく
+取れることが判明したため Phase 1 に繰り上げた。同じ理由で `wal_*` 3列も
+Phase 1 に含める (§4.3-d)。
 
 ### 5.6 ライフサイクル
 
@@ -610,8 +829,8 @@ SECURITY DEFINER の例: `tenant_a` が `admin` 所有の definer 関数を呼�
 
 1. **行の可視性**: 世界公開 (本設計) vs `pg_read_all_stats` +
    自ロールのみ。マルチテナント事業者からの要望次第で再考。
-2. **Phase 2 カウンタ**: `tup_*` 系の畳み込み実装、
-   `track_io_timing` 連動の `blk_read_time`/`blk_write_time`。
+2. **Phase 2 カウンタ**: `tup_*` 系の畳み込み実装 (§4.5)。
+   一時テーブル用の `local_blks_*` を足すかどうかも同時に判断。
 3. **リセット API の形**: 専用関数 (本設計) vs
    `pg_stat_reset_shared('role')` への統合。
 4. **複合キー拡張** (§3.4 案B): 相関の実需が示された場合の
