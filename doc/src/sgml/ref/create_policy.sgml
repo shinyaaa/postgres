@@ -241,7 +241,10 @@ CREATE POLICY <replaceable class="parameter">name</replaceable> ON <replaceable 
          Additionally, <literal>ALL</literal> policies will be applied to
          both the selection side of a query and the modification side, using
          the <literal>USING</literal> expression for both cases if only
-         a <literal>USING</literal> expression has been defined.
+         a <literal>USING</literal> expression has been defined.  Conversely,
+         an <literal>ALL</literal> policy for which only a
+         <literal>WITH CHECK</literal> expression has been defined will not
+         grant access to any existing rows.
        </para>
        <para>
          As an example, if an <literal>UPDATE</literal> is issued, then the
@@ -375,6 +378,11 @@ CREATE POLICY <replaceable class="parameter">name</replaceable> ON <replaceable 
          entire command will be aborted.  If only a <literal>USING</literal>
          clause is specified, then that clause will be used for both
          <literal>USING</literal> and <literal>WITH CHECK</literal> cases.
+         The converse is not true: if only a <literal>WITH CHECK</literal>
+         clause is specified, the policy will not grant access to any
+         existing rows, so rows will be available for update only if some
+         other <literal>UPDATE</literal> or <literal>ALL</literal> policy's
+         <literal>USING</literal> expression grants access to them.
        </para>
 
        <para>

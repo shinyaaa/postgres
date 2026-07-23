@@ -2302,6 +2302,42 @@ INSERT INTO r1 VALUES (10)
 DROP TABLE r1;
 
 --
+-- Test UPDATE policy with only a WITH CHECK expression.  Such a policy
+-- grants no access to existing rows, so if no other policy's USING
+-- expression grants access, the default-deny policy applies and no rows
+-- are updated, regardless of any restrictive policies.
+--
+SET SESSION AUTHORIZATION regress_rls_alice;
+SET row_security = on;
+CREATE TABLE r1 (a int);
+
+CREATE POLICY p1 ON r1 FOR SELECT USING (true);
+CREATE POLICY p2 ON r1 FOR INSERT WITH CHECK (true);
+CREATE POLICY p3 ON r1 FOR UPDATE WITH CHECK (a > 0);
+CREATE POLICY p4 ON r1 AS RESTRICTIVE FOR UPDATE USING (a < 100);
+ALTER TABLE r1 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE r1 FORCE ROW LEVEL SECURITY;
+
+INSERT INTO r1 VALUES (5);
+
+-- No rows are updated, since p3 has no USING expression
+EXPLAIN (COSTS OFF) UPDATE r1 SET a = a + 1;
+UPDATE r1 SET a = a + 1;
+TABLE r1;
+
+-- Adding a USING expression makes rows available for update, subject to
+-- the restrictive policy p4
+ALTER POLICY p3 ON r1 USING (true);
+EXPLAIN (COSTS OFF) UPDATE r1 SET a = a + 1;
+UPDATE r1 SET a = a + 1;
+TABLE r1;
+
+-- Fails, updated row violates p3's WITH CHECK expression
+UPDATE r1 SET a = 0;
+
+DROP TABLE r1;
+
+--
 -- Test policies using virtual generated columns
 --
 SET SESSION AUTHORIZATION regress_rls_alice;
