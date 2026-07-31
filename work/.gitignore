@@ -1,0 +1,8 @@
+# Transient build/test artifacts from the investigation (see toast-bloat-investigation.md)
+build.log
+configure.log
+initdb.log
+pginstall/
+pgrun/
+pgdata/
+pglog
