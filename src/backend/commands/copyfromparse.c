@@ -1326,29 +1326,68 @@ CopyReadLine(CopyFromState cstate, bool is_csv)
 #define COPY_SIMD_FALLBACK_LIMIT	4
 
 /*
+ * Given a bitmask of quote character positions within a vector, return a
+ * bitmask whose bit i is set iff position i lies inside a quoted section,
+ * i.e., iff an odd number of quote characters appear in positions 0..i-1.
+ * "in_quote" is the quoted state carried over from the preceding vectors.
+ *
+ * This models quote characters as pure toggles of the in-quote state, which
+ * is only valid when the QUOTE and ESCAPE characters are the same (the CSV
+ * default): an escaped quote ("") then simply toggles the state twice.
+ */
+static inline uint32
+CopyQuotedSectionMask(uint32 quote_mask, bool in_quote)
+{
+	/* compute at bit i the parity of quote_mask bits 0..i (prefix XOR) */
+	quote_mask ^= quote_mask << 1;
+	quote_mask ^= quote_mask << 2;
+	quote_mask ^= quote_mask << 4;
+	quote_mask ^= quote_mask << 8;
+	quote_mask ^= quote_mask << 16;
+
+	/* shift to make it exclusive, and mix in the carried-over state */
+	return (quote_mask << 1) ^ (in_quote ? PG_UINT32_MAX : 0);
+}
+
+/*
  * Helper function for CopyReadLineText() that uses SIMD instructions to scan
  * the input buffer for special characters.  This can be much faster.
  *
- * Upon encountering a special character (except for end-of-line characters)
- * or a short line, we give up and hand the rest of the line over to the
- * scalar path, but we will try SIMD again on the next line.  If that happens
- * on too many consecutive lines, we disable SIMD for the remainder of the
- * COPY FROM command (see COPY_SIMD_FALLBACK_LIMIT).
+ * In CSV mode with the default quote/escape configuration (i.e., the same
+ * character for both), we track the in-quote state with bitwise prefix XOR
+ * (see CopyQuotedSectionMask) and scan right past quoted sections, stopping
+ * only at unquoted end-of-line characters.  If the scan ends while inside a
+ * quoted section, that state is handed over to the scalar path via
+ * *in_quote_p.
+ *
+ * Otherwise, upon encountering a special character (except for end-of-line
+ * characters) or a short line, we give up and hand the rest of the line over
+ * to the scalar path, but we will try SIMD again on the next line.  If that
+ * happens on too many consecutive lines, we disable SIMD for the remainder
+ * of the COPY FROM command (see COPY_SIMD_FALLBACK_LIMIT).
  */
 static bool
 CopyReadLineTextSIMDHelper(CopyFromState cstate, bool is_csv,
-						   bool *hit_eof_p, int *input_buf_ptr_p)
+						   bool *hit_eof_p, int *input_buf_ptr_p,
+						   bool *in_quote_p)
 {
 	char	   *copy_input_buf;
 	int			input_buf_ptr;
 	int			copy_buf_len;
 	bool		unique_esc_char;	/* for csv, do quote/esc chars differ? */
+	bool		use_quote_mask = false; /* scan past quoted sections? */
+	bool		count_nl = false;	/* count embedded \n instead of \r? */
+	bool		in_quote = false;
 	bool		first = true;
 	bool		result = false;
 	const Vector8 nl_vec = vector8_broadcast('\n');
 	const Vector8 cr_vec = vector8_broadcast('\r');
 	Vector8		bs_or_quote_vec;	/* '\' for text, quote for csv */
 	Vector8		esc_vec;		/* only for csv */
+
+	/* for the in-quote state carry in the quote mask path */
+	StaticAssertStmt(sizeof(Vector8) < sizeof(uint32) * BITS_PER_BYTE,
+					 "Vector8 must be smaller than 32 bytes");
 
 	if (is_csv)
 	{
@@ -1358,6 +1397,23 @@ CopyReadLineTextSIMDHelper(CopyFromState cstate, bool is_csv,
 		bs_or_quote_vec = vector8_broadcast(quote);
 		esc_vec = vector8_broadcast(esc);
 		unique_esc_char = (quote != esc);
+
+		/*
+		 * The quote mask path requires quote characters to be pure toggles of
+		 * the in-quote state, which holds only if the quote and escape
+		 * characters are the same.  It also requires the quote character to
+		 * be distinct from the end-of-line characters so that each byte has
+		 * an unambiguous meaning.
+		 */
+		use_quote_mask = (!unique_esc_char && quote != '\n' && quote != '\r');
+
+		/*
+		 * The scalar path increments cur_lineno for each end-of-line
+		 * character embedded in a quoted section: for \n if the previous line
+		 * ended in \n, else for \r.  cstate->eol_type cannot change while we
+		 * scan, so decide up front which character to count.
+		 */
+		count_nl = (cstate->eol_type == EOL_NL);
 	}
 	else
 	{
@@ -1384,6 +1440,9 @@ CopyReadLineTextSIMDHelper(CopyFromState cstate, bool is_csv,
 	for (;;)
 	{
 		Vector8		chunk;
+		Vector8		nl_match;
+		Vector8		cr_match;
+		Vector8		sp_match;
 		Vector8		match;
 
 		/* Load more data if needed. */
@@ -1428,23 +1487,81 @@ CopyReadLineTextSIMDHelper(CopyFromState cstate, bool is_csv,
 		 * Check for \n, \r, \\ (for text), quotes (for csv), and escapes (for
 		 * csv, if different from quotes).
 		 */
-		match = vector8_eq(chunk, nl_vec);
-		match = vector8_or(match, vector8_eq(chunk, cr_vec));
-		match = vector8_or(match, vector8_eq(chunk, bs_or_quote_vec));
+		nl_match = vector8_eq(chunk, nl_vec);
+		cr_match = vector8_eq(chunk, cr_vec);
+		sp_match = vector8_eq(chunk, bs_or_quote_vec);
+		match = vector8_or(vector8_or(nl_match, cr_match), sp_match);
 		if (unique_esc_char)
 			match = vector8_or(match, vector8_eq(chunk, esc_vec));
 
 		/*
 		 * If we found a special character, advance to it and hand off to the
-		 * scalar path.
+		 * scalar path.  In the quote mask path, quote characters and quoted
+		 * end-of-line characters are not reasons to stop, so we may instead
+		 * decide to move on to the next vector.
+		 *
+		 * If no quote characters are in sight, the quote mask could not
+		 * change anything, so we skip its computation and search for the
+		 * end-of-line character with the cheaper generic code below.
 		 */
 		if (vector8_is_highbit_set(match))
 		{
-			uint32		mask;
 			char		c;
 
-			mask = vector8_highbit_mask(match);
-			input_buf_ptr += pg_rightmost_one_pos32(mask);
+			if (use_quote_mask &&
+				(in_quote || vector8_is_highbit_set(sp_match)))
+			{
+				uint32		n_mask = vector8_highbit_mask(nl_match);
+				uint32		r_mask = vector8_highbit_mask(cr_match);
+				uint32		quoted;
+				uint32		eol_mask;
+				uint32		count_mask;
+				int			pos;
+
+				/*
+				 * Determine which positions lie inside quoted sections, and
+				 * find end-of-line characters outside of them.  Quoted ones
+				 * are just part of the data.
+				 */
+				quoted = CopyQuotedSectionMask(vector8_highbit_mask(sp_match),
+											   in_quote);
+				eol_mask = (n_mask | r_mask) & ~quoted;
+
+				/*
+				 * The scalar path counts quoted end-of-line characters into
+				 * cur_lineno so that error messages report useful physical
+				 * line numbers; replicate that here.
+				 */
+				count_mask = quoted & (count_nl ? n_mask : r_mask);
+
+				if (eol_mask == 0)
+				{
+					/* no line ending in this vector, move on to the next */
+					cstate->cur_lineno += pg_popcount32(count_mask);
+					in_quote = ((quoted >> sizeof(Vector8)) & 1) != 0;
+					input_buf_ptr += sizeof(Vector8);
+					first = false;
+					continue;
+				}
+
+				/*
+				 * Advance to the line ending, counting only quoted
+				 * end-of-line characters that precede it.  Since it is
+				 * unquoted, the in-quote state at the hand-off point is
+				 * necessarily false.
+				 */
+				pos = pg_rightmost_one_pos32(eol_mask);
+				cstate->cur_lineno +=
+					pg_popcount32(count_mask & (((uint32) 1 << pos) - 1));
+				in_quote = false;
+				input_buf_ptr += pos;
+			}
+			else
+			{
+				uint32		mask = vector8_highbit_mask(match);
+
+				input_buf_ptr += pg_rightmost_one_pos32(mask);
+			}
 
 			/*
 			 * If we found \n or \r, the SIMD path did its job for this line,
@@ -1467,6 +1584,7 @@ CopyReadLineTextSIMDHelper(CopyFromState cstate, bool is_csv,
 	}
 
 	*input_buf_ptr_p = input_buf_ptr;
+	*in_quote_p = in_quote;
 	return result;
 }
 #endif							/* ! USE_NO_SIMD */
@@ -1541,11 +1659,20 @@ CopyReadLineText(CopyFromState cstate, bool is_csv)
 		 */
 		bool		tmp_hit_eof = false;
 		int			tmp_input_buf_ptr = 0;	/* silence compiler warning */
+		bool		tmp_in_quote = false;
 
 		result = CopyReadLineTextSIMDHelper(cstate, is_csv, &tmp_hit_eof,
-											&tmp_input_buf_ptr);
+											&tmp_input_buf_ptr,
+											&tmp_in_quote);
 		hit_eof = tmp_hit_eof;
 		input_buf_ptr = tmp_input_buf_ptr;
+
+		/*
+		 * The SIMD path may hand over the scan while inside a quoted CSV
+		 * section, e.g. when too few bytes remain in input_buf to fill a
+		 * vector.  Pick up the in-quote state where it left off.
+		 */
+		in_quote = tmp_in_quote;
 
 		if (result)
 		{

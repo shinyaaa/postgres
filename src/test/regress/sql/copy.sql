@@ -38,6 +38,38 @@ copy copytest2 from :'filename' csv quote '''' escape E'\\';
 
 select * from copytest except select * from copytest2;
 
+--- test quoted fields spanning multiple lines and vector-sized chunks,
+--- to exercise the SIMD path of CopyReadLineText
+
+create temp table copytest_simd (like copytest);
+insert into copytest_simd
+  select 'simd' || i,
+         repeat('a"b,', i) || E'\r\n' ||
+         repeat(E'a long line with "quotes", commas,\nand embedded newlines\n',
+                i % 7),
+         i
+  from generate_series(0, 50) i;
+
+\set filename :abs_builddir '/results/copytest_simd.csv'
+copy copytest_simd to :'filename' csv;
+
+create temp table copytest_simd2 (like copytest);
+copy copytest_simd2 from :'filename' csv;
+
+select * from copytest_simd except select * from copytest_simd2;
+
+-- the error position report must count newlines inside quoted fields
+-- consumed by the SIMD path
+\o :filename
+\qecho '1,"a'
+\qecho 'b'
+\qecho 'c",2'
+\qecho '3,"d'
+\qecho 'e",notanint'
+\o
+create temp table copytest_simd_err (a int, b text, c int);
+copy copytest_simd_err from :'filename' csv;
+
 --- test unquoted \. as data inside CSV
 -- do not use copy out to export the data, as it would quote \.
 \o :filename
