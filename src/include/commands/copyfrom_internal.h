@@ -109,6 +109,8 @@ typedef struct CopyFromStateData
 	bool	   *defaults;		/* if DEFAULT marker was found for
 								 * corresponding att */
 	bool		simd_enabled;	/* use SIMD to scan for special chars? */
+	int			simd_fallbacks; /* # of consecutive lines on which the SIMD
+								 * path fell back to the scalar path */
 
 	/*
 	 * True if the corresponding attribute's is a constrained domain. This

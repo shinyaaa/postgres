@@ -1316,14 +1316,24 @@ CopyReadLine(CopyFromState cstate, bool is_csv)
 
 #ifndef USE_NO_SIMD
 /*
+ * When the SIMD path bails out to the scalar path on this many consecutive
+ * lines, we disable SIMD processing for the remainder of the COPY FROM
+ * command, on the assumption that the input mostly consists of lines that
+ * defeat it.  The value is somewhat arbitrary: it merely bounds the overhead
+ * of repeatedly entering the SIMD path in vain on pathological input, so it
+ * only needs to be small.
+ */
+#define COPY_SIMD_FALLBACK_LIMIT	4
+
+/*
  * Helper function for CopyReadLineText() that uses SIMD instructions to scan
  * the input buffer for special characters.  This can be much faster.
  *
- * Note that we disable SIMD for the remainder of the COPY FROM command upon
- * encountering a special character (except for end-of-line characters) or a
- * short line.  This is perhaps too conservative, but it should help avoid
- * regressions.  It could probably be made more lenient in the future via
- * fine-tuned heuristics.
+ * Upon encountering a special character (except for end-of-line characters)
+ * or a short line, we give up and hand the rest of the line over to the
+ * scalar path, but we will try SIMD again on the next line.  If that happens
+ * on too many consecutive lines, we disable SIMD for the remainder of the
+ * COPY FROM command (see COPY_SIMD_FALLBACK_LIMIT).
  */
 static bool
 CopyReadLineTextSIMDHelper(CopyFromState cstate, bool is_csv,
@@ -1426,8 +1436,7 @@ CopyReadLineTextSIMDHelper(CopyFromState cstate, bool is_csv,
 
 		/*
 		 * If we found a special character, advance to it and hand off to the
-		 * scalar path.  Except for end-of-line characters, we also disable
-		 * SIMD processing for the remainder of the COPY FROM command.
+		 * scalar path.
 		 */
 		if (vector8_is_highbit_set(match))
 		{
@@ -1438,13 +1447,15 @@ CopyReadLineTextSIMDHelper(CopyFromState cstate, bool is_csv,
 			input_buf_ptr += pg_rightmost_one_pos32(mask);
 
 			/*
-			 * Don't disable SIMD if we found \n or \r, else we'd stop using
-			 * SIMD instructions after the first line.  As an exception, we do
-			 * disable it if this is the first vector we processed, as that
-			 * means the line is too short for SIMD.
+			 * If we found \n or \r, the SIMD path did its job for this line,
+			 * so reset the fallback counter.  As an exception, finding one in
+			 * the first vector we processed means the line is too short for
+			 * SIMD to be worthwhile, so we count that as a fallback, too.
 			 */
 			c = copy_input_buf[input_buf_ptr];
-			if (first || (c != '\n' && c != '\r'))
+			if (!first && (c == '\n' || c == '\r'))
+				cstate->simd_fallbacks = 0;
+			else if (++cstate->simd_fallbacks >= COPY_SIMD_FALLBACK_LIMIT)
 				cstate->simd_enabled = false;
 
 			break;
