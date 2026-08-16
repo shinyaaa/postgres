@@ -150,57 +150,13 @@
    snapshot once the transaction has committed.
   </para>
 
-  <sect2 id="logical-replication-publication-replica-identity">
-   <title>Replica Identity</title>
-
-   <para>
-    A published table must have a <firstterm>replica identity</firstterm>
-    configured in order to be able to replicate <command>UPDATE</command>
-    and <command>DELETE</command> operations, so that appropriate rows to
-    update or delete can be identified on the subscriber side.
-   </para>
-
-   <para>
-    By default, this is the primary key, if there is one. Another unique index
-    (with certain additional requirements) can also be set to be the replica
-    identity.  If the table does not have any suitable key, then it can be set
-    to replica identity <literal>FULL</literal>, which means the entire row
-    becomes the key.  When replica identity <literal>FULL</literal> is
-    specified, indexes can be used on the subscriber side for searching the
-    rows.  Candidate indexes must be btree or hash, non-partial, and the
-    leftmost index field must be a column (not an expression) that references
-    the published table column.  These restrictions on the non-unique index
-    properties adhere to some of the restrictions that are enforced for
-    primary keys.  If there are no such suitable indexes, the search on the
-    subscriber side can be very inefficient, therefore replica identity
-    <literal>FULL</literal> should only be used as a fallback if no other
-    solution is possible.
-   </para>
-
-   <para>
-    If a replica identity other than <literal>FULL</literal> is set on the
-    publisher side, a replica identity comprising the same or fewer columns
-    must also be set on the subscriber side.
-   </para>
-
-   <para>
-    Tables with a replica identity defined as <literal>NOTHING</literal>,
-    <literal>DEFAULT</literal> without a primary key, or <literal>USING
-    INDEX</literal> with a dropped index, cannot support
-    <command>UPDATE</command> or <command>DELETE</command> operations when
-    included in a publication replicating these actions. Attempting such
-    operations will result in an error on the publisher.
-   </para>
-
-   <para>
-    <command>INSERT</command> operations can proceed regardless of any replica identity.
-   </para>
-
-   <para>
-    See <link linkend="sql-altertable-replica-identity"><literal>ALTER TABLE...REPLICA IDENTITY</literal></link>
-    for details on how to set the replica identity.
-   </para>
-  </sect2>
+  <para>
+   To be able to replicate <command>UPDATE</command> and
+   <command>DELETE</command> operations, a published table must have a
+   replica identity configured, so that the rows to be updated or deleted can
+   be identified on the subscriber side.  See
+   <xref linkend="logical-replication-replica-identity"/> for details.
+  </para>
 
  </sect1>
 
@@ -844,6 +800,375 @@ HINT:  To initiate replication, you must manually create the replication slot, e
  {'sub1','sub2','sub3', 'pg_16394_sync_16385_7394666715149055164'}
 (1 row)
 </programlisting></para>
+ </sect1>
+
+ <sect1 id="logical-replication-replica-identity">
+  <title>Replica Identity</title>
+
+  <indexterm zone="logical-replication-replica-identity">
+   <primary>replica identity</primary>
+  </indexterm>
+
+  <para>
+   Logical replication transfers changes row by row, so the apply process on
+   the subscriber has to determine which row of its copy of a published table
+   corresponds to the row that was updated or deleted on the publisher.  The
+   <firstterm>replica identity</firstterm> of a table provides the information
+   needed for that: it determines which old column values are written to the
+   write-ahead log when a row is updated or deleted, so that those values can
+   be decoded later and sent to the subscriber together with the change.
+  </para>
+
+  <para>
+   Every table has a replica identity, which is recorded in
+   <link linkend="catalog-pg-class"><structname>pg_class</structname></link>.<structfield>relreplident</structfield>,
+   but it only has an effect when the table's changes are decoded logically,
+   that is, when <xref linkend="guc-wal-level"/> is set to
+   <literal>logical</literal>.  Only <command>UPDATE</command> and
+   <command>DELETE</command> depend on it: <command>INSERT</command>
+   replicates the complete new row anyway, and <command>TRUNCATE</command>
+   does not refer to individual rows, so those operations can be replicated
+   regardless of the replica identity.
+  </para>
+
+  <sect2 id="logical-replication-replica-identity-modes">
+   <title>Replica Identity Modes</title>
+
+   <para>
+    The replica identity of a table is set using
+    <link linkend="sql-altertable-replica-identity"><command>ALTER TABLE ... REPLICA IDENTITY</command></link>,
+    which supports the four modes summarized in
+    <xref linkend="logical-replication-replica-identity-modes-summary"/>.
+   </para>
+
+   <table id="logical-replication-replica-identity-modes-summary">
+    <title>Replica Identity Modes</title>
+    <tgroup cols="3">
+     <colspec colname="col1" colwidth="1.2*"/>
+     <colspec colname="col2" colwidth="1*"/>
+     <colspec colname="col3" colwidth="2*"/>
+     <thead>
+      <row>
+       <entry>Mode</entry>
+       <entry>Old values written to WAL</entry>
+       <entry>Notes</entry>
+      </row>
+     </thead>
+     <tbody>
+      <row>
+       <entry><literal>DEFAULT</literal></entry>
+       <entry>the columns of the primary key</entry>
+       <entry>
+        This is the default for user tables.  If the table has no primary
+        key, the behavior is the same as <literal>NOTHING</literal>.
+       </entry>
+      </row>
+      <row>
+       <entry><literal>USING INDEX <replaceable>index_name</replaceable></literal></entry>
+       <entry>the columns covered by the named index</entry>
+       <entry>
+        The index must be unique, must not be partial, must not be
+        deferrable, must not be an expression index, and must contain only
+        columns marked <literal>NOT NULL</literal>.  If the index is dropped,
+        the behavior is the same as <literal>NOTHING</literal>.
+       </entry>
+      </row>
+      <row>
+       <entry><literal>FULL</literal></entry>
+       <entry>all columns of the old row</entry>
+       <entry>
+        A fallback for tables that have no suitable key; it is more expensive
+        on both sides, see
+        <xref linkend="logical-replication-replica-identity-full"/>.
+       </entry>
+      </row>
+      <row>
+       <entry><literal>NOTHING</literal></entry>
+       <entry>nothing</entry>
+       <entry>
+        This is the default for system catalogs.  <command>UPDATE</command>
+        and <command>DELETE</command> cannot be replicated.
+       </entry>
+      </row>
+     </tbody>
+    </tgroup>
+   </table>
+
+   <para>
+    With <literal>DEFAULT</literal> and <literal>USING INDEX</literal>, the
+    old values of the key columns are written for every
+    <command>DELETE</command>, but for <command>UPDATE</command> they are
+    only written if at least one key column was modified; however, if the old
+    value of a key column is stored externally (see
+    <xref linkend="storage-toast"/>), it is always written, whether or not it
+    changed.  With <literal>FULL</literal>, the complete old row is written
+    for every <command>UPDATE</command> and <command>DELETE</command>.
+   </para>
+
+   <para>
+    Note that a table can be in a state where no old values are available at
+    all, namely when its replica identity is <literal>NOTHING</literal>,
+    <literal>DEFAULT</literal> without a primary key, or <literal>USING
+    INDEX</literal> with an index that has since been dropped.  Such a table
+    cannot replicate <command>UPDATE</command> or <command>DELETE</command>;
+    see <xref linkend="logical-replication-replica-identity-publisher"/>.
+   </para>
+  </sect2>
+
+  <sect2 id="logical-replication-replica-identity-setting">
+   <title>Setting and Examining the Replica Identity</title>
+
+   <para>
+    The following example gives a table a replica identity based on a unique
+    index, because the table has no primary key:
+<programlisting>
+CREATE TABLE t (a int NOT NULL, b text);
+CREATE UNIQUE INDEX t_a_key ON t (a);
+ALTER TABLE t REPLICA IDENTITY USING INDEX t_a_key;
+</programlisting></para>
+
+   <para>
+    In <application>psql</application>, an index that is used as the replica
+    identity is marked as such in the table description, while the
+    <literal>FULL</literal> and <literal>NOTHING</literal> modes are reported
+    by <literal>\d+</literal>:
+<programlisting>
+\d t
+                 Table "public.t"
+ Column |  Type   | Collation | Nullable | Default
+--------+---------+-----------+----------+---------
+ a      | integer |           | not null |
+ b      | text    |           |          |
+Indexes:
+    "t_a_key" UNIQUE, btree (a) REPLICA IDENTITY
+</programlisting>
+    The setting can also be queried directly from the system catalogs:
+<programlisting>
+SELECT relreplident FROM pg_class WHERE relname = 't';
+ relreplident
+--------------
+ i
+(1 row)
+</programlisting></para>
+
+   <para>
+    Changing the replica identity of a table requires an
+    <literal>ACCESS EXCLUSIVE</literal> lock on it, but it neither rewrites
+    the table nor affects data that has already been written to the
+    write-ahead log; it only changes what is logged for subsequent
+    operations.  It is therefore best to set the replica identity of a table
+    before adding it to a publication.
+   </para>
+  </sect2>
+
+  <sect2 id="logical-replication-replica-identity-publisher">
+   <title>Requirements on the Publisher</title>
+
+   <para>
+    If a table is part of a publication that replicates
+    <command>UPDATE</command> or <command>DELETE</command> operations, and no
+    old values would be available for it, the operation fails on the
+    publisher:
+<programlisting>
+UPDATE t SET b = 'x';
+ERROR:  cannot update table "t" because it does not have a replica identity and publishes updates
+HINT:  To enable updating the table, set REPLICA IDENTITY using ALTER TABLE.
+</programlisting>
+    The error is raised when the operation is executed, not when the table is
+    added to the publication, so a table that is only ever inserted into can
+    be published without any replica identity at all.
+   </para>
+
+   <para>
+    In addition, the replica identity restricts which columns may be used by
+    other publication features, and it must itself be fully replicated:
+   </para>
+
+   <itemizedlist>
+    <listitem>
+     <para>
+      A row filter of a publication that publishes
+      <command>UPDATE</command> or <command>DELETE</command> may only
+      reference columns covered by the replica identity.  See
+      <xref linkend="logical-replication-row-filter"/>.
+     </para>
+    </listitem>
+
+    <listitem>
+     <para>
+      A column list of such a publication must include all columns of the
+      replica identity.  See <xref linkend="logical-replication-col-lists"/>.
+     </para>
+    </listitem>
+
+    <listitem>
+     <para>
+      Generated columns that are part of the replica identity must be
+      published, that is, the publication must either set
+      <link linkend="sql-createpublication-params-with-publish-generated-columns"><literal>publish_generated_columns</literal></link>
+      to <literal>stored</literal> or list those columns in its column list.
+      See <xref linkend="logical-replication-gencols"/>.
+     </para>
+    </listitem>
+   </itemizedlist>
+
+   <para>
+    Violations of these rules are likewise reported when an
+    <command>UPDATE</command> or <command>DELETE</command> is executed on the
+    published table.
+   </para>
+  </sect2>
+
+  <sect2 id="logical-replication-replica-identity-subscriber">
+   <title>Requirements on the Subscriber</title>
+
+   <para>
+    The apply process uses the old values received from the publisher to
+    search for the local row to update or delete.  The target table on the
+    subscriber therefore has to be searchable with exactly those values:
+   </para>
+
+   <itemizedlist>
+    <listitem>
+     <para>
+      If the published table has a replica identity other than
+      <literal>FULL</literal>, the target table must have a primary key or a
+      replica identity index, and its columns must all be covered by the
+      replica identity of the published table.  In other words, a replica
+      identity comprising the same or fewer columns must be set on the
+      subscriber side.  Otherwise the apply process reports an error such as:
+<programlisting>
+ERROR:  publisher did not send replica identity column expected by the logical replication target relation "public.t"
+</programlisting>
+     </para>
+    </listitem>
+
+    <listitem>
+     <para>
+      If the target table has neither a primary key nor a replica identity
+      index, the published table must have replica identity
+      <literal>FULL</literal>, so that the whole old row is available for the
+      search.  Otherwise the apply process reports:
+<programlisting>
+ERROR:  logical replication target relation "public.t" has neither REPLICA IDENTITY index nor PRIMARY KEY and published relation does not have REPLICA IDENTITY FULL
+</programlisting>
+     </para>
+    </listitem>
+   </itemizedlist>
+
+   <para>
+    The search is performed with a primary key or replica identity index if
+    the target table has one.  When the published table has replica identity
+    <literal>FULL</literal> and the target table has no such index, any other
+    suitable index may be used instead.  Candidate indexes must be btree or
+    hash, non-partial, and the leftmost index field must be a column (not an
+    expression) that references the published table column.  These
+    restrictions on the non-unique index properties adhere to some of the
+    restrictions that are enforced for primary keys.  If there is no suitable
+    index, the search falls back to a sequential scan of the whole target
+    table for every change, which can be very slow.
+   </para>
+
+   <note>
+    <para>
+     A search that is not based on a unique index can match several rows, for
+     example when a table with replica identity <literal>FULL</literal>
+     contains duplicate rows.  In that case one of the matching rows is
+     updated or deleted, and which one that is, is not determined.
+    </para>
+   </note>
+  </sect2>
+
+  <sect2 id="logical-replication-replica-identity-partitioned">
+   <title>Partitioned Tables</title>
+
+   <para>
+    Rows are physically stored in leaf partitions, and that is also where the
+    old values are written to the write-ahead log.  The replica identity of
+    each partition therefore determines whether an <command>UPDATE</command> or
+    <command>DELETE</command> can be replicated, also when the publication
+    parameter
+    <link linkend="sql-createpublication-params-with-publish-via-partition-root"><literal>publish_via_partition_root</literal></link>
+    is enabled.
+   </para>
+
+   <para>
+    Unlike most other <command>ALTER TABLE</command> forms,
+    <command>ALTER TABLE ... REPLICA IDENTITY</command> does not recurse to
+    the partitions of a partitioned table, and partitions created later do
+    not inherit the setting either.  The replica identity has to be set on
+    each partition individually:
+<programlisting>
+CREATE TABLE p (a int NOT NULL, b text) PARTITION BY RANGE (a);
+CREATE TABLE p1 PARTITION OF p FOR VALUES FROM (0) TO (10);
+ALTER TABLE p REPLICA IDENTITY FULL;
+ALTER TABLE p1 REPLICA IDENTITY FULL;
+</programlisting>
+    Note that a primary key or a unique constraint defined on the partitioned
+    table does exist on every partition, so replica identity
+    <literal>DEFAULT</literal> and a partitioned primary key work without any
+    per-partition setup.
+   </para>
+
+   <para>
+    When <literal>publish_via_partition_root</literal> is enabled, changes
+    are reported using the identity and schema of the root table, and the
+    replica identity of that root table is announced to the subscriber.  In
+    that case the root table and its partitions should be given matching
+    replica identities.
+   </para>
+  </sect2>
+
+  <sect2 id="logical-replication-replica-identity-full">
+   <title>Using <literal>REPLICA IDENTITY FULL</literal></title>
+
+   <para>
+    Replica identity <literal>FULL</literal> makes the entire row the key, so
+    it works for any table.  It comes at a price on both sides of the
+    replication setup, and should only be used as a fallback if no other
+    solution is possible:
+   </para>
+
+   <itemizedlist>
+    <listitem>
+     <para>
+      On the publisher, every <command>UPDATE</command> and
+      <command>DELETE</command> writes a copy of the complete old row into
+      the write-ahead log, which increases the amount of WAL generated, and
+      with it the work of decoding and of sending the changes.  Values that
+      are stored externally are written inline, so wide rows are especially
+      expensive.
+     </para>
+    </listitem>
+
+    <listitem>
+     <para>
+      On the subscriber, the search for the row to update or delete compares
+      all columns.  Unless a suitable index exists, this requires a
+      sequential scan per change, as described in
+      <xref linkend="logical-replication-replica-identity-subscriber"/>.
+     </para>
+    </listitem>
+
+    <listitem>
+     <para>
+      <command>UPDATE</command> and <command>DELETE</command> cannot be
+      applied on the subscriber if the table includes attributes with data
+      types (such as <type>point</type> or <type>box</type>) that do not have
+      a default operator class for btree or hash, because the old and the new
+      row cannot be compared.  Defining a primary key or another replica
+      identity for the table avoids this limitation.
+     </para>
+    </listitem>
+   </itemizedlist>
+
+   <para>
+    So, in order of preference, use a primary key, or a unique index on
+    <literal>NOT NULL</literal> columns via <literal>USING INDEX</literal>,
+    and resort to <literal>FULL</literal> only where neither is available.
+   </para>
+  </sect2>
+
  </sect1>
 
  <sect1 id="logical-replication-row-filter">

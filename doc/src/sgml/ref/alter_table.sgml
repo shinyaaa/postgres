@@ -986,6 +986,8 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
       from the new value; however, if the old value is stored externally, it is
       always logged regardless of whether it changed.
       This option has no effect except when logical replication is in use.
+      See <xref linkend="logical-replication-replica-identity"/> for more
+      information about how the replica identity is used.
      <variablelist>
       <varlistentry id="sql-altertable-replica-identity-default">
        <term><literal>DEFAULT</literal></term>
