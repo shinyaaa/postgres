@@ -98,6 +98,42 @@ typedef struct cb_tablespace
 	struct cb_tablespace *next;
 } cb_tablespace;
 
+/*
+ * Everything needed to produce one output file.
+ */
+typedef struct cb_file_job
+{
+	bool		incremental;	/* reconstruct, rather than copy */
+	pg_checksum_type checksum_type; /* checksum to compute, if any */
+	char	   *ifullpath;		/* input file */
+	char	   *ofullpath;		/* output file */
+	char	   *manifest_prefix;	/* manifest path of containing directory */
+	char	   *manifest_path;	/* manifest path of this file */
+} cb_file_job;
+
+/*
+ * What producing one output file yields.
+ */
+typedef struct cb_file_result
+{
+	uint64		size;
+	int64		mtime;
+	int			checksum_length;
+	uint8		checksum_payload[PG_CHECKSUM_MAX_LENGTH];
+} cb_file_result;
+
+/*
+ * State that the per-file processing needs in addition to the job itself.
+ */
+typedef struct cb_file_context
+{
+	int			n_prior_backups;
+	char	  **prior_backup_dirs;
+	manifest_data **manifests;
+	manifest_writer *mwriter;
+	cb_options *opt;
+} cb_file_context;
+
 /* Directories to be removed if we exit uncleanly. */
 static cb_cleanup_dir *cleanup_dir_list = NULL;
 
@@ -113,11 +149,9 @@ static void process_directory_recursively(Oid tsoid,
 										  char *input_directory,
 										  char *output_directory,
 										  char *relative_path,
-										  int n_prior_backups,
-										  char **prior_backup_dirs,
-										  manifest_data **manifests,
-										  manifest_writer *mwriter,
-										  cb_options *opt);
+										  cb_file_context *context);
+static void process_file(cb_file_job *job, cb_file_result *result,
+						 cb_file_context *context);
 static void remember_to_cleanup_directory(char *target_path, bool rmtopdir);
 static void reset_directory_cleanup_list(void);
 static cb_tablespace *scan_for_existing_tablespaces(char *pathname,
@@ -163,6 +197,7 @@ main(int argc, char *argv[])
 	manifest_data **manifests;
 	manifest_writer *mwriter;
 	char	   *pgdata;
+	cb_file_context context;
 
 	pg_logging_init(argv[0]);
 	progname = get_progname(argv[0]);
@@ -370,11 +405,17 @@ main(int argc, char *argv[])
 						   opt.manifest_checksums, mwriter);
 	}
 
+	/* Collect what the per-file processing needs to know. */
+	context.n_prior_backups = n_prior_backups;
+	context.prior_backup_dirs = prior_backup_dirs;
+	context.manifests = manifests;
+	context.mwriter = mwriter;
+	context.opt = &opt;
+
 	/* Process everything that's not part of a user-defined tablespace. */
 	pg_log_debug("processing backup directory \"%s\"", last_input_dir);
 	process_directory_recursively(InvalidOid, last_input_dir, opt.output,
-								  NULL, n_prior_backups, prior_backup_dirs,
-								  manifests, mwriter, &opt);
+								  NULL, &context);
 
 	/* Process user-defined tablespaces. */
 	for (ts = tablespaces; ts != NULL; ts = ts->next)
@@ -420,8 +461,7 @@ main(int argc, char *argv[])
 
 		/* OK, now handle the directory contents. */
 		process_directory_recursively(ts->oid, ts->old_dir, ts->new_dir,
-									  NULL, n_prior_backups, prior_backup_dirs,
-									  manifests, mwriter, &opt);
+									  NULL, &context);
 	}
 
 	/* Finalize the backup_manifest, if we're generating one. */
@@ -836,21 +876,15 @@ parse_oid(char *s, Oid *result)
  * that we are currently processing. If NULL, it indicates that we're
  * processing the input and output directories themselves.
  *
- * n_prior_backups is the number of prior backups that we have available.
- * This doesn't count the very last backup, which is referenced by
- * input_directory, just the older ones. prior_backup_dirs is an array of
- * the locations of those previous backups.
+ * context carries the information about the prior backups, the manifest
+ * writer, and the options.
  */
 static void
 process_directory_recursively(Oid tsoid,
 							  char *input_directory,
 							  char *output_directory,
 							  char *relative_path,
-							  int n_prior_backups,
-							  char **prior_backup_dirs,
-							  manifest_data **manifests,
-							  manifest_writer *mwriter,
-							  cb_options *opt)
+							  cb_file_context *context)
 {
 	char		ifulldir[MAXPGPATH];
 	char		ofulldir[MAXPGPATH];
@@ -860,7 +894,9 @@ process_directory_recursively(Oid tsoid,
 	bool		is_pg_tblspc = false;
 	bool		is_pg_wal = false;
 	bool		is_incremental_dir = false;
-	manifest_data *latest_manifest = manifests[n_prior_backups];
+	manifest_data *latest_manifest =
+		context->manifests[context->n_prior_backups];
+	cb_options *opt = context->opt;
 	pg_checksum_type checksum_type;
 
 	/*
@@ -962,7 +998,8 @@ process_directory_recursively(Oid tsoid,
 		Oid			oid = InvalidOid;
 		int			checksum_length = 0;
 		uint8	   *checksum_payload = NULL;
-		pg_checksum_context checksum_ctx;
+		cb_file_job job;
+		cb_file_result result;
 
 		/* Ignore "." and ".." entries. */
 		if (strcmp(de->d_name, ".") == 0 ||
@@ -1004,9 +1041,7 @@ process_directory_recursively(Oid tsoid,
 			/* And recurse. */
 			process_directory_recursively(tsoid,
 										  input_directory, output_directory,
-										  new_relative_path,
-										  n_prior_backups, prior_backup_dirs,
-										  manifests, mwriter, opt);
+										  new_relative_path, context);
 			continue;
 		}
 
@@ -1030,141 +1065,184 @@ process_directory_recursively(Oid tsoid,
 			continue;
 
 		/*
-		 * If it's an incremental file, hand it off to the reconstruction
-		 * code, which will figure out what to do.
+		 * If it's an incremental file, it will have to be reconstructed, and
+		 * the output path and manifest path should not include the
+		 * "INCREMENTAL." prefix. Otherwise, it's just copied.
 		 */
-		if (is_incremental_dir &&
+		job.incremental = is_incremental_dir &&
 			strncmp(de->d_name, INCREMENTAL_PREFIX,
-					INCREMENTAL_PREFIX_LENGTH) == 0)
+					INCREMENTAL_PREFIX_LENGTH) == 0;
+		if (job.incremental)
 		{
-			/* Output path should not include "INCREMENTAL." prefix. */
 			snprintf(ofullpath, MAXPGPATH, "%s/%s", ofulldir,
 					 de->d_name + INCREMENTAL_PREFIX_LENGTH);
-
-
-			/* Manifest path likewise omits incremental prefix. */
 			snprintf(manifest_path, MAXPGPATH, "%s%s", manifest_prefix,
 					 de->d_name + INCREMENTAL_PREFIX_LENGTH);
-
-			/* Reconstruction logic will do the rest. */
-			reconstruct_from_incremental_file(ifullpath, ofullpath,
-											  manifest_prefix,
-											  de->d_name + INCREMENTAL_PREFIX_LENGTH,
-											  n_prior_backups,
-											  prior_backup_dirs,
-											  manifests,
-											  manifest_path,
-											  checksum_type,
-											  &checksum_length,
-											  &checksum_payload,
-											  opt->copy_method,
-											  opt->debug,
-											  opt->dry_run);
 		}
 		else
 		{
-			/* Construct the path that the backup_manifest will use. */
+			snprintf(ofullpath, MAXPGPATH, "%s/%s", ofulldir, de->d_name);
 			snprintf(manifest_path, MAXPGPATH, "%s%s", manifest_prefix,
 					 de->d_name);
+		}
 
-			/*
-			 * It's not an incremental file, so we need to copy the entire
-			 * file to the output directory.
-			 *
-			 * If a checksum of the required type already exists in the
-			 * backup_manifest for the final input directory, we can save some
-			 * work by reusing that checksum instead of computing a new one.
-			 */
-			if (checksum_type != CHECKSUM_TYPE_NONE &&
-				latest_manifest != NULL)
+		/*
+		 * If a file is to be copied in its entirety and a checksum of the
+		 * required type already exists in the backup_manifest for the final
+		 * input directory, we can save some work by reusing that checksum
+		 * instead of computing a new one. (The reconstruction code does the
+		 * same for files it ends up copying from a prior backup.)
+		 */
+		if (!job.incremental && checksum_type != CHECKSUM_TYPE_NONE &&
+			latest_manifest != NULL)
+		{
+			manifest_file *mfile;
+
+			mfile = manifest_files_lookup(latest_manifest->files,
+										  manifest_path);
+			if (mfile == NULL)
 			{
-				manifest_file *mfile;
+				char	   *bmpath;
 
-				mfile = manifest_files_lookup(latest_manifest->files,
-											  manifest_path);
-				if (mfile == NULL)
-				{
-					char	   *bmpath;
-
-					/*
-					 * The directory is out of sync with the backup_manifest,
-					 * so emit a warning.
-					 */
-					bmpath = psprintf("%s/%s", input_directory,
-									  "backup_manifest");
-					pg_log_warning("manifest file \"%s\" contains no entry for file \"%s\"",
-								   bmpath, manifest_path);
-					pfree(bmpath);
-				}
-				else if (mfile->checksum_type == checksum_type)
-				{
-					checksum_length = mfile->checksum_length;
-					checksum_payload = mfile->checksum_payload;
-				}
+				/*
+				 * The directory is out of sync with the backup_manifest, so
+				 * emit a warning.
+				 */
+				bmpath = psprintf("%s/%s", input_directory,
+								  "backup_manifest");
+				pg_log_warning("manifest file \"%s\" contains no entry for file \"%s\"",
+							   bmpath, manifest_path);
+				pfree(bmpath);
 			}
-
-			/*
-			 * If we're reusing a checksum, then we don't need copy_file() to
-			 * compute one for us, but otherwise, it needs to compute whatever
-			 * type of checksum we need.
-			 */
-			if (checksum_length != 0)
-				pg_checksum_init(&checksum_ctx, CHECKSUM_TYPE_NONE);
-			else
-				pg_checksum_init(&checksum_ctx, checksum_type);
-
-			/* Actually copy the file. */
-			snprintf(ofullpath, MAXPGPATH, "%s/%s", ofulldir, de->d_name);
-			copy_file(ifullpath, ofullpath, &checksum_ctx,
-					  opt->copy_method, opt->dry_run);
-
-			/*
-			 * If copy_file() performed a checksum calculation for us, then
-			 * save the results (except in dry-run mode, when there's no
-			 * point).
-			 */
-			if (checksum_ctx.type != CHECKSUM_TYPE_NONE && !opt->dry_run)
+			else if (mfile->checksum_type == checksum_type)
 			{
-				checksum_payload = pg_malloc(PG_CHECKSUM_MAX_LENGTH);
-				checksum_length = pg_checksum_final(&checksum_ctx,
-													checksum_payload);
+				checksum_length = mfile->checksum_length;
+				checksum_payload = mfile->checksum_payload;
 			}
 		}
 
+		/*
+		 * If we're reusing a checksum, then nobody needs to compute one for
+		 * us, but otherwise, whatever type of checksum we need must be
+		 * computed while the file is written.
+		 */
+		job.checksum_type =
+			checksum_length != 0 ? CHECKSUM_TYPE_NONE : checksum_type;
+		job.ifullpath = ifullpath;
+		job.ofullpath = ofullpath;
+		job.manifest_prefix = manifest_prefix;
+		job.manifest_path = manifest_path;
+
+		/* Produce the file. */
+		process_file(&job, &result, context);
+
 		/* Generate manifest entry, if needed. */
-		if (mwriter != NULL)
+		if (context->mwriter != NULL)
 		{
-			struct stat sb;
-
-			/*
-			 * In order to generate a manifest entry, we need the file size
-			 * and mtime. We have no way to know the correct mtime except to
-			 * stat() the file, so just do that and get the size as well.
-			 *
-			 * If we didn't need the mtime here, we could try to obtain the
-			 * file size from the reconstruction or file copy process above,
-			 * although that is actually not convenient in all cases. If we
-			 * write the file ourselves then clearly we can keep a count of
-			 * bytes, but if we use something like CopyFile() then it's
-			 * trickier. Since we have to stat() anyway to get the mtime,
-			 * there's no point in worrying about it.
-			 */
-			if (stat(ofullpath, &sb) < 0)
-				pg_fatal("could not stat file \"%s\": %m", ofullpath);
-
-			/* OK, now do the work. */
-			add_file_to_manifest(mwriter, manifest_path,
-								 sb.st_size, sb.st_mtime,
+			if (result.checksum_length > 0)
+			{
+				checksum_length = result.checksum_length;
+				checksum_payload = result.checksum_payload;
+			}
+			add_file_to_manifest(context->mwriter, manifest_path,
+								 result.size, result.mtime,
 								 checksum_type, checksum_length,
 								 checksum_payload);
 		}
-
-		/* Avoid leaking memory. */
-		if (checksum_payload != NULL)
-			pg_free(checksum_payload);
 	}
 
 	closedir(dir);
+}
+
+/*
+ * Produce one output file, by copying or reconstruction as the job says,
+ * and report its size, mtime, and checksum.
+ *
+ * The checksum is only computed if the job asks for it, and never in
+ * dry-run mode. The size and mtime are also meaningless in dry-run mode,
+ * since no file is written.
+ */
+static void
+process_file(cb_file_job *job, cb_file_result *result,
+			 cb_file_context *context)
+{
+	cb_options *opt = context->opt;
+	int			checksum_length = 0;
+	uint8	   *checksum_payload = NULL;
+
+	if (job->incremental)
+	{
+		char	   *bare_file_name;
+
+		/* The manifest path is the manifest prefix plus the bare name. */
+		Assert(strncmp(job->manifest_path, job->manifest_prefix,
+					   strlen(job->manifest_prefix)) == 0);
+		bare_file_name = job->manifest_path + strlen(job->manifest_prefix);
+
+		/* Reconstruction logic will do the rest. */
+		reconstruct_from_incremental_file(job->ifullpath, job->ofullpath,
+										  job->manifest_prefix,
+										  bare_file_name,
+										  context->n_prior_backups,
+										  context->prior_backup_dirs,
+										  context->manifests,
+										  job->manifest_path,
+										  job->checksum_type,
+										  &checksum_length,
+										  &checksum_payload,
+										  opt->copy_method,
+										  opt->debug,
+										  opt->dry_run);
+	}
+	else
+	{
+		pg_checksum_context checksum_ctx;
+
+		/* Copy the entire file, computing a checksum if asked to. */
+		pg_checksum_init(&checksum_ctx, job->checksum_type);
+		copy_file(job->ifullpath, job->ofullpath, &checksum_ctx,
+				  opt->copy_method, opt->dry_run);
+
+		/*
+		 * If copy_file() performed a checksum calculation for us, then save
+		 * the results (except in dry-run mode, when there's no point).
+		 */
+		if (checksum_ctx.type != CHECKSUM_TYPE_NONE && !opt->dry_run)
+		{
+			checksum_payload = pg_malloc(PG_CHECKSUM_MAX_LENGTH);
+			checksum_length = pg_checksum_final(&checksum_ctx,
+												checksum_payload);
+		}
+	}
+
+	memset(result, 0, sizeof(cb_file_result));
+	result->checksum_length = checksum_length;
+	if (checksum_length > 0)
+		memcpy(result->checksum_payload, checksum_payload, checksum_length);
+	if (checksum_payload != NULL)
+		pg_free(checksum_payload);
+
+	/*
+	 * In order to generate a manifest entry, we need the file size and mtime.
+	 * We have no way to know the correct mtime except to stat() the file, so
+	 * just do that and get the size as well.
+	 *
+	 * If we didn't need the mtime here, we could try to obtain the file size
+	 * from the reconstruction or file copy process above, although that is
+	 * actually not convenient in all cases. If we write the file ourselves
+	 * then clearly we can keep a count of bytes, but if we use something like
+	 * CopyFile() then it's trickier. Since we have to stat() anyway to get
+	 * the mtime, there's no point in worrying about it.
+	 */
+	if (!opt->dry_run)
+	{
+		struct stat sb;
+
+		if (stat(job->ofullpath, &sb) < 0)
+			pg_fatal("could not stat file \"%s\": %m", job->ofullpath);
+		result->size = sb.st_size;
+		result->mtime = sb.st_mtime;
+	}
 }
 
 /*
