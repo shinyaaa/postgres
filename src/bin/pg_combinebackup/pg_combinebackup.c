@@ -38,6 +38,7 @@
 #include "getopt_long.h"
 #include "lib/stringinfo.h"
 #include "load_manifest.h"
+#include "parallel.h"
 #include "reconstruct.h"
 #include "write_manifest.h"
 
@@ -80,6 +81,7 @@ typedef struct cb_options
 	bool		no_manifest;
 	DataDirSyncMethod sync_method;
 	CopyMethod	copy_method;
+	int			jobs;
 } cb_options;
 
 /*
@@ -99,7 +101,8 @@ typedef struct cb_tablespace
 } cb_tablespace;
 
 /*
- * Everything needed to produce one output file.
+ * Everything needed to produce one output file. When running with multiple
+ * jobs, this is what the leader sends to a worker.
  */
 typedef struct cb_file_job
 {
@@ -112,7 +115,8 @@ typedef struct cb_file_job
 } cb_file_job;
 
 /*
- * What producing one output file yields.
+ * What producing one output file yields, and what a worker sends back to
+ * the leader.
  */
 typedef struct cb_file_result
 {
@@ -124,6 +128,7 @@ typedef struct cb_file_result
 
 /*
  * State that the per-file processing needs in addition to the job itself.
+ * Workers inherit it from the leader.
  */
 typedef struct cb_file_context
 {
@@ -134,15 +139,55 @@ typedef struct cb_file_context
 	cb_options *opt;
 } cb_file_context;
 
+/*
+ * A file whose manifest entry has not been written yet.
+ *
+ * Workers complete files in whatever order they happen to, but we want the
+ * backup_manifest to list them in the order in which we found them, the
+ * same as it would with a single job. So the leader queues the files as it
+ * hands them out and writes manifest entries from the head of the queue,
+ * as far as the completed files go.
+ */
+typedef struct cb_pending_file
+{
+	char	   *manifest_path;
+	pg_checksum_type checksum_type;
+	int			checksum_length;
+	uint8		checksum_payload[PG_CHECKSUM_MAX_LENGTH];
+	uint64		size;
+	time_t		mtime;
+	bool		done;
+	struct cb_pending_file *next;
+} cb_pending_file;
+
 /* Directories to be removed if we exit uncleanly. */
 static cb_cleanup_dir *cleanup_dir_list = NULL;
 
+/* Worker processes, if we're using them. */
+static cb_worker_pool *worker_pool = NULL;
+
+/* Files awaiting their manifest entry, oldest first. */
+static cb_pending_file *pending_head = NULL;
+static cb_pending_file *pending_tail = NULL;
+
+static cb_pending_file *add_pending_file(const char *manifest_path,
+										 pg_checksum_type checksum_type,
+										 int checksum_length,
+										 uint8 *checksum_payload);
 static void add_tablespace_mapping(cb_options *opt, char *arg);
 static StringInfo check_backup_label_files(int n_backups, char **backup_dirs);
 static uint64 check_control_files(int n_backups, char **backup_dirs);
 static void check_input_dir_permissions(char *dir);
 static void cleanup_directories_atexit(void);
+static void complete_pending_file(cb_pending_file *pending,
+								  cb_file_result *result,
+								  manifest_writer *mwriter);
 static void create_output_directory(char *dirname, cb_options *opt);
+static void deserialize_file_job(char *data, size_t len, cb_file_job *job);
+static void file_job_result(void *tag, char *result, size_t resultlen,
+							void *arg);
+static void file_job_worker(char *job, size_t joblen, StringInfo result,
+							void *arg);
 static void help(const char *progname);
 static bool parse_oid(char *s, Oid *result);
 static void process_directory_recursively(Oid tsoid,
@@ -156,7 +201,9 @@ static void remember_to_cleanup_directory(char *target_path, bool rmtopdir);
 static void reset_directory_cleanup_list(void);
 static cb_tablespace *scan_for_existing_tablespaces(char *pathname,
 													cb_options *opt);
+static void serialize_file_job(cb_file_job *job, StringInfo buf);
 static void slurp_file(int fd, char *filename, StringInfo buf, int maxlen);
+static void worker_init(void *arg);
 
 /*
  * Main program.
@@ -167,6 +214,7 @@ main(int argc, char *argv[])
 	static struct option long_options[] = {
 		{"debug", no_argument, NULL, 'd'},
 		{"dry-run", no_argument, NULL, 'n'},
+		{"jobs", required_argument, NULL, 'j'},
 		{"no-sync", no_argument, NULL, 'N'},
 		{"output", required_argument, NULL, 'o'},
 		{"tablespace-mapping", required_argument, NULL, 'T'},
@@ -208,9 +256,10 @@ main(int argc, char *argv[])
 	opt.manifest_checksums = CHECKSUM_TYPE_CRC32C;
 	opt.sync_method = DATA_DIR_SYNC_METHOD_FSYNC;
 	opt.copy_method = COPY_METHOD_COPY;
+	opt.jobs = 1;
 
 	/* process command-line options */
-	while ((c = getopt_long(argc, argv, "dknNo:T:",
+	while ((c = getopt_long(argc, argv, "dj:knNo:T:",
 							long_options, &optindex)) != -1)
 	{
 		switch (c)
@@ -218,6 +267,11 @@ main(int argc, char *argv[])
 			case 'd':
 				opt.debug = true;
 				pg_logging_increase_verbosity();
+				break;
+			case 'j':
+				if (!option_parse_int(optarg, "-j/--jobs", 1, INT_MAX,
+									  &opt.jobs))
+					exit(1);
 				break;
 			case 'k':
 				opt.copy_method = COPY_METHOD_LINK;
@@ -311,6 +365,12 @@ main(int argc, char *argv[])
 		pg_fatal("copy_file_range not supported on this platform");
 #endif
 	}
+
+	/* Check that the platform supports parallel operation, if requested. */
+#ifdef WIN32
+	if (opt.jobs > 1)
+		pg_fatal("parallel jobs are not supported on this platform");
+#endif
 
 	/* Read the server version from the final backup. */
 	pgdata = argv[argc - 1];
@@ -412,6 +472,15 @@ main(int argc, char *argv[])
 	context.mwriter = mwriter;
 	context.opt = &opt;
 
+	/*
+	 * If we're using worker processes, start them now. They inherit all the
+	 * state we've set up so far.
+	 */
+	if (opt.jobs > 1)
+		worker_pool = cb_worker_pool_start(opt.jobs, worker_init,
+										   file_job_worker, file_job_result,
+										   &context);
+
 	/* Process everything that's not part of a user-defined tablespace. */
 	pg_log_debug("processing backup directory \"%s\"", last_input_dir);
 	process_directory_recursively(InvalidOid, last_input_dir, opt.output,
@@ -462,6 +531,13 @@ main(int argc, char *argv[])
 		/* OK, now handle the directory contents. */
 		process_directory_recursively(ts->oid, ts->old_dir, ts->new_dir,
 									  NULL, &context);
+	}
+
+	/* Wait for the workers to finish whatever they're still doing. */
+	if (worker_pool != NULL)
+	{
+		cb_worker_pool_finish(worker_pool);
+		Assert(pending_head == NULL);
 	}
 
 	/* Finalize the backup_manifest, if we're generating one. */
@@ -822,6 +898,7 @@ help(const char *progname)
 	printf(_("  %s [OPTION]... DIRECTORY...\n"), progname);
 	printf(_("\nOptions:\n"));
 	printf(_("  -d, --debug               generate lots of debugging output\n"));
+	printf(_("  -j, --jobs=NUM            use this many parallel worker processes\n"));
 	printf(_("  -k, --link                link files instead of copying\n"));
 	printf(_("  -n, --dry-run             do not actually do anything\n"));
 	printf(_("  -N, --no-sync             do not wait for changes to be written safely to disk\n"));
@@ -999,7 +1076,7 @@ process_directory_recursively(Oid tsoid,
 		int			checksum_length = 0;
 		uint8	   *checksum_payload = NULL;
 		cb_file_job job;
-		cb_file_result result;
+		cb_pending_file *pending;
 
 		/* Ignore "." and ".." entries. */
 		if (strcmp(de->d_name, ".") == 0 ||
@@ -1133,21 +1210,29 @@ process_directory_recursively(Oid tsoid,
 		job.manifest_prefix = manifest_prefix;
 		job.manifest_path = manifest_path;
 
-		/* Produce the file. */
-		process_file(&job, &result, context);
-
-		/* Generate manifest entry, if needed. */
-		if (context->mwriter != NULL)
+		/*
+		 * Queue the manifest entry, and then either produce the file
+		 * ourselves or hand it to a worker. Either way, the manifest entry
+		 * gets written once the file is done and all of the files queued
+		 * before it are done as well.
+		 */
+		pending = add_pending_file(manifest_path, checksum_type,
+								   checksum_length, checksum_payload);
+		if (worker_pool == NULL)
 		{
-			if (result.checksum_length > 0)
-			{
-				checksum_length = result.checksum_length;
-				checksum_payload = result.checksum_payload;
-			}
-			add_file_to_manifest(context->mwriter, manifest_path,
-								 result.size, result.mtime,
-								 checksum_type, checksum_length,
-								 checksum_payload);
+			cb_file_result result;
+
+			process_file(&job, &result, context);
+			complete_pending_file(pending, &result, context->mwriter);
+		}
+		else
+		{
+			StringInfoData buf;
+
+			initStringInfo(&buf);
+			serialize_file_job(&job, &buf);
+			cb_worker_pool_dispatch(worker_pool, buf.data, buf.len, pending);
+			pfree(buf.data);
 		}
 	}
 
@@ -1244,6 +1329,159 @@ process_file(cb_file_job *job, cb_file_result *result,
 		result->mtime = sb.st_mtime;
 	}
 }
+
+/*
+ * Add a file to the queue of files awaiting a manifest entry.
+ *
+ * If the checksum is already known, because it was reused from an input
+ * manifest, it can be provided here; otherwise, it comes with the result.
+ */
+static cb_pending_file *
+add_pending_file(const char *manifest_path, pg_checksum_type checksum_type,
+				 int checksum_length, uint8 *checksum_payload)
+{
+	cb_pending_file *pending = pg_malloc0_object(cb_pending_file);
+
+	pending->manifest_path = pstrdup(manifest_path);
+	pending->checksum_type = checksum_type;
+	pending->checksum_length = checksum_length;
+	if (checksum_length > 0)
+		memcpy(pending->checksum_payload, checksum_payload, checksum_length);
+
+	if (pending_tail == NULL)
+		pending_head = pending;
+	else
+		pending_tail->next = pending;
+	pending_tail = pending;
+
+	return pending;
+}
+
+/*
+ * Note that a queued file has been produced, and write the manifest entries
+ * for as many files from the head of the queue as are done.
+ */
+static void
+complete_pending_file(cb_pending_file *pending, cb_file_result *result,
+					  manifest_writer *mwriter)
+{
+	pending->size = result->size;
+	pending->mtime = result->mtime;
+	if (result->checksum_length > 0)
+	{
+		Assert(pending->checksum_length == 0);
+		pending->checksum_length = result->checksum_length;
+		memcpy(pending->checksum_payload, result->checksum_payload,
+			   result->checksum_length);
+	}
+	pending->done = true;
+
+	while (pending_head != NULL && pending_head->done)
+	{
+		cb_pending_file *next = pending_head->next;
+
+		if (mwriter != NULL)
+			add_file_to_manifest(mwriter, pending_head->manifest_path,
+								 pending_head->size, pending_head->mtime,
+								 pending_head->checksum_type,
+								 pending_head->checksum_length,
+								 pending_head->checksum_payload);
+
+		pfree(pending_head->manifest_path);
+		pfree(pending_head);
+		pending_head = next;
+	}
+	if (pending_head == NULL)
+		pending_tail = NULL;
+}
+
+/*
+ * Turn a job into a message for a worker. The strings are sent with their
+ * terminating NUL bytes, so that they can be used in place on the other
+ * side.
+ */
+static void
+serialize_file_job(cb_file_job *job, StringInfo buf)
+{
+	appendStringInfoChar(buf, job->incremental ? 1 : 0);
+	appendStringInfoChar(buf, (char) job->checksum_type);
+	appendBinaryStringInfo(buf, job->ifullpath, strlen(job->ifullpath) + 1);
+	appendBinaryStringInfo(buf, job->ofullpath, strlen(job->ofullpath) + 1);
+	appendBinaryStringInfo(buf, job->manifest_prefix,
+						   strlen(job->manifest_prefix) + 1);
+	appendBinaryStringInfo(buf, job->manifest_path,
+						   strlen(job->manifest_path) + 1);
+}
+
+/*
+ * The inverse of serialize_file_job(). The job's strings point into data.
+ */
+static void
+deserialize_file_job(char *data, size_t len, cb_file_job *job)
+{
+	char	   *p = data;
+
+	Assert(len >= 2);
+	job->incremental = (*p++ != 0);
+	job->checksum_type = (pg_checksum_type) *p++;
+	job->ifullpath = p;
+	p += strlen(p) + 1;
+	job->ofullpath = p;
+	p += strlen(p) + 1;
+	job->manifest_prefix = p;
+	p += strlen(p) + 1;
+	job->manifest_path = p;
+	p += strlen(p) + 1;
+	Assert(p == data + len);
+}
+
+/*
+ * Worker process setup.
+ */
+static void
+worker_init(void *arg)
+{
+	/*
+	 * Removing the output directories on failure is the leader's job. A
+	 * worker that fails exits through the same atexit handler, so make sure
+	 * it has nothing to do there.
+	 */
+	reset_directory_cleanup_list();
+}
+
+/*
+ * Perform one job in a worker process.
+ */
+static void
+file_job_worker(char *job, size_t joblen, StringInfo result, void *arg)
+{
+	cb_file_context *context = arg;
+	cb_file_job file_job;
+	cb_file_result file_result;
+
+	deserialize_file_job(job, joblen, &file_job);
+	process_file(&file_job, &file_result, context);
+	appendBinaryStringInfo(result, (char *) &file_result,
+						   sizeof(file_result));
+}
+
+/*
+ * Handle the result of a job in the leader.
+ */
+static void
+file_job_result(void *tag, char *result, size_t resultlen, void *arg)
+{
+	cb_file_context *context = arg;
+	cb_file_result file_result;
+
+	if (resultlen != sizeof(file_result))
+		pg_fatal("unexpected result from worker process");
+	memcpy(&file_result, result, sizeof(file_result));
+
+	complete_pending_file(tag, &file_result, context->mwriter);
+}
+
+
 
 /*
  * Add a directory to the list of output directories to clean up.

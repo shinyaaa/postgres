@@ -82,6 +82,35 @@ PostgreSQL documentation
      </varlistentry>
 
      <varlistentry>
+      <term><option>-j <replaceable class="parameter">njobs</replaceable></option></term>
+      <term><option>--jobs=<replaceable class="parameter">njobs</replaceable></option></term>
+      <listitem>
+       <para>
+        Use <replaceable class="parameter">njobs</replaceable> worker
+        processes to copy and reconstruct files in parallel.  The default is
+        1, in which case all files are processed one after another by a
+        single process.  The output does not depend on the number of jobs.
+       </para>
+
+       <para>
+        Reconstructing a backup is mostly a matter of waiting for I/O, so on
+        solid-state storage, using several jobs can make
+        <application>pg_combinebackup</application> finish considerably
+        sooner.  On rotational storage, several jobs are likely to make it
+        slower instead.  There is also little to gain when
+        <option>--clone</option> or <option>-k</option>/<option>--link</option>
+        is used, or when <option>--copy-file-range</option> is used on a
+        file system that implements it by sharing blocks, because producing
+        a file is then a cheap metadata operation rather than I/O.
+       </para>
+
+       <para>
+        This option is not supported on Windows.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
       <term><option>-k</option></term>
       <term><option>--link</option></term>
       <listitem>

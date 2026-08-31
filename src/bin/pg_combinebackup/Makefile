@@ -27,6 +27,7 @@ OBJS = \
 	backup_label.o \
 	copy_file.o \
 	load_manifest.o \
+	parallel.o \
 	reconstruct.o \
 	write_manifest.o
 

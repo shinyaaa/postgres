@@ -3679,9 +3679,15 @@ cb_cleanup_dir
 cb_file_context
 cb_file_job
 cb_file_result
+cb_job_callback
 cb_options
+cb_pending_file
+cb_result_callback
 cb_tablespace
 cb_tablespace_mapping
+cb_worker
+cb_worker_init_callback
+cb_worker_pool
 char16_t
 char32_t
 check_agg_arguments_context

@@ -4,6 +4,7 @@ GETTEXT_FILES    = $(FRONTEND_COMMON_GETTEXT_FILES) \
                    backup_label.c \
                    copy_file.c \
                    load_manifest.c \
+                   parallel.c \
                    pg_combinebackup.c \
                    reconstruct.c \
                    write_manifest.c \
