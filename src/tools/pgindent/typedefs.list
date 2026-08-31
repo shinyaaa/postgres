@@ -3687,6 +3687,7 @@ cb_tablespace
 cb_tablespace_mapping
 cb_worker
 cb_worker_init_callback
+cb_worker_thread_arg
 cb_worker_pool
 char16_t
 char32_t

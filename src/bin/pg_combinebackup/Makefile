@@ -19,6 +19,10 @@ top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
 
 override CPPFLAGS := -I$(libpq_srcdir) $(CPPFLAGS)
+
+ifeq ($(PORTNAME), win32)
+override CPPFLAGS += -DFD_SETSIZE=1024
+endif
 LDFLAGS_INTERNAL += -L$(top_builddir)/src/fe_utils -lpgfeutils
 
 OBJS = \

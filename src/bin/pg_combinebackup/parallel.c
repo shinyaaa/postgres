@@ -1,21 +1,27 @@
 /*-------------------------------------------------------------------------
  *
  * parallel.c
- *		Worker processes for pg_combinebackup.
+ *		Workers for pg_combinebackup.
  *
- * The leader forks a fixed number of worker processes up front and hands
- * each of them one job at a time. Jobs and results are opaque byte strings
- * that travel over a pair of pipes per worker, each prefixed with its
- * length. A worker runs the job callback for every job it receives and
- * sends back whatever that callback produces. The leader hands out a new
- * job as soon as a worker becomes idle and delivers each result to the
- * result callback.
+ * The leader starts a fixed number of workers up front and hands each of
+ * them one job at a time. Jobs and results are opaque byte strings that
+ * travel over a pair of pipes per worker, each prefixed with its length.
+ * A worker runs the job callback for every job it receives and sends back
+ * whatever that callback produces. The leader hands out a new job as soon
+ * as a worker becomes idle and delivers each result to the result
+ * callback.
  *
- * A worker reports errors the same way the leader does, by calling
- * pg_fatal(). The leader notices that the worker's result pipe has been
- * closed and exits as well. Conversely, if the leader exits while workers
- * are still running, it terminates them first, so that they do not keep
- * writing into an output directory that is about to be removed.
+ * On Unix, workers are processes created with fork(). A worker reports
+ * errors the same way the leader does, by calling pg_fatal(); the leader
+ * notices that the worker's result pipe has been closed and exits as
+ * well. Conversely, if the leader exits while workers are still running,
+ * it terminates them first, so that they do not keep writing into an
+ * output directory that is about to be removed.
+ *
+ * On Windows, workers are threads, and the pipes are socket pairs, so
+ * that the leader can still wait for results with select(); see pgpipe().
+ * A thread that calls pg_fatal() takes the whole process with it, so the
+ * cross-process error dance above does not apply.
  *
  * Copyright (c) 2017-2026, PostgreSQL Global Development Group
  *
@@ -37,12 +43,28 @@
 
 #include "common/logging.h"
 #include "parallel.h"
+#include "port/pg_bswap.h"
 
-#ifndef WIN32
+/*
+ * On Windows, the pipes are really sockets; see pgpipe().
+ */
+#ifdef WIN32
+#define piperead(fd, buf, len)	recv((SOCKET) (fd), (buf), (int) (len), 0)
+#define pipewrite(fd, buf, len) send((SOCKET) (fd), (buf), (int) (len), 0)
+#define closepipe(fd)			closesocket((SOCKET) (fd))
+#else
+#define piperead(fd, buf, len)	read(fd, buf, len)
+#define pipewrite(fd, buf, len) write(fd, buf, len)
+#define closepipe(fd)			close(fd)
+#endif
 
 typedef struct cb_worker
 {
+#ifdef WIN32
+	HANDLE		thread;
+#else
 	pid_t		pid;
+#endif
 	int			job_fd;			/* leader's write end of the job pipe */
 	int			result_fd;		/* leader's read end of the result pipe */
 	bool		busy;			/* has a job it has not reported on yet */
@@ -51,33 +73,53 @@ typedef struct cb_worker
 
 struct cb_worker_pool
 {
-	pid_t		leader_pid;
 	int			nworkers;
 	cb_worker  *workers;
 	cb_result_callback result_cb;
 	void	   *arg;
+#ifndef WIN32
+	pid_t		leader_pid;
+#endif
 };
 
-/* The pool whose workers are to be terminated if the leader exits early. */
-static cb_worker_pool *active_pool = NULL;
+#ifdef WIN32
+/* What a worker thread needs to know, passed to _beginthreadex(). */
+typedef struct cb_worker_thread_arg
+{
+	int			job_fd;			/* worker's read end of the job pipe */
+	int			result_fd;		/* worker's write end of the result pipe */
+	cb_worker_init_callback init_cb;
+	cb_job_callback job_cb;
+	void	   *arg;
+}			cb_worker_thread_arg;
+#endif
 
 static void collect_results(cb_worker_pool *pool, bool wait);
-static void terminate_workers_atexit(void);
-pg_noreturn static void run_worker(int job_fd, int result_fd,
-								   cb_worker_init_callback init_cb,
-								   cb_job_callback job_cb, void *arg);
+static void worker_main_loop(int job_fd, int result_fd,
+							 cb_worker_init_callback init_cb,
+							 cb_job_callback job_cb, void *arg);
 static void send_message(int fd, const char *data, size_t len);
 static bool receive_message(int fd, StringInfo buf);
 static bool write_fully(int fd, const void *data, size_t len);
 static int	read_fully(int fd, void *data, size_t len);
 
+#ifdef WIN32
+static void pgpipe(int handles[2]);
+static unsigned __stdcall worker_thread(void *varg);
+#else
+static void terminate_workers_atexit(void);
+
+/* The pool whose workers are to be terminated if the leader exits early. */
+static cb_worker_pool *active_pool = NULL;
+#endif
+
 /*
- * Fork the requested number of worker processes.
+ * Start the requested number of workers.
  *
  * Every worker starts by calling init_cb, and then runs job_cb once per job
  * until the leader calls cb_worker_pool_finish(). arg is passed through to
- * all three callbacks. The state that the workers need must therefore be
- * set up before this function is called, since they inherit it by fork().
+ * all the callbacks. On Unix, the state that the workers need must be set
+ * up before this function is called, since they inherit it by fork().
  */
 cb_worker_pool *
 cb_worker_pool_start(int nworkers, cb_worker_init_callback init_cb,
@@ -89,11 +131,13 @@ cb_worker_pool_start(int nworkers, cb_worker_init_callback init_cb,
 	Assert(nworkers > 1);
 
 	pool = pg_malloc0_object(cb_worker_pool);
-	pool->leader_pid = getpid();
 	pool->nworkers = nworkers;
 	pool->workers = pg_malloc0_array(cb_worker, nworkers);
 	pool->result_cb = result_cb;
 	pool->arg = arg;
+
+#ifndef WIN32
+	pool->leader_pid = getpid();
 
 	/*
 	 * A worker that dies takes its pipes with it. We want to find out about
@@ -108,12 +152,25 @@ cb_worker_pool_start(int nworkers, cb_worker_init_callback init_cb,
 	 */
 	active_pool = pool;
 	atexit(terminate_workers_atexit);
+#else
+	{
+		WSADATA		wsaData;
+		int			err;
+
+		/* Initialize socket access. */
+		err = WSAStartup(MAKEWORD(2, 2), &wsaData);
+		if (err != 0)
+			pg_fatal("%s() failed: error code %d", "WSAStartup", err);
+	}
+#endif
 
 	for (int i = 0; i < nworkers; ++i)
 	{
 		cb_worker  *w = &pool->workers[i];
 		int			job_pipe[2];
 		int			result_pipe[2];
+
+#ifndef WIN32
 		pid_t		pid;
 
 		if (pipe(job_pipe) < 0 || pipe(result_pipe) < 0)
@@ -124,8 +181,7 @@ cb_worker_pool_start(int nworkers, cb_worker_init_callback init_cb,
 		 * must fit in an fd_set.
 		 */
 		if (result_pipe[0] >= FD_SETSIZE)
-			pg_fatal("too many parallel jobs requested (maximum is %d)",
-					 i);
+			pg_fatal("too many parallel jobs requested (maximum is %d)", i);
 
 		/* Ensure stdio state is quiesced before forking */
 		fflush(NULL);
@@ -152,13 +208,38 @@ cb_worker_pool_start(int nworkers, cb_worker_init_callback init_cb,
 
 			pqsignal(SIGPIPE, PG_SIG_DFL);
 
-			run_worker(job_pipe[0], result_pipe[1], init_cb, job_cb, arg);
+			worker_main_loop(job_pipe[0], result_pipe[1], init_cb, job_cb,
+							 arg);
+			exit(0);
 		}
 
 		/* Parent. */
 		close(job_pipe[0]);
 		close(result_pipe[1]);
 		w->pid = pid;
+#else
+		cb_worker_thread_arg *targ;
+
+		pgpipe(job_pipe);
+		pgpipe(result_pipe);
+
+		/* select() takes at most FD_SETSIZE sockets on Windows, too. */
+		if (i >= FD_SETSIZE)
+			pg_fatal("too many parallel jobs requested (maximum is %d)", i);
+
+		targ = pg_malloc_object(cb_worker_thread_arg);
+		targ->job_fd = job_pipe[0];
+		targ->result_fd = result_pipe[1];
+		targ->init_cb = init_cb;
+		targ->job_cb = job_cb;
+		targ->arg = arg;
+
+		w->thread = (HANDLE) _beginthreadex(NULL, 0, worker_thread, targ,
+											0, NULL);
+		if (w->thread == 0)
+			pg_fatal("could not create worker thread: %m");
+#endif
+
 		w->job_fd = job_pipe[1];
 		w->result_fd = result_pipe[0];
 		w->busy = false;
@@ -206,7 +287,7 @@ cb_worker_pool_dispatch(cb_worker_pool *pool, const char *job, size_t joblen,
 
 /*
  * Wait for all outstanding jobs to complete, deliver their results, and
- * reap the worker processes.
+ * reap the workers.
  */
 void
 cb_worker_pool_finish(cb_worker_pool *pool)
@@ -214,7 +295,7 @@ cb_worker_pool_finish(cb_worker_pool *pool)
 	/* Closing the job pipe tells the worker that there is no more work. */
 	for (int i = 0; i < pool->nworkers; ++i)
 	{
-		close(pool->workers[i].job_fd);
+		closepipe(pool->workers[i].job_fd);
 		pool->workers[i].job_fd = -1;
 	}
 
@@ -238,19 +319,40 @@ cb_worker_pool_finish(cb_worker_pool *pool)
 	for (int i = 0; i < pool->nworkers; ++i)
 	{
 		cb_worker  *w = &pool->workers[i];
-		int			status;
 
-		close(w->result_fd);
+		closepipe(w->result_fd);
 		w->result_fd = -1;
 
-		if (waitpid(w->pid, &status, 0) != w->pid)
-			pg_fatal("%s() failed: %m", "waitpid");
-		w->pid = 0;
-		if (status != 0)
-			pg_fatal("%s", wait_result_to_str(status));
+#ifndef WIN32
+		{
+			int			status;
+
+			if (waitpid(w->pid, &status, 0) != w->pid)
+				pg_fatal("%s() failed: %m", "waitpid");
+			w->pid = 0;
+			if (status != 0)
+				pg_fatal("%s", wait_result_to_str(status));
+		}
+#else
+		{
+			DWORD		status;
+
+			if (WaitForSingleObject(w->thread, INFINITE) != WAIT_OBJECT_0)
+				pg_fatal("could not wait for worker thread");
+			if (!GetExitCodeThread(w->thread, &status))
+				pg_fatal("could not get worker thread exit status");
+			CloseHandle(w->thread);
+			w->thread = 0;
+			if (status != 0)
+				pg_fatal("worker thread exited with status %lu",
+						 (unsigned long) status);
+		}
+#endif
 	}
 
+#ifndef WIN32
 	active_pool = NULL;
+#endif
 }
 
 /*
@@ -321,6 +423,7 @@ collect_results(cb_worker_pool *pool, bool wait)
 	pfree(buf.data);
 }
 
+#ifndef WIN32
 /*
  * Terminate any workers that are still running. This is an atexit handler,
  * so it runs when the leader exits early because of an error; a normal exit
@@ -346,13 +449,14 @@ terminate_workers_atexit(void)
 			waitpid(pool->workers[i].pid, NULL, 0);
 	}
 }
+#endif
 
 /*
- * Main loop of a worker process. Never returns.
+ * Main loop of a worker.
  */
 static void
-run_worker(int job_fd, int result_fd, cb_worker_init_callback init_cb,
-		   cb_job_callback job_cb, void *arg)
+worker_main_loop(int job_fd, int result_fd, cb_worker_init_callback init_cb,
+				 cb_job_callback job_cb, void *arg)
 {
 	StringInfoData job;
 	StringInfoData result;
@@ -370,8 +474,28 @@ run_worker(int job_fd, int result_fd, cb_worker_init_callback init_cb,
 		send_message(result_fd, result.data, result.len);
 	}
 
-	exit(0);
+	closepipe(job_fd);
+	closepipe(result_fd);
+	pfree(job.data);
+	pfree(result.data);
 }
+
+#ifdef WIN32
+/*
+ * Entry point of a worker thread.
+ */
+static unsigned __stdcall
+worker_thread(void *varg)
+{
+	cb_worker_thread_arg *targ = varg;
+
+	worker_main_loop(targ->job_fd, targ->result_fd, targ->init_cb,
+					 targ->job_cb, targ->arg);
+	pg_free(targ);
+
+	return 0;
+}
+#endif
 
 /*
  * Write a length-prefixed message to a pipe.
@@ -434,7 +558,7 @@ write_fully(int fd, const void *data, size_t len)
 
 	while (len > 0)
 	{
-		ssize_t		wb = write(fd, p, len);
+		ssize_t		wb = pipewrite(fd, p, len);
 
 		if (wb < 0)
 		{
@@ -463,7 +587,7 @@ read_fully(int fd, void *data, size_t len)
 
 	while (got < len)
 	{
-		ssize_t		rb = read(fd, p + got, len - got);
+		ssize_t		rb = piperead(fd, p + got, len - got);
 
 		if (rb < 0)
 		{
@@ -484,31 +608,66 @@ read_fully(int fd, void *data, size_t len)
 	return 1;
 }
 
-#else							/* WIN32 */
-
+#ifdef WIN32
 /*
- * Parallel operation is not implemented on Windows yet. The option is
- * rejected before we get here, so these exist only to satisfy the linker.
+ * A replacement for pipe(2) for Windows that allows the handles to be used
+ * in select(), by using a pair of connected local TCP sockets. Taken from
+ * pg_dump, except that errors are fatal here.
+ *
+ * Reads and writes on the pipe must go through piperead()/pipewrite().
+ *
+ * For consistency with Unix we declare the returned handles as "int".
+ * This is okay even on WIN64 because system handles are not more than
+ * 32 bits wide, but we do have to do some casting.
  */
-cb_worker_pool *
-cb_worker_pool_start(int nworkers, cb_worker_init_callback init_cb,
-					 cb_job_callback job_cb, cb_result_callback result_cb,
-					 void *arg)
+static void
+pgpipe(int handles[2])
 {
-	pg_fatal("parallel jobs are not supported on this platform");
-}
+	pgsocket	s,
+				tmp_sock;
+	struct sockaddr_in serv_addr;
+	int			len = sizeof(serv_addr);
 
-void
-cb_worker_pool_dispatch(cb_worker_pool *pool, const char *job, size_t joblen,
-						void *tag)
-{
-	pg_fatal("parallel jobs are not supported on this platform");
-}
+	/* We have to use the Unix socket invalid file descriptor value here. */
+	handles[0] = handles[1] = -1;
 
-void
-cb_worker_pool_finish(cb_worker_pool *pool)
-{
-	pg_fatal("parallel jobs are not supported on this platform");
-}
+	/*
+	 * setup listen socket
+	 */
+	if ((s = socket(AF_INET, SOCK_STREAM, 0)) == PGINVALID_SOCKET)
+		pg_fatal("pgpipe: could not create socket: error code %d",
+				 WSAGetLastError());
 
+	memset(&serv_addr, 0, sizeof(serv_addr));
+	serv_addr.sin_family = AF_INET;
+	serv_addr.sin_port = pg_hton16(0);
+	serv_addr.sin_addr.s_addr = pg_hton32(INADDR_LOOPBACK);
+	if (bind(s, (SOCKADDR *) &serv_addr, len) == SOCKET_ERROR)
+		pg_fatal("pgpipe: could not bind: error code %d",
+				 WSAGetLastError());
+	if (listen(s, 1) == SOCKET_ERROR)
+		pg_fatal("pgpipe: could not listen: error code %d",
+				 WSAGetLastError());
+	if (getsockname(s, (SOCKADDR *) &serv_addr, &len) == SOCKET_ERROR)
+		pg_fatal("pgpipe: %s() failed: error code %d", "getsockname",
+				 WSAGetLastError());
+
+	/*
+	 * setup pipe handles
+	 */
+	if ((tmp_sock = socket(AF_INET, SOCK_STREAM, 0)) == PGINVALID_SOCKET)
+		pg_fatal("pgpipe: could not create second socket: error code %d",
+				 WSAGetLastError());
+	handles[1] = (int) tmp_sock;
+
+	if (connect(handles[1], (SOCKADDR *) &serv_addr, len) == SOCKET_ERROR)
+		pg_fatal("pgpipe: could not connect socket: error code %d",
+				 WSAGetLastError());
+	if ((tmp_sock = accept(s, (SOCKADDR *) &serv_addr, &len)) == PGINVALID_SOCKET)
+		pg_fatal("pgpipe: could not accept connection: error code %d",
+				 WSAGetLastError());
+	handles[0] = (int) tmp_sock;
+
+	closesocket(s);
+}
 #endif							/* WIN32 */

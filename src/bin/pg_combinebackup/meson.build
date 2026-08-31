@@ -19,6 +19,7 @@ endif
 pg_combinebackup = executable('pg_combinebackup',
   pg_combinebackup_sources,
   dependencies: [frontend_code],
+  c_args: host_system == 'windows' ? ['-DFD_SETSIZE=1024'] : [],
   kwargs: default_bin_args,
 )
 bin_targets += pg_combinebackup

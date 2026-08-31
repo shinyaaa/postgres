@@ -366,12 +366,6 @@ main(int argc, char *argv[])
 #endif
 	}
 
-	/* Check that the platform supports parallel operation, if requested. */
-#ifdef WIN32
-	if (opt.jobs > 1)
-		pg_fatal("parallel jobs are not supported on this platform");
-#endif
-
 	/* Read the server version from the final backup. */
 	pgdata = argv[argc - 1];
 	version = get_pg_version(pgdata, NULL);
@@ -473,8 +467,8 @@ main(int argc, char *argv[])
 	context.opt = &opt;
 
 	/*
-	 * If we're using worker processes, start them now. They inherit all the
-	 * state we've set up so far.
+	 * If we're using workers, start them now. They inherit all the state
+	 * we've set up so far.
 	 */
 	if (opt.jobs > 1)
 		worker_pool = cb_worker_pool_start(opt.jobs, worker_init,
@@ -1441,12 +1435,17 @@ deserialize_file_job(char *data, size_t len, cb_file_job *job)
 static void
 worker_init(void *arg)
 {
+#ifndef WIN32
+
 	/*
 	 * Removing the output directories on failure is the leader's job. A
-	 * worker that fails exits through the same atexit handler, so make sure
-	 * it has nothing to do there.
+	 * worker process that fails exits through the same atexit handler, so
+	 * make sure it has nothing to do there. (On Windows, the workers are
+	 * threads, and a failing thread exits the whole process, which should
+	 * clean up as usual.)
 	 */
 	reset_directory_cleanup_list();
+#endif
 }
 
 /*

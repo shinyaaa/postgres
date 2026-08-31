@@ -19,7 +19,8 @@ struct cb_worker_pool;
 typedef struct cb_worker_pool cb_worker_pool;
 
 /*
- * Called once in each worker process, before it starts accepting jobs.
+ * Called once in each worker, before it starts accepting jobs. On Unix this
+ * runs in the worker process; on Windows, in the worker thread.
  */
 typedef void (*cb_worker_init_callback) (void *arg);
 

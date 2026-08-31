@@ -103,10 +103,6 @@ PostgreSQL documentation
         file system that implements it by sharing blocks, because producing
         a file is then a cheap metadata operation rather than I/O.
        </para>
-
-       <para>
-        This option is not supported on Windows.
-       </para>
       </listitem>
      </varlistentry>
 
