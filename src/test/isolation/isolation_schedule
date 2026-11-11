@@ -102,6 +102,7 @@ test: alter-table-1
 test: alter-table-2
 test: alter-table-3
 test: alter-table-4
+test: alter-table-reloptions
 test: create-trigger
 test: sequence-ddl
 test: rowtypes-alter

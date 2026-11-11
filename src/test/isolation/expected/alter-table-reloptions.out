@@ -1,0 +1,96 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1_begin s1_lock s2_limit s2_show s2_reset s2_show s1_commit
+step s1_begin: BEGIN;
+step s1_lock: LOCK TABLE reloptions_tab IN SHARE UPDATE EXCLUSIVE MODE;
+step s2_limit: ALTER TABLE reloptions_tab SET (autovacuum_vacuum_cost_limit = 100, toast.autovacuum_vacuum_cost_limit = 200);
+step s2_show: 
+	SELECT c.reloptions, t.reloptions AS toast_reloptions
+	  FROM pg_class c JOIN pg_class t ON t.oid = c.reltoastrelid
+	  WHERE c.relname = 'reloptions_tab';
+
+reloptions                        |toast_reloptions                  
+----------------------------------+----------------------------------
+{autovacuum_vacuum_cost_limit=100}|{autovacuum_vacuum_cost_limit=200}
+(1 row)
+
+step s2_reset: ALTER TABLE reloptions_tab RESET (autovacuum_vacuum_cost_limit);
+step s2_show: 
+	SELECT c.reloptions, t.reloptions AS toast_reloptions
+	  FROM pg_class c JOIN pg_class t ON t.oid = c.reltoastrelid
+	  WHERE c.relname = 'reloptions_tab';
+
+reloptions|toast_reloptions                  
+----------+----------------------------------
+          |{autovacuum_vacuum_cost_limit=200}
+(1 row)
+
+step s1_commit: COMMIT;
+
+starting permutation: s1_begin s1_lock s2_fillfactor s1_commit s2_show
+step s1_begin: BEGIN;
+step s1_lock: LOCK TABLE reloptions_tab IN SHARE UPDATE EXCLUSIVE MODE;
+step s2_fillfactor: ALTER TABLE reloptions_tab SET (fillfactor = 90); <waiting ...>
+step s1_commit: COMMIT;
+step s2_fillfactor: <... completed>
+step s2_show: 
+	SELECT c.reloptions, t.reloptions AS toast_reloptions
+	  FROM pg_class c JOIN pg_class t ON t.oid = c.reltoastrelid
+	  WHERE c.relname = 'reloptions_tab';
+
+reloptions     |toast_reloptions
+---------------+----------------
+{fillfactor=90}|                
+(1 row)
+
+
+starting permutation: s1_begin s1_lock s2_mixed s1_commit s2_show
+step s1_begin: BEGIN;
+step s1_lock: LOCK TABLE reloptions_tab IN SHARE UPDATE EXCLUSIVE MODE;
+step s2_mixed: ALTER TABLE reloptions_tab SET (autovacuum_vacuum_cost_delay = 2, fillfactor = 90); <waiting ...>
+step s1_commit: COMMIT;
+step s2_mixed: <... completed>
+step s2_show: 
+	SELECT c.reloptions, t.reloptions AS toast_reloptions
+	  FROM pg_class c JOIN pg_class t ON t.oid = c.reltoastrelid
+	  WHERE c.relname = 'reloptions_tab';
+
+reloptions                                    |toast_reloptions
+----------------------------------------------+----------------
+{autovacuum_vacuum_cost_delay=2,fillfactor=90}|                
+(1 row)
+
+
+starting permutation: s1_begin s1_delay s2_limit s1_commit s2_show
+step s1_begin: BEGIN;
+step s1_delay: ALTER TABLE reloptions_tab SET (autovacuum_vacuum_cost_delay = 1);
+step s2_limit: ALTER TABLE reloptions_tab SET (autovacuum_vacuum_cost_limit = 100, toast.autovacuum_vacuum_cost_limit = 200); <waiting ...>
+step s1_commit: COMMIT;
+step s2_limit: <... completed>
+step s2_show: 
+	SELECT c.reloptions, t.reloptions AS toast_reloptions
+	  FROM pg_class c JOIN pg_class t ON t.oid = c.reltoastrelid
+	  WHERE c.relname = 'reloptions_tab';
+
+reloptions                                                       |toast_reloptions                  
+-----------------------------------------------------------------+----------------------------------
+{autovacuum_vacuum_cost_delay=1,autovacuum_vacuum_cost_limit=100}|{autovacuum_vacuum_cost_limit=200}
+(1 row)
+
+
+starting permutation: s1_begin s1_delay s2_fillfactor s1_commit s2_show
+step s1_begin: BEGIN;
+step s1_delay: ALTER TABLE reloptions_tab SET (autovacuum_vacuum_cost_delay = 1);
+step s2_fillfactor: ALTER TABLE reloptions_tab SET (fillfactor = 90); <waiting ...>
+step s1_commit: COMMIT;
+step s2_fillfactor: <... completed>
+step s2_show: 
+	SELECT c.reloptions, t.reloptions AS toast_reloptions
+	  FROM pg_class c JOIN pg_class t ON t.oid = c.reltoastrelid
+	  WHERE c.relname = 'reloptions_tab';
+
+reloptions                                    |toast_reloptions
+----------------------------------------------+----------------
+{autovacuum_vacuum_cost_delay=1,fillfactor=90}|                
+(1 row)
+

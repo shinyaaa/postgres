@@ -885,6 +885,10 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
       <literal>SHARE UPDATE EXCLUSIVE</literal> lock will be taken for
       fillfactor, TOAST and autovacuum storage parameters, as well as the
       planner parameter <varname>parallel_workers</varname>.
+      Only an <literal>ACCESS SHARE</literal> lock will be taken if all the
+      parameters are <varname>autovacuum_vacuum_cost_delay</varname> or
+      <varname>autovacuum_vacuum_cost_limit</varname>, so that these can be
+      changed without interrupting a running autovacuum.
      </para>
     </listitem>
    </varlistentry>

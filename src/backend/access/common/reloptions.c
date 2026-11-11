@@ -56,9 +56,9 @@
  * handling code can detect the case where the option has not been set.
  *
  * The default choice for any new option should be AccessExclusiveLock.
- * In some cases the lock level can be reduced from there, but the lock
- * level chosen should always conflict with itself to ensure that multiple
- * changes aren't lost when we attempt concurrent changes.
+ * In some cases the lock level can be reduced from there.  The lock level
+ * does not need to conflict with itself, because ATExecSetRelOptions()
+ * serializes concurrent changes with a separate lock.
  * The choice of lock level depends completely upon how that parameter
  * is used within the server, not upon how and when you'd like to change it.
  * Safety first. Existing choices are documented here, and elsewhere in
@@ -70,6 +70,11 @@
  * Autovacuum related parameters can be set at ShareUpdateExclusiveLock
  * since they are only used by the AV procs and don't change anything
  * currently executing.
+ *
+ * The autovacuum cost delay parameters can be set at AccessShareLock.  They
+ * only throttle VACUUM, and taking a lock that conflicts with VACUUM would
+ * make it impossible to change them without waiting for, or canceling, the
+ * autovacuum worker they are meant to adjust.
  *
  * Fillfactor can be set at ShareUpdateExclusiveLock because it applies only to
  * subsequent changes made to data blocks, as documented in hio.c
@@ -285,7 +290,7 @@ static relopt_int intRelOpts[] =
 			"autovacuum_vacuum_cost_limit",
 			"Vacuum cost amount available before napping, for autovacuum",
 			RELOPT_KIND_HEAP | RELOPT_KIND_TOAST,
-			ShareUpdateExclusiveLock
+			AccessShareLock
 		},
 		-1, 1, 10000
 	},
@@ -424,7 +429,7 @@ static relopt_real realRelOpts[] =
 			"autovacuum_vacuum_cost_delay",
 			"Vacuum cost delay in milliseconds, for autovacuum",
 			RELOPT_KIND_HEAP | RELOPT_KIND_TOAST,
-			ShareUpdateExclusiveLock
+			AccessShareLock
 		},
 		-1, 0.0, 100.0
 	},
@@ -717,42 +722,18 @@ initialize_reloptions(void)
 
 	j = 0;
 	for (i = 0; boolRelOpts[i].gen.name; i++)
-	{
-		Assert(DoLockModesConflict(boolRelOpts[i].gen.lockmode,
-								   boolRelOpts[i].gen.lockmode));
 		j++;
-	}
 	for (i = 0; ternaryRelOpts[i].gen.name; i++)
-	{
-		Assert(DoLockModesConflict(ternaryRelOpts[i].gen.lockmode,
-								   ternaryRelOpts[i].gen.lockmode));
 		j++;
-	}
 
 	for (i = 0; intRelOpts[i].gen.name; i++)
-	{
-		Assert(DoLockModesConflict(intRelOpts[i].gen.lockmode,
-								   intRelOpts[i].gen.lockmode));
 		j++;
-	}
 	for (i = 0; realRelOpts[i].gen.name; i++)
-	{
-		Assert(DoLockModesConflict(realRelOpts[i].gen.lockmode,
-								   realRelOpts[i].gen.lockmode));
 		j++;
-	}
 	for (i = 0; enumRelOpts[i].gen.name; i++)
-	{
-		Assert(DoLockModesConflict(enumRelOpts[i].gen.lockmode,
-								   enumRelOpts[i].gen.lockmode));
 		j++;
-	}
 	for (i = 0; stringRelOpts[i].gen.name; i++)
-	{
-		Assert(DoLockModesConflict(stringRelOpts[i].gen.lockmode,
-								   stringRelOpts[i].gen.lockmode));
 		j++;
-	}
 	j += num_custom_options;
 
 	if (relOpts)

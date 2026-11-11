@@ -4683,7 +4683,7 @@ AlterTableGetLockLevel(List *cmds)
 	 * This only works if we read catalog tables using MVCC snapshots.
 	 */
 	ListCell   *lcmd;
-	LOCKMODE	lockmode = ShareUpdateExclusiveLock;
+	LOCKMODE	lockmode = NoLock;
 
 	foreach(lcmd, cmds)
 	{
@@ -4928,6 +4928,14 @@ AlterTableGetLockLevel(List *cmds)
 		if (cmd_lockmode > lockmode)
 			lockmode = cmd_lockmode;
 	}
+
+	/*
+	 * Only some storage parameters allow less than ShareUpdateExclusiveLock.
+	 * Use that if no subcommand asked for a lock, which happens for a storage
+	 * parameter we do not know.
+	 */
+	if (lockmode == NoLock)
+		lockmode = ShareUpdateExclusiveLock;
 
 	return lockmode;
 }
@@ -18015,8 +18023,27 @@ ATExecSetRelOptions(Relation rel, List *defList, AlterTableType operation,
 
 	pgclass = table_open(RelationRelationId, RowExclusiveLock);
 
-	/* Fetch heap tuple */
 	relid = RelationGetRelid(rel);
+
+	/*
+	 * Some options can be changed while holding a lock on the relation that
+	 * does not conflict with itself, so that changing them does not have to
+	 * wait for, or cancel, a VACUUM of the relation.  The relation lock then
+	 * does not stop two sessions from changing the options at once.  Take a
+	 * self-conflicting lock on the pg_class entry instead, and hold it until
+	 * end of transaction.  Do that for all options, since a session changing
+	 * one that needs a stronger relation lock must be serialized with the
+	 * others as well.  This also covers the TOAST table's options, which can
+	 * only be changed by way of its parent.
+	 */
+	if (rel->rd_rel->relisshared)
+		LockSharedObject(RelationRelationId, relid, 0,
+						 ShareUpdateExclusiveLock);
+	else
+		LockDatabaseObject(RelationRelationId, relid, 0,
+						   ShareUpdateExclusiveLock);
+
+	/* Fetch heap tuple */
 	tuple = SearchSysCacheLocked1(RELOID, ObjectIdGetDatum(relid));
 	if (!HeapTupleIsValid(tuple))
 		elog(ERROR, "cache lookup failed for relation %u", relid);
@@ -18140,8 +18167,11 @@ ATExecSetRelOptions(Relation rel, List *defList, AlterTableType operation,
 
 		toastrel = table_open(toastid, lockmode);
 
-		/* Fetch heap tuple */
-		tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(toastid));
+		/*
+		 * Fetch heap tuple.  "lockmode" can be too weak to keep VACUUM from
+		 * updating the tuple in place, so lock the tuple as well.
+		 */
+		tuple = SearchSysCacheLocked1(RELOID, ObjectIdGetDatum(toastid));
 		if (!HeapTupleIsValid(tuple))
 			elog(ERROR, "cache lookup failed for relation %u", toastid);
 
@@ -18184,6 +18214,7 @@ ATExecSetRelOptions(Relation rel, List *defList, AlterTableType operation,
 									 repl_val, repl_null, repl_repl);
 
 		CatalogTupleUpdate(pgclass, &newtuple->t_self, newtuple);
+		UnlockTuple(pgclass, &tuple->t_self, InplaceUpdateTupleLock);
 
 		InvokeObjectPostAlterHookArg(RelationRelationId,
 									 RelationGetRelid(toastrel), 0,
