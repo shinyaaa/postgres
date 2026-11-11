@@ -1329,6 +1329,7 @@ lazy_scan_heap(LVRelState *vacrel)
 		bool		vm_page_frozen = false;
 		bool		got_cleanup_lock = false;
 
+		vacuum_recheck_cost_params();
 		vacuum_delay_point(false);
 
 		/*
@@ -2546,6 +2547,9 @@ lazy_vacuum_all_indexes(LVRelState *vacrel)
 			Relation	indrel = vacrel->indrels[idx];
 			IndexBulkDeleteResult *istat = vacrel->indstats[idx];
 
+			/* Index AMs cannot do this, so do it between indexes */
+			vacuum_recheck_cost_params();
+
 			vacrel->indstats[idx] = lazy_vacuum_one_index(indrel, istat,
 														  old_live_tuples,
 														  vacrel);
@@ -2700,6 +2704,7 @@ lazy_vacuum_heap_rel(LVRelState *vacrel)
 		OffsetNumber offsets[MaxOffsetNumber];
 		int			num_offsets;
 
+		vacuum_recheck_cost_params();
 		vacuum_delay_point(false);
 
 		buf = read_stream_next_buffer(stream, (void **) &iter_result);
@@ -2996,6 +3001,9 @@ lazy_cleanup_all_indexes(LVRelState *vacrel)
 		{
 			Relation	indrel = vacrel->indrels[idx];
 			IndexBulkDeleteResult *istat = vacrel->indstats[idx];
+
+			/* Index AMs cannot do this, so do it between indexes */
+			vacuum_recheck_cost_params();
 
 			vacrel->indstats[idx] =
 				lazy_cleanup_one_index(indrel, istat, reltuples,

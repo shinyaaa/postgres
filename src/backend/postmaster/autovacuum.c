@@ -67,6 +67,7 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#include "access/genam.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/multixact.h"
@@ -77,6 +78,7 @@
 #include "catalog/dependency.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_database.h"
+#include "catalog/pg_depend.h"
 #include "catalog/pg_namespace.h"
 #include "commands/vacuum.h"
 #include "common/int.h"
@@ -105,6 +107,7 @@
 #include "utils/fmgrprotos.h"
 #include "utils/guc_hooks.h"
 #include "utils/injection_point.h"
+#include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/ps_status.h"
@@ -160,6 +163,12 @@ int			Log_autoanalyze_min_duration = 600000;
  */
 static double av_storage_param_cost_delay = -1;
 static int	av_storage_param_cost_limit = -1;
+
+/*
+ * Set when the relcache entry of the table being processed is invalidated,
+ * which is how we learn that its storage parameters may have changed.
+ */
+static bool av_storage_params_stale = false;
 
 /* Flags set by signal handlers */
 static volatile sig_atomic_t got_SIGUSR2 = false;
@@ -373,6 +382,11 @@ static void autovac_recalculate_workers_for_balance(void);
 static void do_autovacuum(void);
 static void FreeWorkerInfo(int code, Datum arg);
 
+static void autovac_cost_storage_params(const AutoVacOpts *avopts,
+										double *cost_delay, int *cost_limit,
+										bool *dobalance);
+static void autovac_relcache_callback(Datum arg, Oid relid);
+static Oid	autovac_toast_parent(Oid toastrelid);
 static autovac_table *table_recheck_autovac(Oid relid, HTAB *table_toast_map,
 											TupleDesc pg_class_desc,
 											int effective_multixact_freeze_max_age);
@@ -1623,6 +1637,9 @@ AutoVacWorkerMain(const void *startup_data, size_t startup_data_len)
 		ereport(DEBUG1,
 				(errmsg_internal("autovacuum: processing database \"%s\"", dbname)));
 
+		/* Watch for changes of the storage parameters of our tables */
+		CacheRegisterRelcacheCallback(autovac_relcache_callback, (Datum) 0);
+
 		if (PostAuthDelay)
 			pg_usleep(PostAuthDelay * 1000000L);
 
@@ -1778,6 +1795,184 @@ AutoVacuumUpdateCostLimit(void)
 
 		vacuum_cost_limit = Max(vacuum_cost_limit / nworkers_for_balance, 1);
 	}
+}
+
+/*
+ * autovac_cost_storage_params
+ *		Extract the cost-related storage parameters from a table's options.
+ *
+ * "avopts" is NULL if the table has no storage parameters.
+ */
+static void
+autovac_cost_storage_params(const AutoVacOpts *avopts,
+							double *cost_delay, int *cost_limit,
+							bool *dobalance)
+{
+	*cost_delay = avopts ? avopts->vacuum_cost_delay : -1;
+	*cost_limit = avopts ? avopts->vacuum_cost_limit : 0;
+
+	/*
+	 * If any of the cost delay parameters has been set individually for this
+	 * table, disable the balancing algorithm.
+	 */
+	*dobalance = !(*cost_limit > 0 || *cost_delay >= 0);
+}
+
+/*
+ * autovac_relcache_callback
+ *		Relcache invalidation callback of an autovacuum worker.
+ */
+static void
+autovac_relcache_callback(Datum arg, Oid relid)
+{
+	/* InvalidOid means that all relcache entries are invalidated */
+	if (MyWorkerInfo != NULL &&
+		(relid == InvalidOid || relid == MyWorkerInfo->wi_tableoid))
+		av_storage_params_stale = true;
+}
+
+/*
+ * autovac_toast_parent
+ *		Return the OID of the table that owns the given TOAST table.
+ */
+static Oid
+autovac_toast_parent(Oid toastrelid)
+{
+	Oid			result = InvalidOid;
+	Relation	depRel;
+	ScanKeyData key[2];
+	SysScanDesc scan;
+	HeapTuple	tup;
+
+	depRel = table_open(DependRelationId, AccessShareLock);
+
+	ScanKeyInit(&key[0],
+				Anum_pg_depend_classid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(RelationRelationId));
+	ScanKeyInit(&key[1],
+				Anum_pg_depend_objid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(toastrelid));
+
+	scan = systable_beginscan(depRel, DependDependerIndexId, true,
+							  NULL, 2, key);
+
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_pg_depend depform = (Form_pg_depend) GETSTRUCT(tup);
+
+		if (depform->refclassid == RelationRelationId &&
+			depform->deptype == DEPENDENCY_INTERNAL)
+		{
+			result = depform->refobjid;
+			break;
+		}
+	}
+
+	systable_endscan(scan);
+	table_close(depRel, AccessShareLock);
+
+	return result;
+}
+
+/*
+ * AutoVacuumRefreshStorageParams
+ *		Re-read the cost-related storage parameters of the table being
+ *		processed, if they may have changed.
+ *
+ * ALTER TABLE can change these parameters while we are processing the table.
+ * Returns true if they have changed, in which case the caller must call
+ * VacuumUpdateCosts() to make the new values take effect.
+ */
+bool
+AutoVacuumRefreshStorageParams(void)
+{
+	Oid			relid;
+	HeapTuple	tup;
+	StdRdOptions *relopts;
+	StdRdOptions *main_relopts = NULL;
+	StdRdOptions *merged;
+	Datum		datum;
+	bool		isnull;
+	double		cost_delay;
+	int			cost_limit;
+	bool		dobalance;
+	bool		changed;
+
+	if (!av_storage_params_stale || MyWorkerInfo == NULL)
+		return false;
+
+	/* We need a transaction to read the catalogs; try again later if not */
+	if (!IsTransactionState())
+		return false;
+
+	av_storage_params_stale = false;
+
+	relid = MyWorkerInfo->wi_tableoid;
+	tup = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	if (!HeapTupleIsValid(tup))
+		return false;
+
+	datum = SysCacheGetAttr(RELOID, tup, Anum_pg_class_reloptions, &isnull);
+	relopts = isnull ? NULL : (StdRdOptions *)
+		heap_reloptions(((Form_pg_class) GETSTRUCT(tup))->relkind, datum,
+						false);
+
+	/* A TOAST table uses its parent's parameters where its own are unset */
+	if (((Form_pg_class) GETSTRUCT(tup))->relkind == RELKIND_TOASTVALUE)
+	{
+		Oid			main_relid = autovac_toast_parent(relid);
+		HeapTuple	main_tup = NULL;
+
+		if (OidIsValid(main_relid))
+			main_tup = SearchSysCache1(RELOID, ObjectIdGetDatum(main_relid));
+
+		if (HeapTupleIsValid(main_tup))
+		{
+			datum = SysCacheGetAttr(RELOID, main_tup,
+									Anum_pg_class_reloptions, &isnull);
+			if (!isnull)
+				main_relopts = (StdRdOptions *)
+					heap_reloptions(((Form_pg_class) GETSTRUCT(main_tup))->relkind,
+									datum, false);
+			ReleaseSysCache(main_tup);
+		}
+	}
+
+	ReleaseSysCache(tup);
+
+	merged = merge_toast_reloptions(relopts, main_relopts);
+	autovac_cost_storage_params(merged ? &merged->autovacuum : NULL,
+								&cost_delay, &cost_limit, &dobalance);
+
+	if (relopts)
+		pfree(relopts);
+	if (main_relopts)
+		pfree(main_relopts);
+	if (merged)
+		pfree(merged);
+
+	changed = (cost_delay != av_storage_param_cost_delay ||
+			   cost_limit != av_storage_param_cost_limit);
+
+	if (changed)
+	{
+		av_storage_param_cost_delay = cost_delay;
+		av_storage_param_cost_limit = cost_limit;
+
+		/* Whether we take part in the balancing may have changed as well */
+		if (dobalance)
+			pg_atomic_test_set_flag(&MyWorkerInfo->wi_dobalance);
+		else
+			pg_atomic_clear_flag(&MyWorkerInfo->wi_dobalance);
+
+		LWLockAcquire(AutovacuumLock, LW_SHARED);
+		autovac_recalculate_workers_for_balance();
+		LWLockRelease(AutovacuumLock);
+	}
+
+	return changed;
 }
 
 /*
@@ -2964,21 +3159,13 @@ table_recheck_autovac(Oid relid, HTAB *table_toast_map,
 		 * vacuum_max_eager_freeze_failure_rate override.
 		 */
 		tab->at_params.max_eager_freeze_failure_rate = vacuum_max_eager_freeze_failure_rate;
-		tab->at_storage_param_vac_cost_limit = avopts ?
-			avopts->vacuum_cost_limit : 0;
-		tab->at_storage_param_vac_cost_delay = avopts ?
-			avopts->vacuum_cost_delay : -1;
+		autovac_cost_storage_params(avopts,
+									&tab->at_storage_param_vac_cost_delay,
+									&tab->at_storage_param_vac_cost_limit,
+									&tab->at_dobalance);
 		tab->at_relname = NULL;
 		tab->at_nspname = NULL;
 		tab->at_datname = NULL;
-
-		/*
-		 * If any of the cost delay parameters has been set individually for
-		 * this table, disable the balancing algorithm.
-		 */
-		tab->at_dobalance =
-			!(avopts && (avopts->vacuum_cost_limit > 0 ||
-						 avopts->vacuum_cost_delay >= 0));
 	}
 
 	if (relopts)

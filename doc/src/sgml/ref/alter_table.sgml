@@ -888,7 +888,10 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
       Only an <literal>ACCESS SHARE</literal> lock will be taken if all the
       parameters are <varname>autovacuum_vacuum_cost_delay</varname> or
       <varname>autovacuum_vacuum_cost_limit</varname>, so that these can be
-      changed without interrupting a running autovacuum.
+      changed without interrupting a running autovacuum.  An autovacuum
+      worker that is vacuuming the table starts using the new values
+      shortly afterwards, except that it does not notice the change while
+      it is processing an index.
      </para>
     </listitem>
    </varlistentry>

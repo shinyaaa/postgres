@@ -396,6 +396,7 @@ extern bool vacuum_get_cutoffs(Relation rel, const VacuumParams *params,
 extern bool vacuum_xid_failsafe_check(const struct VacuumCutoffs *cutoffs);
 extern void vac_update_datfrozenxid(void);
 extern void vacuum_delay_point(bool is_analyze);
+extern void vacuum_recheck_cost_params(void);
 extern bool vacuum_is_permitted_for_relation(Oid relid, Form_pg_class reltuple,
 											 uint32 options, bool missing_ok);
 extern Relation vacuum_open_relation(Oid relid, RangeVar *relation,
@@ -410,6 +411,7 @@ extern IndexBulkDeleteResult *vac_cleanup_one_index(IndexVacuumInfo *ivinfo,
 
 /* In postmaster/autovacuum.c */
 extern void AutoVacuumUpdateCostLimit(void);
+extern bool AutoVacuumRefreshStorageParams(void);
 extern void VacuumUpdateCosts(void);
 
 /* in commands/vacuumparallel.c */

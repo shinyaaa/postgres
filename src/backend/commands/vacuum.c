@@ -59,6 +59,7 @@
 #include "utils/guc.h"
 #include "utils/guc_hooks.h"
 #include "utils/injection_point.h"
+#include "utils/inval.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
@@ -70,6 +71,15 @@
  * frequently.
  */
 #define PARALLEL_VACUUM_DELAY_REPORT_INTERVAL_NS	(NS_PER_S)
+
+/*
+ * An autovacuum worker that does not nap processes invalidation messages
+ * every this many calls of vacuum_recheck_cost_params().
+ */
+#define VACUUM_INVAL_CHECK_INTERVAL	32
+
+/* Calls of vacuum_recheck_cost_params() left until the next check */
+static int	inval_check_countdown = VACUUM_INVAL_CHECK_INTERVAL;
 
 /*
  * GUC parameters
@@ -2475,6 +2485,38 @@ vac_close_indexes(int nindexes, Relation *Irel, LOCKMODE lockmode)
 }
 
 /*
+ * vacuum_recheck_cost_params --- follow changes to the cost-related storage
+ * parameters of the table an autovacuum worker is processing.
+ *
+ * ALTER TABLE does not wait for the worker to change those parameters, and
+ * the worker learns about the change from the invalidation message.  Nothing
+ * else makes it look at those messages while it is scanning the table, so
+ * this does, once in a while and after every nap.
+ *
+ * Unlike vacuum_delay_point(), this must only be called where the caller can
+ * cope with the relcache entries of its relations being rebuilt.  That rules
+ * out index AMs, which may be holding pointers into rd_amcache.
+ */
+void
+vacuum_recheck_cost_params(void)
+{
+	if (!AmAutoVacuumWorkerProcess())
+		return;
+
+	if (--inval_check_countdown <= 0)
+	{
+		inval_check_countdown = VACUUM_INVAL_CHECK_INTERVAL;
+		AcceptInvalidationMessages();
+	}
+
+	if (AutoVacuumRefreshStorageParams())
+	{
+		VacuumUpdateCosts();
+		parallel_vacuum_propagate_shared_delay_params();
+	}
+}
+
+/*
  * vacuum_delay_point --- check for interrupts and cost-based delay.
  *
  * This should be called in each major loop of VACUUM processing,
@@ -2639,6 +2681,13 @@ vacuum_delay_point(bool is_analyze)
 
 		if (AmAutoVacuumWorkerProcess())
 			parallel_vacuum_propagate_shared_delay_params();
+
+		/*
+		 * Have vacuum_recheck_cost_params() look for a change the next time.
+		 * This keeps a heavily throttled worker responsive to a change that
+		 * speeds it up.
+		 */
+		inval_check_countdown = 0;
 
 		/* Might have gotten an interrupt while sleeping */
 		CHECK_FOR_INTERRUPTS();
