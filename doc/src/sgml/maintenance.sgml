@@ -1069,7 +1069,11 @@ analyze threshold = analyze base threshold + analyze scale factor * number of tu
     <structfield>started_by</structfield> column in the
     <structname>pg_stat_progress_vacuum</structname> view shows
     <literal>autovacuum_wraparound</literal> value), the autovacuum is
-    not automatically interrupted.
+    not automatically interrupted.  When an autovacuum is interrupted this
+    way, the process that requested the conflicting lock writes a message to
+    the server log reporting the process ID of the interrupted autovacuum
+    worker and the lock it was waiting for, which can be used to identify the
+    cause of the interruption.
    </para>
 
    <warning>
