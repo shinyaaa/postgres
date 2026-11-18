@@ -1566,28 +1566,28 @@ ProcSleep(LOCALLOCK *locallock)
 			{
 				int			pid = autovac->pid;
 
-				/* report the case, if configured to do so */
-				if (message_level_is_interesting(DEBUG1))
+				/*
+				 * Report the case, if configured to do so.  When log_lock_waits
+				 * is enabled, this is reported at LOG level, so that the cause
+				 * of the autovacuum cancellation can be identified later
+				 * without having to sample pg_locks or pg_stat_activity.
+				 */
+				if (log_lock_waits || message_level_is_interesting(DEBUG1))
 				{
 					StringInfoData locktagbuf;
-					StringInfoData logbuf;	/* errdetail for server log */
 
 					initStringInfo(&locktagbuf);
-					initStringInfo(&logbuf);
 					DescribeLockTag(&locktagbuf, &locktag_copy);
-					appendStringInfo(&logbuf,
-									 "Process %d waits for %s on %s.",
-									 MyProcPid,
-									 GetLockmodeName(lockmethod_copy, lockmode),
-									 locktagbuf.data);
 
-					ereport(DEBUG1,
-							(errmsg_internal("sending cancel to blocking autovacuum PID %d",
-											 pid),
-							 errdetail_log("%s", logbuf.data)));
+					ereport(log_lock_waits ? LOG : DEBUG1,
+							(errmsg("sending cancel to blocking autovacuum PID %d",
+									pid),
+							 errdetail_log("Process %d waits for %s on %s.",
+										   MyProcPid,
+										   GetLockmodeName(lockmethod_copy, lockmode),
+										   locktagbuf.data)));
 
 					pfree(locktagbuf.data);
-					pfree(logbuf.data);
 				}
 
 				/* send the autovacuum worker Back to Old Kent Road */
