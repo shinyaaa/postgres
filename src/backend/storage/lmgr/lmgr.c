@@ -144,11 +144,14 @@ LockRelationOid(Oid relid, LOCKMODE lockmode)
  * As above, but only lock if we can get the lock without blocking.
  * Returns true iff the lock was acquired.
  *
+ * If logLockFailure is true, a log message reporting the processes holding
+ * and waiting for the lock is emitted when the lock cannot be acquired.
+ *
  * NOTE: we do not currently need conditional versions of all the
  * LockXXX routines in this file, but they could easily be added if needed.
  */
 bool
-ConditionalLockRelationOid(Oid relid, LOCKMODE lockmode)
+ConditionalLockRelationOid(Oid relid, LOCKMODE lockmode, bool logLockFailure)
 {
 	LOCKTAG		tag;
 	LOCALLOCK  *locallock;
@@ -157,7 +160,7 @@ ConditionalLockRelationOid(Oid relid, LOCKMODE lockmode)
 	SetLocktagRelationOid(&tag, relid);
 
 	res = LockAcquireExtended(&tag, lockmode, false, true, true, &locallock,
-							  false);
+							  logLockFailure);
 
 	if (res == LOCKACQUIRE_NOT_AVAIL)
 		return false;

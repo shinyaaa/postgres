@@ -143,7 +143,7 @@ LockTableRecurse(Oid reloid, LOCKMODE lockmode, bool nowait)
 
 		if (!nowait)
 			LockRelationOid(childreloid, lockmode);
-		else if (!ConditionalLockRelationOid(childreloid, lockmode))
+		else if (!ConditionalLockRelationOid(childreloid, lockmode, false))
 		{
 			/* try to throw error by name; relation could be deleted... */
 			char	   *relname = get_rel_name(childreloid);
@@ -239,7 +239,7 @@ LockViewRecurse_walker(Node *node, LockViewRecurse_context *context)
 			/* We have enough rights to lock the relation; do so. */
 			if (!context->nowait)
 				LockRelationOid(relid, context->lockmode);
-			else if (!ConditionalLockRelationOid(relid, context->lockmode))
+			else if (!ConditionalLockRelationOid(relid, context->lockmode, false))
 				ereport(ERROR,
 						(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
 						 errmsg("could not obtain lock on relation \"%s\"",

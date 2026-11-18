@@ -8527,8 +8527,11 @@ log_line_prefix = '%m [%p] %q%u@%d/%a '
        <para>
         Controls whether a detailed log message is produced
         when a lock acquisition fails.  This is useful for analyzing
-        the causes of lock failures.  Currently, only lock failures
-        due to <literal>SELECT NOWAIT</literal> is supported.
+        the causes of lock failures.  Currently, lock failures due to
+        <literal>SELECT NOWAIT</literal>, and lock failures that cause
+        autovacuum, or <command>VACUUM</command> and <command>ANALYZE</command>
+        with the <literal>SKIP_LOCKED</literal> option, to skip a relation
+        are supported.
         The default is <literal>off</literal>.  Only superusers and
         users with the appropriate <literal>SET</literal> privilege
         can change this setting.

@@ -808,11 +808,15 @@ vacuum_open_relation(Oid relid, RangeVar *relation, uint32 options,
 	 * the last time we saw it.  If so, we don't need to vacuum or analyze it.
 	 *
 	 * If we've been asked not to wait for the relation lock, acquire it first
-	 * in non-blocking mode, before calling try_relation_open().
+	 * in non-blocking mode, before calling try_relation_open().  If the lock
+	 * is not available and log_lock_failures is enabled, the processes
+	 * holding and waiting for the lock are reported, which helps to find out
+	 * why autovacuum (or VACUUM/ANALYZE with SKIP_LOCKED) skipped the
+	 * relation.
 	 */
 	if (!(options & VACOPT_SKIP_LOCKED))
 		rel = try_relation_open(relid, lmode);
-	else if (ConditionalLockRelationOid(relid, lmode))
+	else if (ConditionalLockRelationOid(relid, lmode, log_lock_failures))
 		rel = try_relation_open(relid, NoLock);
 	else
 	{
